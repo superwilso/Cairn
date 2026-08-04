@@ -14,10 +14,23 @@
 //! - Retrofitting causality into a deployed report format is very expensive, because old
 //!   clients keep producing the old format forever.
 //!
-//! So the commitment covers a **hash chain**: each message commits to its predecessor's
-//! commitment. A [`TranscriptReport`] can therefore carry a contiguous run of messages
-//! whose ordering the moderator can verify cryptographically, not merely trust. v1 may
-//! populate only one message; the format does not have to change when it stops doing so.
+//! So a report carries a **chain**: each message's server attestation names its
+//! predecessor. A [`TranscriptReport`] can therefore carry a contiguous run whose ordering
+//! a moderator verifies cryptographically rather than trusting. v1 may populate only one
+//! message; the format does not have to change when it stops doing so.
+//!
+//! ## Why the server anchors the chain, not the sender
+//!
+//! An earlier design had each sender commit to the predecessor *it had seen*. That works
+//! in a 1-to-1 conversation and breaks in a group: two members sending concurrently both
+//! believe they follow the same message, the chain forks, and the resulting transcript
+//! cannot be reported at all — an honest-participant failure, not an attack.
+//!
+//! Causality therefore lives in the server's tag. The server assigns `server_seq` and is
+//! already the ordering authority, so it is the only party that knows the true order at
+//! the time a message is accepted. This costs nothing in trust: the threat model
+//! (`docs/01-threat-model.md` §4) already concedes that a malicious server can reorder and
+//! drop messages, so making it the ordering witness grants it no new power.
 //!
 //! ## What this deliberately gives up
 //!
@@ -125,6 +138,13 @@ impl ServerFrankingKey {
         mac.update(ctx.sender.as_uuid().as_bytes());
         mac.update(ctx.sender_device.as_uuid().as_bytes());
         mac.update(&ctx.server_seq.to_be_bytes());
+        match &ctx.prev_commitment {
+            Some(p) => {
+                mac.update(&[1u8]);
+                mac.update(&p.0);
+            }
+            None => mac.update(&[0u8]),
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(&mac.finalize().into_bytes());
         Tag(out)
@@ -155,37 +175,32 @@ pub struct Context {
     /// Server-assigned, strictly increasing per room. Gives the moderator an ordering
     /// that does not depend on the sender's self-reported clock.
     pub server_seq: u64,
+    /// The commitment of the previous *franked* message in this room, as the server
+    /// ordered it. `None` for the first.
+    ///
+    /// This is what makes a multi-message report verifiable as a sequence, and it is
+    /// supplied by the server precisely because a sender in a group cannot know it.
+    pub prev_commitment: Option<Commitment>,
 }
 
-/// Commit to a message at a position in the conversation.
+/// Commit to a message.
 ///
-/// `prev` is the commitment of the preceding message in the same room, or `None` for the
-/// first. Including it is what makes a multi-message report verifiable as a *sequence*.
-pub fn commit(plaintext: &[u8], prev: Option<&Commitment>) -> (Commitment, Opening) {
+/// Deliberately covers only the message. Ordering is attested by the server in
+/// [`ServerFrankingKey::tag`] — see the module docs for why a sender cannot supply it
+/// correctly in a group.
+pub fn commit(plaintext: &[u8]) -> (Commitment, Opening) {
     let opening = Opening::generate();
-    let commitment = commit_with_opening(plaintext, prev, &opening);
+    let commitment = commit_with_opening(plaintext, &opening);
     (commitment, opening)
 }
 
 /// Recompute a commitment from a known opening. Used by verifiers.
-pub fn commit_with_opening(
-    plaintext: &[u8],
-    prev: Option<&Commitment>,
-    opening: &Opening,
-) -> Commitment {
+pub fn commit_with_opening(plaintext: &[u8], opening: &Opening) -> Commitment {
     // HMAC keyed by the opening is a standard commitment: hiding (the opening is
     // uniformly random and secret) and binding (finding a second preimage means breaking
     // HMAC-SHA256).
     let mut mac = HmacSha256::new_from_slice(&opening.0).expect("hmac accepts any key length");
     mac.update(DOMAIN_COMMITMENT);
-    // Length-prefix so that (prev, plaintext) cannot be re-split ambiguously.
-    match prev {
-        Some(p) => {
-            mac.update(&[1u8]);
-            mac.update(&p.0);
-        }
-        None => mac.update(&[0u8]),
-    }
     mac.update(&(plaintext.len() as u64).to_be_bytes());
     mac.update(plaintext);
     let mut out = [0u8; 32];
@@ -194,13 +209,8 @@ pub fn commit_with_opening(
 }
 
 /// Constant-time commitment check.
-pub fn verify_commitment(
-    plaintext: &[u8],
-    prev: Option<&Commitment>,
-    opening: &Opening,
-    commitment: &Commitment,
-) -> bool {
-    commit_with_opening(plaintext, prev, opening).0.ct_eq(&commitment.0).into()
+pub fn verify_commitment(plaintext: &[u8], opening: &Opening, commitment: &Commitment) -> bool {
+    commit_with_opening(plaintext, opening).0.ct_eq(&commitment.0).into()
 }
 
 /// One message in a report: everything a moderator needs to verify it.
@@ -208,7 +218,6 @@ pub fn verify_commitment(
 pub struct ReportedMessage {
     pub plaintext: Vec<u8>,
     pub opening: Opening,
-    pub prev: Option<Commitment>,
     pub context: Context,
     pub tag: Tag,
 }
@@ -251,7 +260,7 @@ impl TranscriptReport {
             }
             // The commitment must actually open to the disclosed plaintext at this
             // position. This is what stops a reporter fabricating message content.
-            let recomputed = commit_with_opening(&m.plaintext, m.prev.as_ref(), &m.opening);
+            let recomputed = commit_with_opening(&m.plaintext, &m.opening);
             if !bool::from(recomputed.0.ct_eq(&m.context.commitment.0)) {
                 return Err(ReportError::BadCommitment(i));
             }
@@ -261,8 +270,9 @@ impl TranscriptReport {
                 return Err(ReportError::BadTag(i));
             }
             if let Some((prev_commitment, prev_seq)) = last {
-                // Causality: this message must name its predecessor.
-                match &m.prev {
+                // Causality: the server's attestation for this message must name the
+                // message before it. A reporter cannot drop the one supplying context.
+                match &m.context.prev_commitment {
                     Some(p) if bool::from(p.0.ct_eq(&prev_commitment.0)) => {}
                     _ => return Err(ReportError::BrokenChain(i)),
                 }
@@ -315,22 +325,29 @@ mod tests {
             }
         }
 
-        /// Client commits, server tags — the normal send path.
+        /// Client commits, server orders and tags — the normal send path.
         fn send(&mut self, msg: &[u8]) -> ReportedMessage {
-            let (commitment, opening) = commit(msg, self.prev.as_ref());
+            self.send_as(self.sender, msg)
+        }
+
+        /// Same, from a specific account, so group cases can be exercised.
+        fn send_as(&mut self, sender: UserId, msg: &[u8]) -> ReportedMessage {
+            // Client: commits to the message only. It does not know the order.
+            let (commitment, opening) = commit(msg);
+
+            // Server: assigns the position and attests to what precedes it.
             self.seq += 1;
             let context = Context {
                 commitment,
                 room: self.room,
-                sender: self.sender,
+                sender,
                 sender_device: self.device,
                 server_seq: self.seq,
+                prev_commitment: self.prev,
             };
             let tag = self.key.tag(&context);
-            let reported =
-                ReportedMessage { plaintext: msg.to_vec(), opening, prev: self.prev, context, tag };
             self.prev = Some(commitment);
-            reported
+            ReportedMessage { plaintext: msg.to_vec(), opening, context, tag }
         }
     }
 
@@ -424,9 +441,54 @@ mod tests {
     fn commitment_hides_the_message() {
         // Two identical plaintexts must not produce equal commitments, or the server
         // could detect repeated messages by comparing commitments.
-        let (c1, _) = commit(b"same message", None);
-        let (c2, _) = commit(b"same message", None);
+        let (c1, _) = commit(b"same message");
+        let (c2, _) = commit(b"same message");
         assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn concurrent_group_senders_still_produce_a_reportable_transcript() {
+        // The case that broke the previous design. Two members send without having seen
+        // each other's message; the server orders them. Because the server supplies the
+        // chain, honest concurrent senders no longer produce an unreportable transcript.
+        let mut h = Harness::new();
+        let alice = h.sender;
+        let bob = UserId::new();
+
+        let first = h.send_as(alice, b"shared context");
+        let from_alice = h.send_as(alice, b"alice speaks");
+        let from_bob = h.send_as(bob, b"bob speaks, unaware of alice");
+
+        let report = TranscriptReport { messages: vec![first, from_alice, from_bob] };
+        assert_eq!(report.verify(&h.key), Ok(()));
+    }
+
+    #[test]
+    fn a_report_from_a_group_attributes_each_message_to_its_own_sender() {
+        let mut h = Harness::new();
+        let alice = h.sender;
+        let bob = UserId::new();
+        let a = h.send_as(alice, b"from alice");
+        let b = h.send_as(bob, b"from bob");
+        assert_eq!(a.context.sender, alice);
+        assert_eq!(b.context.sender, bob);
+        let report = TranscriptReport { messages: vec![a, b] };
+        assert_eq!(report.verify(&h.key), Ok(()));
+    }
+
+    #[test]
+    fn a_reporter_cannot_forge_the_chain_the_server_attested() {
+        // The chain now lives inside the server's tag, so rewriting it invalidates the
+        // tag rather than merely changing a client-supplied field.
+        let mut h = Harness::new();
+        let first = h.send(b"one");
+        let mut second = h.send(b"two");
+        second.context.prev_commitment = None;
+        let report = TranscriptReport { messages: vec![first, second] };
+        assert!(matches!(
+            report.verify(&h.key),
+            Err(ReportError::BadTag(1)) | Err(ReportError::BrokenChain(1))
+        ));
     }
 
     #[test]

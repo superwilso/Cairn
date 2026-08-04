@@ -56,8 +56,6 @@ pub struct Conversation {
     /// unsigned message would be unattributable — franking would have nothing to bind to.
     session: Arc<Session>,
     group: Option<GroupHandle>,
-    /// Tail of the franking hash chain. `None` before the first message.
-    prev_commitment: Option<Commitment>,
 }
 
 impl std::fmt::Debug for Conversation {
@@ -82,22 +80,14 @@ impl Conversation {
             return Err(ConversationError::NotEncrypted);
         }
         let group = session.create_group()?;
-        Ok(Self {
-            seal,
-            room: RoomId::new(),
-            user,
-            device,
-            session,
-            group: Some(group),
-            prev_commitment: None,
-        })
+        Ok(Self { seal, room: RoomId::new(), user, device, session, group: Some(group) })
     }
 
     /// Join an existing encrypted conversation, having accepted an MLS welcome.
     ///
-    /// The franking chain starts empty: a joiner has not seen prior messages and so cannot
-    /// verify or report them. That is correct — MLS deliberately does not give a new member
-    /// access to history, and franking must not invent it.
+    /// A joiner has no access to prior messages — MLS deliberately does not grant it, and
+    /// franking must not invent it. The server owns the franking chain, so a joiner simply
+    /// starts reporting from the messages it can actually decrypt.
     pub fn join_encrypted(
         seal: RoomSeal,
         room: RoomId,
@@ -109,7 +99,7 @@ impl Conversation {
         if !seal.tier().is_e2ee() {
             return Err(ConversationError::NotEncrypted);
         }
-        Ok(Self { seal, room, user, device, session, group: Some(group), prev_commitment: None })
+        Ok(Self { seal, room, user, device, session, group: Some(group) })
     }
 
     /// Open a public (T3) conversation. No MLS group; the server reads content.
@@ -122,15 +112,7 @@ impl Conversation {
         if seal.tier().is_e2ee() {
             return Err(ConversationError::Encrypted);
         }
-        Ok(Self {
-            seal,
-            room: RoomId::new(),
-            user,
-            device,
-            session,
-            group: None,
-            prev_commitment: None,
-        })
+        Ok(Self { seal, room: RoomId::new(), user, device, session, group: None })
     }
 
     /// Sign an outbound envelope with this device's key.
@@ -174,7 +156,7 @@ impl Conversation {
         }
         let group = self.group.as_mut().ok_or(MlsError::NoGroup)?;
 
-        let (commitment, opening) = franking::commit(plaintext, self.prev_commitment.as_ref());
+        let (commitment, opening) = franking::commit(plaintext);
 
         // The opening travels *inside* the encrypted body, never beside it. A recipient
         // cannot file a report without it, and the server must never see it — a server
@@ -195,8 +177,6 @@ impl Conversation {
         )?
         .with_franking_commitment(commitment.to_hex());
         let envelope = self.sign(envelope)?;
-
-        self.prev_commitment = Some(commitment);
         Ok(OutboundMessage { envelope, opening, commitment })
     }
 
@@ -254,16 +234,10 @@ impl Conversation {
                     .and_then(decode_commitment)
                     .ok_or(ConversationError::MissingCommitment)?;
 
-                if !franking::verify_commitment(
-                    &inner.body,
-                    self.prev_commitment.as_ref(),
-                    &inner.opening,
-                    &claimed,
-                ) {
+                if !franking::verify_commitment(&inner.body, &inner.opening, &claimed) {
                     return Err(ConversationError::CommitmentMismatch);
                 }
 
-                self.prev_commitment = Some(claimed);
                 Ok(Some(ReceivedMessage {
                     body: inner.body,
                     franking: Some(ReceivedFranking {
@@ -349,9 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn franking_chain_advances_across_messages() {
-        // Each message must commit to its predecessor, or transcript reports cannot
-        // prove ordering later.
+    fn each_message_gets_a_distinct_opening_and_commitment() {
+        // Ordering is attested by the server, not the sender, so a commitment binds only
+        // its own message. Each send must still be independently openable.
         let session = Arc::new(Session::new(b"alice").unwrap());
         let mut convo = Conversation::create_encrypted(
             dm_seal(),
@@ -365,12 +339,10 @@ mod tests {
         let second = convo.send(b"two", 2).unwrap();
         assert_ne!(first.commitment, second.commitment);
 
-        // The second message's commitment must be reproducible only with the first as prev.
-        let recomputed =
-            franking::commit_with_opening(b"two", Some(&first.commitment), &second.opening);
-        assert_eq!(recomputed, second.commitment);
-        let wrong = franking::commit_with_opening(b"two", None, &second.opening);
-        assert_ne!(wrong, second.commitment);
+        assert_eq!(franking::commit_with_opening(b"one", &first.opening), first.commitment);
+        assert_eq!(franking::commit_with_opening(b"two", &second.opening), second.commitment);
+        // An opening must not open a different message.
+        assert_ne!(franking::commit_with_opening(b"two", &first.opening), second.commitment);
     }
 
     #[test]
@@ -459,7 +431,7 @@ mod tests {
         let (mut alice, mut bob) = linked_pair();
 
         let mut sent = alice.send(b"innocuous", 1).unwrap();
-        let (bogus, _) = franking::commit(b"something else entirely", None);
+        let (bogus, _) = franking::commit(b"something else entirely");
         sent.envelope.franking_commitment = Some(bogus.to_hex());
 
         assert!(matches!(bob.receive(&sent.envelope), Err(ConversationError::CommitmentMismatch)));
@@ -481,15 +453,18 @@ mod tests {
         for (i, text) in [&b"first"[..], &b"second"[..], &b"third"[..]].iter().enumerate() {
             let sent = alice.send(text, i as i64).unwrap();
 
-            // The server tags what it can see: the commitment, not the plaintext.
+            // The server tags what it can see — the commitment, never the plaintext — and
+            // supplies the chain, since only it knows the true order.
             let context = Context {
                 commitment: sent.commitment,
                 room: sent.envelope.room,
                 sender: sent.envelope.sender,
                 sender_device: sent.envelope.sender_device,
                 server_seq: i as u64 + 1,
+                prev_commitment: prev,
             };
             let tag = server_key.tag(&context);
+            prev = Some(sent.commitment);
 
             let got = bob.receive(&sent.envelope).unwrap().unwrap();
             let franking = got.franking.unwrap();
@@ -497,11 +472,9 @@ mod tests {
             reported.push(ReportedMessage {
                 plaintext: got.body,
                 opening: franking.opening,
-                prev,
                 context,
                 tag,
             });
-            prev = Some(franking.commitment);
         }
 
         let report = TranscriptReport { messages: reported };

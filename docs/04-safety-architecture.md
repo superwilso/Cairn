@@ -43,13 +43,29 @@ problems:
 - **Retrofitting causality into a deployed report format is very expensive**, because old
   clients keep emitting the old format indefinitely.
 
-So each commitment covers its predecessor's commitment, forming a hash chain. A report can
-carry a contiguous run whose ordering the moderator verifies cryptographically rather than
-trusting. v1 may populate a single message; the format does not need to change when that
-stops being true.
+So each message's **server attestation names its predecessor**, forming a chain. A report
+can carry a contiguous run whose ordering the moderator verifies cryptographically rather
+than trusting. v1 may populate a single message; the format does not need to change when
+that stops being true.
 
-This follows the 2025 transcript-franking line of work (arXiv:2507.19391). Group franking
-needs asymmetric group message franking (AGMF) and is **not yet implemented** — see §6.
+**The server anchors the chain, not the sender.** An earlier design had each sender commit
+to the predecessor it had seen. That works 1-to-1 and breaks in a group: two members
+sending concurrently both believe they follow the same message, the chain forks, and the
+transcript becomes unreportable — an honest-participant failure, not an attack. The server
+assigns `server_seq` and is the only party that knows the true order when a message is
+accepted. This costs no trust: `01-threat-model.md` §4 already concedes the server can
+reorder and drop messages, so making it the ordering witness grants it nothing new.
+
+This follows the 2025 transcript-franking line of work (arXiv:2507.19391).
+
+**On group franking and AGMF.** The AGMF literature targets *metadata-private* systems,
+where the server does not learn who sent a message and attribution must therefore be
+carried cryptographically. Cairn is explicitly not metadata-private
+(`01-threat-model.md` §3.1) and now authenticates every envelope, so the server knows the
+sender directly and symmetric franking attributes correctly in groups. The genuine
+group-specific problem was ordering, and that is what the server-anchored chain fixes.
+Revisit AGMF if metadata privacy ever becomes a goal — it would make this reasoning
+obsolete.
 
 ### Properties, verified by test
 
@@ -60,6 +76,9 @@ needs asymmetric group message franking (AGMF) and is **not yet implemented** �
 | Reattribution is rejected (unframeability) | `reattributing_to_another_account_is_rejected` |
 | Forgery without the server key fails | `a_forged_message_cannot_be_tagged_without_the_server_key` |
 | **Dropping context breaks the chain** | `omitting_a_middle_message_breaks_the_chain` |
+| Concurrent group senders stay reportable | `concurrent_group_senders_still_produce_a_reportable_transcript` |
+| Each group message attributed to its own sender | `a_report_from_a_group_attributes_each_message_to_its_own_sender` |
+| The attested chain cannot be forged by a reporter | `a_reporter_cannot_forge_the_chain_the_server_attested` |
 | Reordering is rejected | `reordering_is_rejected` |
 | Cross-room splicing is rejected | `splicing_messages_from_another_room_is_rejected` |
 | Commitments hide content | `commitment_hides_the_message` |
@@ -185,9 +204,9 @@ unmoderated; the mechanism changes to match what is technically possible there.
 
 ## 6. Open questions
 
-1. **Group franking (AGMF).** The current implementation is sound for 1-to-1. Group
-   franking needs different machinery — in a group, "who sent it" is a claim about a
-   member, and a naive scheme lets a member fabricate attribution. Blocking for T2.
+1. **Group franking.** Resolved for Cairn's threat model — see the AGMF note above. The
+   ordering bug it depended on is fixed and tested. Reopen if metadata privacy becomes a
+   goal.
 2. **Report handling.** Franking proves a message was sent. It does not decide what to do
    about it. Moderator tooling, appeals, and review workflows are unspecified and are at
    least as much of the work as the cryptography.

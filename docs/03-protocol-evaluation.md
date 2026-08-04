@@ -83,7 +83,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
 | No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
 | No account system | Messages are authenticated per device, but anyone can *register* any unused user id — no passwords, sessions, invites, or rate limits |
-| No group franking (AGMF) | T2 franking is not yet sound for groups |
+| Franking unreviewed | Groups are handled, but no external cryptographic review yet |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
 | No TLS termination | Must sit behind a reverse proxy |
 

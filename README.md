@@ -73,7 +73,7 @@ one.
 ## Try it
 
 ```bash
-cargo test --workspace     # 84 tests
+cargo test --workspace     # 89 tests
 cargo run -p cairn-cli     # the vertical slice, end to end
 ```
 

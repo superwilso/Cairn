@@ -24,7 +24,9 @@ Specifically, and non-exhaustively:
   now survive restarts, but the whole file is rewritten per write, and a crash between
   writes loses everything since the last one (never a partial file — writes are atomic).
   Adequate for a scaffold, not for real load.
-- **No group franking.** The franking implementation is sound for 1-to-1 only.
+- **Franking is unaudited.** It now handles groups correctly (the server anchors the
+  ordering chain, so concurrent senders stay reportable), but no cryptographer outside
+  the project has reviewed the construction.
 - **No transport security of its own.** Must sit behind a TLS-terminating proxy.
 
 A full list is in `docs/03-protocol-evaluation.md`.

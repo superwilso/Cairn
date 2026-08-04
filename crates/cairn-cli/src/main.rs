@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for plaintext in conversation {
         // Client: commit and encrypt together.
-        let (commitment, opening) = franking::commit(plaintext, prev.as_ref());
+        let (commitment, opening) = franking::commit(plaintext);
         let ciphertext = alice_group.encrypt(plaintext)?;
         let wire = ciphertext.to_bytes()?;
 
@@ -85,8 +85,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sender: alice_id,
             sender_device: alice_device,
             server_seq: seq,
+            prev_commitment: prev,
         };
         let tag = server_key.tag(&context);
+        prev = Some(commitment);
 
         // Recipient: decrypt, and retain what a future report would need.
         let decrypted = bob_group
@@ -101,8 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &commitment.to_hex()[..12]
         );
 
-        received.push(ReportedMessage { plaintext: decrypted, opening, prev, context, tag });
-        prev = Some(commitment);
+        received.push(ReportedMessage { plaintext: decrypted, opening, context, tag });
     }
 
     // --- 4. Bob reports the conversation ----------------------------------------------

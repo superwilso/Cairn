@@ -51,6 +51,12 @@ struct Room {
     /// and it is the ordering a moderator can trust in a franking report — unlike the
     /// sender's self-reported clock.
     next_seq: u64,
+    /// Commitment of the last *franked* message, as this server ordered it.
+    ///
+    /// The server owns the franking chain because a sender in a group cannot know what
+    /// precedes its message — see `cairn_crypto::franking` module docs.
+    #[serde(default)]
+    last_franked: Option<Commitment>,
     log: Vec<StoredMessage>,
 }
 
@@ -208,7 +214,7 @@ impl Instance {
         let seal = RoomSeal::new(shape)?;
         let id = RoomId::new();
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        rooms.insert(id, Room { seal, next_seq: 0, log: Vec::new() });
+        rooms.insert(id, Room { seal, next_seq: 0, last_franked: None, log: Vec::new() });
         self.persist(&rooms)?;
         Ok((id, seal))
     }
@@ -241,13 +247,16 @@ impl Instance {
             Some(hex_commitment) => {
                 let commitment =
                     decode_commitment(hex_commitment).ok_or(ServerError::BadCommitment)?;
-                Some(self.franking_key.tag(&FrankingContext {
+                let tag = self.franking_key.tag(&FrankingContext {
                     commitment,
                     room: envelope.room,
                     sender: envelope.sender,
                     sender_device: envelope.sender_device,
                     server_seq,
-                }))
+                    prev_commitment: room.last_franked,
+                });
+                room.last_franked = Some(commitment);
+                Some(tag)
             }
             None => None,
         };
@@ -411,7 +420,7 @@ mod tests {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
         let (room, _) = inst.create_room(dm_shape()).unwrap();
-        let (commitment, _opening) = cairn_crypto::commit(b"hello", None);
+        let (commitment, _opening) = cairn_crypto::commit(b"hello");
 
         let e = sender
             .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
@@ -425,6 +434,7 @@ mod tests {
             sender: stored.envelope.sender,
             sender_device: stored.envelope.sender_device,
             server_seq: stored.server_seq,
+            prev_commitment: None,
         };
         assert!(inst.franking_key().verify_tag(&ctx, &tag));
     }
@@ -461,7 +471,7 @@ mod tests {
             let inst = Instance::open(storage.clone()).unwrap();
             let sender = TestSender::registered(&inst);
             let (room, _) = inst.create_room(dm_shape()).unwrap();
-            let (commitment, opening) = cairn_crypto::commit(b"evidence", None);
+            let (commitment, opening) = cairn_crypto::commit(b"evidence");
             let e = sender
                 .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
                 .with_franking_commitment(commitment.to_hex());
@@ -484,13 +494,13 @@ mod tests {
             messages: vec![ReportedMessage {
                 plaintext: b"evidence".to_vec(),
                 opening,
-                prev: None,
                 context: Context {
                     commitment,
                     room,
                     sender,
                     sender_device: device,
                     server_seq: seq,
+                    prev_commitment: None,
                 },
                 tag,
             }],
@@ -623,6 +633,93 @@ mod tests {
             inst.register_device(alice.user, alice.device, attacker_key.public_key()),
             Err(ServerError::DeviceAlreadyRegistered)
         ));
+    }
+
+    #[test]
+    fn the_server_chains_franked_messages_from_different_senders() {
+        // The group case. Two members send without seeing each other's message; neither
+        // can know what precedes theirs. The server orders them and supplies the chain,
+        // so the resulting transcript is reportable — which it was not when the sender
+        // guessed the predecessor.
+        use cairn_crypto::franking::{ReportedMessage, TranscriptReport};
+
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(dm_shape()).unwrap();
+
+        let mut reported = Vec::new();
+        for (sender, text) in [(&alice, &b"alice speaks"[..]), (&bob, &b"bob speaks"[..])] {
+            let (commitment, opening) = cairn_crypto::commit(text);
+            let e = sender
+                .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
+                .with_franking_commitment(commitment.to_hex());
+            let stored = inst.accept(sender.sign(e)).unwrap();
+
+            reported.push(ReportedMessage {
+                plaintext: text.to_vec(),
+                opening,
+                context: FrankingContext {
+                    commitment,
+                    room,
+                    sender: stored.envelope.sender,
+                    sender_device: stored.envelope.sender_device,
+                    server_seq: stored.server_seq,
+                    // Reconstructed from what the server attested; the first has none.
+                    prev_commitment: reported
+                        .last()
+                        .map(|m: &ReportedMessage| m.context.commitment),
+                },
+                tag: stored.franking_tag.unwrap(),
+            });
+        }
+
+        let report = TranscriptReport { messages: reported };
+        assert_eq!(
+            inst.verify_report(&report),
+            Ok(()),
+            "a transcript spanning two senders must verify"
+        );
+    }
+
+    #[test]
+    fn unfranked_messages_do_not_break_the_chain() {
+        // A T3 room mixes franked and unfranked messages. The chain must track only
+        // franked ones, or an unfranked message in between would orphan the next report.
+        let inst = Instance::in_memory();
+        let sender = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape()).unwrap();
+
+        let (c1, _) = cairn_crypto::commit(b"one");
+        let e = sender
+            .unsigned(room, EnvelopePayload::Plaintext { body: "one".into() })
+            .with_franking_commitment(c1.to_hex());
+        inst.accept(sender.sign(e)).unwrap();
+
+        // An unfranked message in between.
+        inst.accept(sender.envelope(room, EnvelopePayload::Plaintext { body: "plain".into() }))
+            .unwrap();
+
+        let (c2, o2) = cairn_crypto::commit(b"two");
+        let e = sender
+            .unsigned(room, EnvelopePayload::Plaintext { body: "two".into() })
+            .with_franking_commitment(c2.to_hex());
+        let stored = inst.accept(sender.sign(e)).unwrap();
+
+        // The second franked message must chain to the first, not to the unfranked one.
+        let ctx = FrankingContext {
+            commitment: c2,
+            room,
+            sender: stored.envelope.sender,
+            sender_device: stored.envelope.sender_device,
+            server_seq: stored.server_seq,
+            prev_commitment: Some(c1),
+        };
+        assert!(
+            inst.franking_key().verify_tag(&ctx, &stored.franking_tag.unwrap()),
+            "the chain must skip unfranked messages"
+        );
+        let _ = o2;
     }
 
     #[test]
