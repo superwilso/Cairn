@@ -106,6 +106,16 @@ impl ServerFrankingKey {
         Self(bytes)
     }
 
+    /// Expose the raw key so it can be persisted.
+    ///
+    /// Named bluntly because that is what it is. The key must outlive restarts — losing
+    /// it invalidates every franking tag the instance ever issued — but anything holding
+    /// these bytes holds the ability to forge tags, so keep them on disk with restricted
+    /// permissions and nowhere else.
+    pub const fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
     /// Tag a commitment, binding it to who sent it, where, and in what order.
     pub fn tag(&self, ctx: &Context) -> Tag {
         let mut mac = HmacSha256::new_from_slice(&self.0).expect("hmac accepts any key length");

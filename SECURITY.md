@@ -16,8 +16,10 @@ Specifically, and non-exhaustively:
   a malicious one**. Key transparency — which makes server equivocation detectable without
   manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
 - **No authentication.** The server accepts anything from anyone.
-- **No persistence.** The franking key is regenerated on every restart, invalidating all
-  historical reports.
+- **Storage is a JSON snapshot rewritten on every message.** State and the franking key
+  now survive restarts, but the whole file is rewritten per write, and a crash between
+  writes loses everything since the last one (never a partial file — writes are atomic).
+  Adequate for a scaffold, not for real load.
 - **No group franking.** The franking implementation is sound for 1-to-1 only.
 - **No transport security of its own.** Must sit behind a TLS-terminating proxy.
 

@@ -36,6 +36,9 @@ impl IntoResponse for ServerError {
             ServerError::Rejected(_) | ServerError::Shape(_) | ServerError::BadCommitment => {
                 StatusCode::BAD_REQUEST
             }
+            // A storage failure is ours, not the caller's, and it means the write may not
+            // be durable — so it must not be reported as success.
+            ServerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }

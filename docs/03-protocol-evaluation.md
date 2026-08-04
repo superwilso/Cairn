@@ -62,7 +62,8 @@ These block fixing the tier constants and any public claim about group sizes:
 - [ ] **1,000-member MLS group**: join, leave, and commit latency; memory per client
 - [ ] **Mobile battery and sync** under sustained commit churn — needs a mobile client
 - [ ] **50,000-member public channel** read path
-- [ ] **Group state persistence** across restarts (currently in-memory, so nothing survives)
+- [ ] **MLS group state persistence** on the *client* (server state now persists; client
+      group state is still in-memory, so a client cannot resume a session after restart)
 - [ ] **`T1_MAX_MEMBERS` / `T2_MAX_MEMBERS`** — currently provisional placeholders
       (256 / 2,000) in `crates/cairn-proto/src/tier.rs`, clearly marked as such
 
@@ -75,8 +76,8 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | Gap | Consequence |
 |---|---|
 | No key transparency; safety numbers not surfaced in a UI | The primitive exists and is tested, but nothing displays it and no contact store persists verification state, so in practice E2EE still holds against an honest-but-curious server rather than a malicious one (`01-threat-model.md` §4) |
-| Franking key regenerated on restart | All historical reports become unverifiable |
-| No persistence anywhere | Nothing survives a restart |
+| Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
+| No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
 | No authentication on the server | Anyone can post as anyone |
 | No group franking (AGMF) | T2 franking is not yet sound for groups |
 | JSON + hex wire format | A development convenience; a binary format replaces it |

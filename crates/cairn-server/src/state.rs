@@ -3,17 +3,21 @@
 //! Logic lives here rather than in the HTTP handlers so it can be tested without a
 //! socket. The handlers in [`crate::http`] are a thin translation layer.
 //!
-//! Storage is in-memory. Persistence is deliberately not in this scaffold — see
-//! `docs/03-protocol-evaluation.md`.
+//! State is held in memory and snapshotted through [`crate::storage`] on every mutation,
+//! so rooms, the message log, and — critically — the franking key survive a restart.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::{Commitment, Context as FrankingContext, ServerFrankingKey, Tag};
 use cairn_crypto::TranscriptReport;
 use cairn_proto::{Envelope, RoomId, RoomSeal, RoomShape, ShapeError};
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+use crate::storage::{Storage, StorageError};
+
+#[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("no such room")]
     NoSuchRoom,
@@ -23,10 +27,12 @@ pub enum ServerError {
     Shape(#[from] ShapeError),
     #[error("malformed franking commitment")]
     BadCommitment,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
 
 /// A room as the server knows it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Room {
     seal: RoomSeal,
     /// Strictly increasing, assigned by the server.
@@ -39,7 +45,7 @@ struct Room {
 }
 
 /// A message the server has accepted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub envelope: Envelope,
     pub server_seq: u64,
@@ -47,10 +53,26 @@ pub struct StoredMessage {
     pub franking_tag: Option<Tag>,
 }
 
+/// Everything about an instance that must survive a restart.
+///
+/// A list rather than a map so the on-disk form does not depend on how map keys are
+/// encoded, which is a needless way for a format to break between versions.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PersistedState {
+    pub rooms: Vec<PersistedRoom>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedRoom {
+    id: RoomId,
+    room: Room,
+}
+
 /// The instance.
 pub struct Instance {
     rooms: Mutex<HashMap<RoomId, Room>>,
     franking_key: ServerFrankingKey,
+    storage: Arc<dyn Storage>,
 }
 
 impl std::fmt::Debug for Instance {
@@ -62,24 +84,45 @@ impl std::fmt::Debug for Instance {
 pub type SharedInstance = Arc<Instance>;
 
 impl Instance {
-    pub fn new() -> Self {
-        Self {
-            rooms: Mutex::new(HashMap::new()),
-            // Regenerated on restart in this scaffold, which invalidates every previously
-            // issued franking tag. A real deployment must persist this key — losing it
-            // means losing the ability to verify any historical report.
-            franking_key: ServerFrankingKey::generate(),
-        }
+    /// Open an instance against a store, restoring prior state.
+    ///
+    /// The franking key is loaded rather than generated whenever one already exists. That
+    /// is what lets a report filed before a restart still verify afterwards.
+    pub fn open(storage: Arc<dyn Storage>) -> Result<Self, ServerError> {
+        let franking_key = storage.load_or_create_franking_key()?;
+        let persisted = storage.load_state()?;
+        let rooms = persisted.rooms.into_iter().map(|r| (r.id, r.room)).collect();
+        Ok(Self { rooms: Mutex::new(rooms), franking_key, storage })
+    }
+
+    /// An ephemeral instance backed by nothing. Tests and throwaway runs only.
+    pub fn in_memory() -> Self {
+        Self::open(Arc::new(crate::storage::MemoryStorage))
+            .expect("memory storage cannot fail to open")
+    }
+
+    /// Snapshot to durable storage.
+    ///
+    /// Called while the caller still holds the rooms lock, so a save can never interleave
+    /// with a mutation and record a torn view of the state.
+    fn persist(&self, rooms: &HashMap<RoomId, Room>) -> Result<(), ServerError> {
+        let state = PersistedState {
+            rooms: rooms
+                .iter()
+                .map(|(id, room)| PersistedRoom { id: *id, room: room.clone() })
+                .collect(),
+        };
+        self.storage.save_state(&state)?;
+        Ok(())
     }
 
     /// Create a room, deriving and sealing its tier.
     pub fn create_room(&self, shape: RoomShape) -> Result<(RoomId, RoomSeal), ServerError> {
         let seal = RoomSeal::new(shape)?;
         let id = RoomId::new();
-        self.rooms
-            .lock()
-            .expect("rooms mutex poisoned")
-            .insert(id, Room { seal, next_seq: 0, log: Vec::new() });
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        rooms.insert(id, Room { seal, next_seq: 0, log: Vec::new() });
+        self.persist(&rooms)?;
         Ok((id, seal))
     }
 
@@ -119,6 +162,7 @@ impl Instance {
 
         let stored = StoredMessage { envelope, server_seq, franking_tag };
         room.log.push(stored.clone());
+        self.persist(&rooms)?;
         Ok(stored)
     }
 
@@ -154,7 +198,7 @@ impl Instance {
 
 impl Default for Instance {
     fn default() -> Self {
-        Self::new()
+        Self::in_memory()
     }
 }
 
@@ -192,7 +236,7 @@ mod tests {
 
     #[test]
     fn rooms_get_the_tier_their_shape_implies() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (_, dm) = inst.create_room(dm_shape()).unwrap();
         assert_eq!(dm.tier(), Tier::Private);
         let (_, pubc) = inst.create_room(public_shape()).unwrap();
@@ -202,7 +246,7 @@ mod tests {
     #[test]
     fn server_rejects_plaintext_smuggled_into_an_encrypted_room() {
         // The defence that does not depend on the client behaving.
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (room, _) = inst.create_room(dm_shape()).unwrap();
         let e = envelope(room, EnvelopePayload::Plaintext { body: "sneaky".into() });
         assert!(matches!(inst.accept(e), Err(ServerError::Rejected(_))));
@@ -210,7 +254,7 @@ mod tests {
 
     #[test]
     fn server_accepts_ciphertext_in_an_encrypted_room() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (room, _) = inst.create_room(dm_shape()).unwrap();
         let e = envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1, 2, 3] });
         assert!(inst.accept(e).is_ok());
@@ -218,7 +262,7 @@ mod tests {
 
     #[test]
     fn sequence_numbers_are_strictly_increasing() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (room, _) = inst.create_room(public_shape()).unwrap();
         let mut last = 0;
         for i in 0..5 {
@@ -231,14 +275,14 @@ mod tests {
 
     #[test]
     fn unknown_room_is_rejected() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let e = envelope(RoomId::new(), EnvelopePayload::Plaintext { body: "x".into() });
         assert!(matches!(inst.accept(e), Err(ServerError::NoSuchRoom)));
     }
 
     #[test]
     fn messages_are_franked_when_a_commitment_is_present() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (room, _) = inst.create_room(dm_shape()).unwrap();
         let (commitment, _opening) = cairn_crypto::commit(b"hello", None);
 
@@ -259,16 +303,105 @@ mod tests {
 
     #[test]
     fn malformed_commitment_is_rejected() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (room, _) = inst.create_room(dm_shape()).unwrap();
         let e = envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
             .with_franking_commitment("not-hex");
         assert!(matches!(inst.accept(e), Err(ServerError::BadCommitment)));
     }
 
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cairn-state-{}-{}", name, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_report_filed_before_a_restart_still_verifies_after_it() {
+        // The property persistence exists for. If the franking key changed on restart,
+        // every tag the instance ever issued would stop verifying — a moderation system
+        // that forgets its own evidence.
+        use cairn_crypto::franking::{Context, ReportedMessage, TranscriptReport};
+
+        let dir = temp_dir("restart");
+        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+
+        let (room, sender, device, commitment, opening, tag, seq) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, _) = inst.create_room(dm_shape()).unwrap();
+            let (commitment, opening) = cairn_crypto::commit(b"evidence", None);
+            let e = envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
+                .with_franking_commitment(commitment.to_hex());
+            let stored = inst.accept(e).unwrap();
+            (
+                room,
+                stored.envelope.sender,
+                stored.envelope.sender_device,
+                commitment,
+                opening,
+                stored.franking_tag.unwrap(),
+                stored.server_seq,
+            )
+        };
+
+        // Restart: a brand new Instance over the same directory.
+        let restarted = Instance::open(storage).unwrap();
+
+        let report = TranscriptReport {
+            messages: vec![ReportedMessage {
+                plaintext: b"evidence".to_vec(),
+                opening,
+                prev: None,
+                context: Context {
+                    commitment,
+                    room,
+                    sender,
+                    sender_device: device,
+                    server_seq: seq,
+                },
+                tag,
+            }],
+        };
+        assert_eq!(
+            restarted.verify_report(&report),
+            Ok(()),
+            "a tag issued before the restart must still verify after it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rooms_and_messages_survive_a_restart() {
+        let dir = temp_dir("rooms");
+        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+
+        let room = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, _) = inst.create_room(public_shape()).unwrap();
+            for i in 0..3 {
+                let e = envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
+                inst.accept(e).unwrap();
+            }
+            room
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.room_seal(room).unwrap().tier(), Tier::PublicCommunity);
+        assert_eq!(restarted.messages_since(room, 0).unwrap().len(), 3);
+
+        // Sequence numbers must continue, not restart — a repeated server_seq would let
+        // two different messages carry interchangeable franking contexts.
+        let e = envelope(room, EnvelopePayload::Plaintext { body: "after".into() });
+        assert_eq!(restarted.accept(e).unwrap().server_seq, 4);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn messages_since_filters_by_sequence() {
-        let inst = Instance::new();
+        let inst = Instance::in_memory();
         let (room, _) = inst.create_room(public_shape()).unwrap();
         for i in 0..3 {
             let e = envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });

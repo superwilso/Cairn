@@ -77,8 +77,10 @@ deniable protocol offers. Cairn accepts this trade on frankable surfaces and sta
 - It does not work if the recipient never reports.
 - A malicious server can refuse to issue tags, or discard them. It cannot forge one.
 - **The franking key must be persisted.** Losing it invalidates every historical report.
-  The current scaffold regenerates it on restart, which is fine for a scaffold and
-  unacceptable in deployment.
+  This is now implemented: the key is stored with owner-only permissions and loaded on
+  start, and a corrupt or unreadable key file is a hard error rather than a silently
+  minted replacement — which would discard the ability to verify history without telling
+  the operator.
 
 ---
 

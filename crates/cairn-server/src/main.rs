@@ -6,14 +6,15 @@
 //!
 //! ## Status
 //!
-//! Pre-alpha scaffold. In-memory storage, no authentication, no TLS termination, and the
-//! franking key is regenerated on every restart. **Not deployable.** It exists to make the
-//! vertical slice exercisable end to end.
+//! Pre-alpha scaffold. No authentication and no TLS termination. **Not deployable.** It
+//! exists to make the vertical slice exercisable end to end. State is now persisted, so
+//! the franking key and message log survive a restart.
 
 #![forbid(unsafe_code)]
 
 mod http;
 mod state;
+mod storage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,10 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind: SocketAddr =
         std::env::var("CAIRN_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string()).parse()?;
 
-    let instance = Arc::new(state::Instance::new());
+    let data_dir = std::env::var("CAIRN_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let storage = Arc::new(storage::FileStorage::new(&data_dir)?);
+    let instance = Arc::new(state::Instance::open(storage)?);
     let app = http::router(instance);
 
-    tracing::warn!("pre-alpha scaffold: in-memory storage, no auth, no TLS. Do not expose this.");
+    tracing::warn!("pre-alpha scaffold: no auth, no TLS. Do not expose this.");
+    tracing::info!(%data_dir, "state directory");
     tracing::info!(%bind, "cairn-server listening");
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
