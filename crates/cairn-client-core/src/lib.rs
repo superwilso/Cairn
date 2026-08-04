@@ -18,4 +18,6 @@
 
 pub mod conversation;
 
-pub use conversation::{Conversation, ConversationError, OutboundMessage};
+pub use conversation::{
+    Conversation, ConversationError, OutboundMessage, ReceivedFranking, ReceivedMessage,
+};

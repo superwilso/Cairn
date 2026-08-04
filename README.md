@@ -46,6 +46,9 @@ A working protocol core, with the security-critical paths under test:
   message" without the server ever seeing plaintext. Reports cover a **hash-chained run of
   messages**, so a moderator can verify ordering and causality — and a reporter cannot
   quietly drop the message that supplies the context.
+- **Safety numbers** — 60-digit out-of-band key verification, so a malicious server
+  substituting keys becomes visible to the user. Verified against real MLS identity keys.
+  Not yet surfaced in any UI, so the protection is not yet effective in practice.
 - **Tier enforcement** — structurally enforced. There is no setter for a room's tier, and
   the server re-validates every message against its room's tier because
   [modified clients exist](docs/01-threat-model.md).
@@ -66,7 +69,7 @@ one.
 ## Try it
 
 ```bash
-cargo test --workspace     # 48 tests
+cargo test --workspace     # 64 tests
 cargo run -p cairn-cli     # the vertical slice, end to end
 ```
 
@@ -108,6 +111,8 @@ logic above the FFI line** ([ADR-006](docs/adr/006-platform-architecture.md)).
 
 ## What Cairn is not
 
+- **Not yet safe against a *malicious* server.** Safety numbers exist but no client shows
+  them, and key transparency is unimplemented. ([SECURITY.md](SECURITY.md))
 - **Not metadata-private.** The server sees who talks to whom and when. Signal beats us
   here, and will until it is designed for. ([Threat model §3.1](docs/01-threat-model.md))
 - **Not federated at launch.** Self-hosted islands, with a designed seam.

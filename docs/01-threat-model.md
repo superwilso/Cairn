@@ -142,6 +142,12 @@ holds.
 polish. They are what makes A4 a bounded adversary rather than an unbounded one, and they
 belong in the same milestone as encryption itself.
 
+**Status.** Safety numbers are implemented and tested (`cairn-crypto::verification`),
+including detection of a key that changes after verification. They are **not yet shown to
+any user**, and key transparency is unimplemented. So A4 remains an *unbounded* adversary
+in practice: the tool exists, but nothing in the product yet puts it in front of the person
+who has to use it. A primitive nobody sees protects nobody.
+
 ---
 
 ## 5. The malicious group member (A6)
@@ -237,7 +243,9 @@ Plain-language summary, which should be reflected in the UI and in any public cl
    delivery path, so it must be decided before the spec freezes (§3.1).
 2. What happens when a user loses every device? (§6)
 3. Key transparency: build on an existing verifiable log design, or defer and ship only
-   manual verification? Deferring is defensible; leaving it undocumented is not. (§4)
+   manual verification? Deferring is defensible; leaving it undocumented is not. Manual
+   verification now exists as a primitive; the open question is whether it is sufficient
+   for v1 and what surfaces it in the UI. (§4)
 4. Are bots group members with keys, and how is that surfaced? A bot in an E2EE room is an
    A6 adversary with a friendly name.
 

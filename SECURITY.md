@@ -8,9 +8,13 @@ need a secure messenger today, use Signal.
 
 Specifically, and non-exhaustively:
 
-- **No key transparency and no safety-number verification.** The end-to-end encryption
-  holds against an honest-but-curious server, **not a malicious one**. A malicious server
-  can currently substitute keys undetected. See `docs/01-threat-model.md` §4.
+- **No key transparency, and safety numbers are not yet surfaced in any UI.**
+  Safety-number verification is implemented and tested in `cairn-crypto::verification`,
+  but nothing displays it to a user yet, and there is no contact store persisting
+  verification state. Until a client shows the number and a user compares it out of band,
+  the end-to-end encryption still holds only against an honest-but-curious server, **not
+  a malicious one**. Key transparency — which makes server equivocation detectable without
+  manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
 - **No authentication.** The server accepts anything from anyone.
 - **No persistence.** The franking key is regenerated on every restart, invalidating all
   historical reports.

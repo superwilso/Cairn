@@ -66,6 +66,8 @@ pub fn parse_message(bytes: &[u8]) -> Result<MlsMessage, MlsError> {
 /// A Cairn participant: an identity plus the MLS client built from it.
 pub struct Session {
     client: Client<CairnConfig>,
+    identity: Vec<u8>,
+    public_key: Vec<u8>,
 }
 
 impl std::fmt::Debug for Session {
@@ -96,6 +98,7 @@ impl Session {
             |e: mls_rs_crypto_rustcrypto::RustCryptoError| MlsError::Crypto(e.to_string()),
         )?;
 
+        let public_key = public.as_ref().to_vec();
         let credential = BasicCredential::new(identity.to_vec()).into_credential();
         let signing_identity = SigningIdentity::new(credential, public);
 
@@ -105,7 +108,25 @@ impl Session {
             .signing_identity(signing_identity, secret, CIPHERSUITE)
             .build();
 
-        Ok(Self { client })
+        Ok(Self { client, identity: identity.to_vec(), public_key })
+    }
+
+    /// This participant's identity (credential) bytes.
+    pub fn identity(&self) -> &[u8] {
+        &self.identity
+    }
+
+    /// This participant's long-term signature public key.
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    /// The fingerprint others compare against out of band.
+    ///
+    /// See [`crate::verification`] — this is the value that makes a malicious server's key
+    /// substitution visible.
+    pub fn fingerprint(&self) -> crate::verification::Fingerprint {
+        crate::verification::Fingerprint::compute(&self.public_key, &self.identity)
     }
 
     /// Start a new group. The creator is its only member until it commits an add.
@@ -281,6 +302,42 @@ mod tests {
             Some(&b"after carol left"[..]),
             "remaining members must still receive"
         );
+    }
+
+    #[test]
+    fn safety_numbers_detect_a_substituted_key() {
+        // The threat model's A4: a malicious server hands Alice a key it controls while
+        // claiming it is Bob's. MLS cannot detect this — only comparing safety numbers
+        // out of band can. This exercises it with real generated MLS identity keys rather
+        // than synthetic bytes.
+        use crate::verification::SafetyNumber;
+
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+
+        // A malicious server generates its own key and presents it as Bob's.
+        let impostor = Session::new(b"bob@instance").unwrap();
+
+        let honest = SafetyNumber::between(&alice.fingerprint(), &bob.fingerprint());
+        let attacked = SafetyNumber::between(&alice.fingerprint(), &impostor.fingerprint());
+
+        assert_ne!(
+            honest, attacked,
+            "an impostor using the same claimed identity must still produce a different \
+             safety number, or out-of-band verification is worthless"
+        );
+
+        // Both parties independently derive the same value.
+        let from_bobs_side = SafetyNumber::between(&bob.fingerprint(), &alice.fingerprint());
+        assert_eq!(honest, from_bobs_side);
+    }
+
+    #[test]
+    fn a_sessions_fingerprint_is_stable() {
+        let alice = Session::new(b"alice@instance").unwrap();
+        assert_eq!(alice.fingerprint(), alice.fingerprint());
+        assert!(!alice.public_key().is_empty());
+        assert_eq!(alice.identity(), b"alice@instance");
     }
 
     #[test]

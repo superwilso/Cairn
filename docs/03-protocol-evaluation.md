@@ -47,6 +47,13 @@ performance measurements. Those are still owed.
   workspace test suite runs in well under a second.
 - **Transcript franking is practical** — a plain HMAC hash chain gives verifiable causality
   with no exotic cryptography. Detecting an omitted middle message costs nothing extra.
+- **The franking opening now travels inside the encrypted body**, so a recipient can
+  actually file a report. The recipient also re-derives the commitment and rejects the
+  message if it does not open to the text they were shown — without that check a sender
+  could have the server tag one commitment while displaying different text, leaving the
+  recipient unable to prove what they received.
+- **Safety numbers work against real MLS identity keys**, not just synthetic input. An
+  impostor claiming the same identity string still produces a different number.
 
 ## Still owed
 
@@ -67,8 +74,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 
 | Gap | Consequence |
 |---|---|
-| No key transparency or safety-number verification | E2EE holds against an honest-but-curious server, **not a malicious one** (`01-threat-model.md` §4) |
-| Franking openings not yet inside the encrypted payload | Currently returned alongside; must move in-envelope |
+| No key transparency; safety numbers not surfaced in a UI | The primitive exists and is tested, but nothing displays it and no contact store persists verification state, so in practice E2EE still holds against an honest-but-curious server rather than a malicious one (`01-threat-model.md` §4) |
 | Franking key regenerated on restart | All historical reports become unverifiable |
 | No persistence anywhere | Nothing survives a restart |
 | No authentication on the server | Anyone can post as anyone |

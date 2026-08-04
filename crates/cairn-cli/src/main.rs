@@ -13,6 +13,7 @@
 
 use cairn_crypto::franking::{self, Commitment, Context, ReportedMessage, ServerFrankingKey};
 use cairn_crypto::mls::Session;
+use cairn_crypto::verification::{ContactVerification, SafetyNumber};
 use cairn_crypto::TranscriptReport;
 use cairn_proto::{DeviceId, RoomId, UserId};
 
@@ -29,6 +30,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("1. MLS group established");
     println!("   members: {}, epoch: {}\n", alice_group.member_count(), alice_group.epoch());
+
+    // --- 1a. Out-of-band key verification --------------------------------------------
+    // MLS protects a group whose members were correctly identified. It cannot tell you
+    // whether the server handed you the right key in the first place. Only comparing this
+    // number over a channel the server does not control can.
+    let safety = SafetyNumber::between(&alice.fingerprint(), &bob.fingerprint());
+    println!("1a. Safety number (compare out of band)");
+    println!("   {safety}");
+
+    let impostor = Session::new(b"bob@example.instance")?;
+    let spoofed = SafetyNumber::between(&alice.fingerprint(), &impostor.fingerprint());
+    println!("   if the server substituted a key, Alice would instead see:");
+    println!("   {spoofed}");
+    println!("   -> mismatch is visible to the user: {}\n", safety != spoofed);
+
+    let mut bob_record = ContactVerification::new(bob.fingerprint());
+    bob_record.mark_verified();
+    bob_record.observe(impostor.fingerprint());
+    println!(
+        "   after a key change post-verification, state = {:?}, warn = {}\n",
+        bob_record.state,
+        bob_record.needs_attention()
+    );
 
     // --- 2 & 3. Send, frank, and let the "server" sequence + tag ----------------------
     // The server holds only this key and the ciphertext. It never sees plaintext.

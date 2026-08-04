@@ -20,9 +20,11 @@
 
 pub mod franking;
 pub mod mls;
+pub mod verification;
 
 pub use franking::{
     commit, verify_commitment, Commitment, Context as FrankingContext, Opening, ReportError,
     ReportedMessage, ServerFrankingKey, Tag, TranscriptReport,
 };
 pub use mls::{CommitOutput, GroupHandle, MlsError, Session};
+pub use verification::{ContactVerification, Fingerprint, SafetyNumber, VerificationState};
