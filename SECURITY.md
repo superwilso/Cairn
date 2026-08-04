@@ -15,7 +15,11 @@ Specifically, and non-exhaustively:
   the end-to-end encryption still holds only against an honest-but-curious server, **not
   a malicious one**. Key transparency — which makes server equivocation detectable without
   manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
-- **No authentication.** The server accepts anything from anyone.
+- **Account creation is unauthenticated.** Messages are now authenticated — every envelope
+  is signed by its sending device, and the device→account binding is fixed at registration,
+  so nobody can send as an account they do not hold a key for. But *registering* an account
+  is open: anyone can claim any unused user id on first registration. There are no
+  passwords, sessions, invites, or rate limits yet.
 - **Storage is a JSON snapshot rewritten on every message.** State and the franking key
   now survive restarts, but the whole file is rewritten per write, and a crash between
   writes loses everything since the last one (never a partial file — writes are atomic).

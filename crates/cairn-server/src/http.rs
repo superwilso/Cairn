@@ -22,6 +22,7 @@ use crate::state::{ServerError, SharedInstance};
 pub fn router(instance: SharedInstance) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/devices", post(register_device))
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room}", get(describe_room))
         .route("/v1/rooms/{room}/messages", post(send_message).get(fetch_messages))
@@ -39,6 +40,15 @@ impl IntoResponse for ServerError {
             // A storage failure is ours, not the caller's, and it means the write may not
             // be durable — so it must not be reported as success.
             ServerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Authentication failures are all 401 and all carry their own message. They
+            // are deliberately not collapsed into one opaque error: an honest client with
+            // an unregistered device needs to know that, and none of these distinctions
+            // help an attacker, who already knows which part of the request they forged.
+            ServerError::Unsigned
+            | ServerError::UnknownDevice
+            | ServerError::BadSignature
+            | ServerError::DeviceUserMismatch => StatusCode::UNAUTHORIZED,
+            ServerError::DeviceAlreadyRegistered => StatusCode::CONFLICT,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -51,6 +61,33 @@ struct ErrorBody {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Deserialize)]
+struct RegisterDeviceRequest {
+    user: uuid::Uuid,
+    device: uuid::Uuid,
+    /// Hex-encoded signature public key.
+    public_key: String,
+}
+
+/// Register a device's signing key.
+///
+/// There is no account system yet, so anyone may claim any `user` on first registration.
+/// That is a real gap — it means account *creation* is unauthenticated even though
+/// message *sending* now is not. What this does provide is that once a device is bound to
+/// an account, nobody else can send as that account without its key.
+async fn register_device(
+    State(instance): State<SharedInstance>,
+    Json(req): Json<RegisterDeviceRequest>,
+) -> Result<StatusCode, ServerError> {
+    let public_key = hex::decode(&req.public_key).map_err(|_| ServerError::BadSignature)?;
+    instance.register_device(
+        cairn_proto::UserId::from_uuid(req.user),
+        cairn_proto::DeviceId::from_uuid(req.device),
+        &public_key,
+    )?;
+    Ok(StatusCode::CREATED)
 }
 
 #[derive(Deserialize)]

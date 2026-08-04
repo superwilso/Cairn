@@ -4,6 +4,8 @@
 //! a client cannot forget to maintain it — a message sent without a commitment is a
 //! message that can never be reported.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::{self, Commitment, Opening};
@@ -47,6 +49,12 @@ pub struct Conversation {
     room: RoomId,
     user: UserId,
     device: DeviceId,
+    /// The device identity, retained so outbound envelopes can be signed.
+    ///
+    /// Held here rather than passed per call so a platform UI cannot send an unsigned
+    /// message by forgetting an argument. The server rejects unsigned envelopes, and an
+    /// unsigned message would be unattributable — franking would have nothing to bind to.
+    session: Arc<Session>,
     group: Option<GroupHandle>,
     /// Tail of the franking hash chain. `None` before the first message.
     prev_commitment: Option<Commitment>,
@@ -68,17 +76,19 @@ impl Conversation {
         seal: RoomSeal,
         user: UserId,
         device: DeviceId,
-        session: &Session,
+        session: Arc<Session>,
     ) -> Result<Self, ConversationError> {
         if !seal.tier().is_e2ee() {
             return Err(ConversationError::NotEncrypted);
         }
+        let group = session.create_group()?;
         Ok(Self {
             seal,
             room: RoomId::new(),
             user,
             device,
-            group: Some(session.create_group()?),
+            session,
+            group: Some(group),
             prev_commitment: None,
         })
     }
@@ -93,12 +103,13 @@ impl Conversation {
         room: RoomId,
         user: UserId,
         device: DeviceId,
+        session: Arc<Session>,
         group: GroupHandle,
     ) -> Result<Self, ConversationError> {
         if !seal.tier().is_e2ee() {
             return Err(ConversationError::NotEncrypted);
         }
-        Ok(Self { seal, room, user, device, group: Some(group), prev_commitment: None })
+        Ok(Self { seal, room, user, device, session, group: Some(group), prev_commitment: None })
     }
 
     /// Open a public (T3) conversation. No MLS group; the server reads content.
@@ -106,11 +117,28 @@ impl Conversation {
         seal: RoomSeal,
         user: UserId,
         device: DeviceId,
+        session: Arc<Session>,
     ) -> Result<Self, ConversationError> {
         if seal.tier().is_e2ee() {
             return Err(ConversationError::Encrypted);
         }
-        Ok(Self { seal, room: RoomId::new(), user, device, group: None, prev_commitment: None })
+        Ok(Self {
+            seal,
+            room: RoomId::new(),
+            user,
+            device,
+            session,
+            group: None,
+            prev_commitment: None,
+        })
+    }
+
+    /// Sign an outbound envelope with this device's key.
+    ///
+    /// Every send path goes through here; there is no way to emit an unsigned envelope.
+    fn sign(&self, envelope: Envelope) -> Result<Envelope, ConversationError> {
+        let signature = self.session.sign(&envelope.signing_bytes())?;
+        Ok(envelope.with_signature(hex::encode(signature)))
     }
 
     pub const fn tier(&self) -> Tier {
@@ -166,6 +194,7 @@ impl Conversation {
             EnvelopePayload::MlsApplication { ciphertext },
         )?
         .with_franking_commitment(commitment.to_hex());
+        let envelope = self.sign(envelope)?;
 
         self.prev_commitment = Some(commitment);
         Ok(OutboundMessage { envelope, opening, commitment })
@@ -181,14 +210,15 @@ impl Conversation {
         if tier.is_e2ee() {
             return Err(ConversationError::Encrypted);
         }
-        Ok(Envelope::new(
+        let envelope = Envelope::new(
             tier,
             self.room,
             self.user,
             self.device,
             now_ms,
             EnvelopePayload::Plaintext { body: body.to_owned() },
-        )?)
+        )?;
+        self.sign(envelope)
     }
 
     /// Decrypt an incoming envelope, verify its franking commitment, and advance the chain.
@@ -300,10 +330,14 @@ mod tests {
 
     #[test]
     fn encrypted_conversation_produces_franked_ciphertext() {
-        let session = Session::new(b"alice").unwrap();
-        let mut convo =
-            Conversation::create_encrypted(dm_seal(), UserId::new(), DeviceId::new(), &session)
-                .unwrap();
+        let session = Arc::new(Session::new(b"alice").unwrap());
+        let mut convo = Conversation::create_encrypted(
+            dm_seal(),
+            UserId::new(),
+            DeviceId::new(),
+            session.clone(),
+        )
+        .unwrap();
 
         let out = convo.send(b"hello", 1_000).unwrap();
         assert!(out.envelope.payload.is_opaque_to_server());
@@ -318,10 +352,14 @@ mod tests {
     fn franking_chain_advances_across_messages() {
         // Each message must commit to its predecessor, or transcript reports cannot
         // prove ordering later.
-        let session = Session::new(b"alice").unwrap();
-        let mut convo =
-            Conversation::create_encrypted(dm_seal(), UserId::new(), DeviceId::new(), &session)
-                .unwrap();
+        let session = Arc::new(Session::new(b"alice").unwrap());
+        let mut convo = Conversation::create_encrypted(
+            dm_seal(),
+            UserId::new(),
+            DeviceId::new(),
+            session.clone(),
+        )
+        .unwrap();
 
         let first = convo.send(b"one", 1).unwrap();
         let second = convo.send(b"two", 2).unwrap();
@@ -337,36 +375,50 @@ mod tests {
 
     #[test]
     fn tier_mismatch_is_refused_in_both_directions() {
-        let session = Session::new(b"alice").unwrap();
-        let mut encrypted =
-            Conversation::create_encrypted(dm_seal(), UserId::new(), DeviceId::new(), &session)
-                .unwrap();
+        let session = Arc::new(Session::new(b"alice").unwrap());
+        let mut encrypted = Conversation::create_encrypted(
+            dm_seal(),
+            UserId::new(),
+            DeviceId::new(),
+            session.clone(),
+        )
+        .unwrap();
         assert!(matches!(encrypted.send_plaintext("oops", 0), Err(ConversationError::Encrypted)));
 
-        let mut public =
-            Conversation::create_public(public_seal(), UserId::new(), DeviceId::new()).unwrap();
+        let mut public = Conversation::create_public(
+            public_seal(),
+            UserId::new(),
+            DeviceId::new(),
+            Arc::new(Session::new(b"pub").unwrap()),
+        )
+        .unwrap();
         assert!(matches!(public.send(b"oops", 0), Err(ConversationError::NotEncrypted)));
     }
 
     #[test]
     fn cannot_create_encrypted_conversation_for_a_public_room() {
-        let session = Session::new(b"alice").unwrap();
+        let session = Arc::new(Session::new(b"alice").unwrap());
         assert!(matches!(
-            Conversation::create_encrypted(public_seal(), UserId::new(), DeviceId::new(), &session),
+            Conversation::create_encrypted(
+                public_seal(),
+                UserId::new(),
+                DeviceId::new(),
+                session.clone()
+            ),
             Err(ConversationError::NotEncrypted)
         ));
     }
 
     /// Wire two conversations together over a shared MLS group.
     fn linked_pair() -> (Conversation, Conversation) {
-        let alice_session = Session::new(b"alice").unwrap();
-        let bob_session = Session::new(b"bob").unwrap();
+        let alice_session = Arc::new(Session::new(b"alice").unwrap());
+        let bob_session = Arc::new(Session::new(b"bob").unwrap());
 
         let mut alice = Conversation::create_encrypted(
             dm_seal(),
             UserId::new(),
             DeviceId::new(),
-            &alice_session,
+            alice_session.clone(),
         )
         .unwrap();
 
@@ -379,6 +431,7 @@ mod tests {
             alice.room(),
             UserId::new(),
             DeviceId::new(),
+            bob_session.clone(),
             bob_group,
         )
         .unwrap();
@@ -457,8 +510,13 @@ mod tests {
 
     #[test]
     fn public_conversation_sends_plaintext() {
-        let mut convo =
-            Conversation::create_public(public_seal(), UserId::new(), DeviceId::new()).unwrap();
+        let mut convo = Conversation::create_public(
+            public_seal(),
+            UserId::new(),
+            DeviceId::new(),
+            Arc::new(Session::new(b"pub").unwrap()),
+        )
+        .unwrap();
         let env = convo.send_plaintext("hello world", 5).unwrap();
         assert!(!env.payload.is_opaque_to_server());
         assert_eq!(env.franking_commitment, None);

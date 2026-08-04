@@ -49,6 +49,10 @@ A working protocol core, with the security-critical paths under test:
 - **Safety numbers** — 60-digit out-of-band key verification, so a malicious server
   substituting keys becomes visible to the user. Verified against real MLS identity keys.
   Not yet surfaced in any UI, so the protection is not yet effective in practice.
+- **Authenticated envelopes** — every message is signed by its sending device over
+  length-prefixed canonical bytes, and a device's account binding is fixed at registration.
+  This is what makes franking's attribution real rather than a claim the server takes on
+  faith.
 - **Tier enforcement** — structurally enforced. There is no setter for a room's tier, and
   the server re-validates every message against its room's tier because
   [modified clients exist](docs/01-threat-model.md).
@@ -69,7 +73,7 @@ one.
 ## Try it
 
 ```bash
-cargo test --workspace     # 64 tests
+cargo test --workspace     # 84 tests
 cargo run -p cairn-cli     # the vertical slice, end to end
 ```
 

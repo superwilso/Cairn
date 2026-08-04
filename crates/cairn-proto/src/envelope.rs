@@ -84,6 +84,14 @@ pub struct Envelope {
     /// already show.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub franking_commitment: Option<String>,
+    /// Hex signature over [`Envelope::signing_bytes`], made by the sending device's key.
+    ///
+    /// This is what makes `sender` and `sender_device` claims rather than assertions the
+    /// server has to take on faith. Without it the franking tag is worthless: a tag binds
+    /// a commitment to a *claimed* sender, so if anyone may claim to be anyone, the tag
+    /// proves nothing and unframeability collapses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl Envelope {
@@ -109,6 +117,7 @@ impl Envelope {
             sent_at_ms,
             payload,
             franking_commitment: None,
+            signature: None,
         };
         envelope.validate_for_tier(tier)?;
         Ok(envelope)
@@ -118,6 +127,64 @@ impl Envelope {
     pub fn with_franking_commitment(mut self, commitment: impl Into<String>) -> Self {
         self.franking_commitment = Some(commitment.into());
         self
+    }
+
+    /// Attach a signature.
+    pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
+        self.signature = Some(signature.into());
+        self
+    }
+
+    /// The exact bytes a sender signs and the server verifies.
+    ///
+    /// Built by explicit length-prefixed concatenation rather than by serialising the
+    /// struct. Serialisation formats are free to reorder fields or change encodings
+    /// between versions; a signature scheme whose input can shift underneath it is a
+    /// signature scheme that silently stops working — or worse, one where two different
+    /// envelopes can produce identical signing input.
+    ///
+    /// Covers every field the server acts on. The signature itself is excluded, obviously.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        fn push(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        let mut out = Vec::new();
+        push(&mut out, b"cairn/envelope/v1");
+        out.extend_from_slice(&self.version.to_be_bytes());
+        push(&mut out, self.id.as_uuid().as_bytes());
+        push(&mut out, self.room.as_uuid().as_bytes());
+        push(&mut out, self.sender.as_uuid().as_bytes());
+        push(&mut out, self.sender_device.as_uuid().as_bytes());
+        out.extend_from_slice(&self.sent_at_ms.to_be_bytes());
+
+        // A discriminant so a payload of one kind can never be reinterpreted as another
+        // with the same bytes.
+        match &self.payload {
+            EnvelopePayload::MlsApplication { ciphertext } => {
+                out.push(1);
+                push(&mut out, ciphertext);
+            }
+            EnvelopePayload::MlsHandshake { message, epoch_seq } => {
+                out.push(2);
+                push(&mut out, message);
+                out.extend_from_slice(&epoch_seq.unwrap_or(0).to_be_bytes());
+            }
+            EnvelopePayload::Plaintext { body } => {
+                out.push(3);
+                push(&mut out, body.as_bytes());
+            }
+        }
+
+        match &self.franking_commitment {
+            Some(c) => {
+                out.push(1);
+                push(&mut out, c.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out
     }
 
     /// Re-check the tier/payload invariant.
@@ -202,6 +269,7 @@ mod tests {
             sent_at_ms: 0,
             payload: pt(),
             franking_commitment: None,
+            signature: None,
         };
         assert_eq!(
             smuggled.validate_for_tier(Tier::Private),
@@ -216,6 +284,63 @@ mod tests {
         let back: Envelope = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
         assert_eq!(back.franking_commitment.as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn signing_bytes_are_stable_and_cover_every_acted_on_field() {
+        let e = build(Tier::Private, ct()).unwrap();
+        assert_eq!(e.signing_bytes(), e.signing_bytes(), "must be deterministic");
+
+        // Changing any covered field must change the signed input, or that field is
+        // unauthenticated and an attacker can rewrite it in transit.
+        let mut other = e.clone();
+        other.sender = UserId::new();
+        assert_ne!(e.signing_bytes(), other.signing_bytes(), "sender must be covered");
+
+        let mut other = e.clone();
+        other.room = RoomId::new();
+        assert_ne!(e.signing_bytes(), other.signing_bytes(), "room must be covered");
+
+        let mut other = e.clone();
+        other.sender_device = DeviceId::new();
+        assert_ne!(e.signing_bytes(), other.signing_bytes(), "device must be covered");
+
+        let mut other = e.clone();
+        other.sent_at_ms = 999;
+        assert_ne!(e.signing_bytes(), other.signing_bytes(), "timestamp must be covered");
+
+        let mut other = e.clone();
+        other.payload = EnvelopePayload::MlsApplication { ciphertext: vec![9, 9, 9] };
+        assert_ne!(e.signing_bytes(), other.signing_bytes(), "payload must be covered");
+
+        let other = e.clone().with_franking_commitment("abcd");
+        assert_ne!(e.signing_bytes(), other.signing_bytes(), "commitment must be covered");
+    }
+
+    #[test]
+    fn the_signature_itself_is_not_signed() {
+        // Otherwise signing would be circular and could never verify.
+        let e = build(Tier::Private, ct()).unwrap();
+        let signed = e.clone().with_signature("deadbeef");
+        assert_eq!(e.signing_bytes(), signed.signing_bytes());
+    }
+
+    #[test]
+    fn length_prefixing_prevents_field_boundary_confusion() {
+        // Without length prefixes, two different (room, sender) pairs could concatenate
+        // to the same bytes and share a signature.
+        let a = Envelope::new(
+            Tier::PublicCommunity,
+            RoomId::new(),
+            UserId::new(),
+            DeviceId::new(),
+            0,
+            EnvelopePayload::Plaintext { body: "ab".into() },
+        )
+        .unwrap();
+        let mut b = a.clone();
+        b.payload = EnvelopePayload::Plaintext { body: "a".into() };
+        assert_ne!(a.signing_bytes(), b.signing_bytes());
     }
 
     #[test]

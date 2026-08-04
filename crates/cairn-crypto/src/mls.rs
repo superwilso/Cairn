@@ -58,6 +58,19 @@ pub enum MlsError {
     NoWelcome,
 }
 
+/// Verify a signature made by [`Session::sign`].
+///
+/// Returns `false` on any failure — a malformed key, a malformed signature, or a genuine
+/// mismatch. Callers must not distinguish these, since doing so would tell an attacker
+/// which part of their forgery was wrong.
+pub fn verify_signature(public_key: &[u8], data: &[u8], signature: &[u8]) -> bool {
+    let crypto = RustCryptoProvider::default();
+    let Some(cs) = crypto.cipher_suite_provider(CIPHERSUITE) else {
+        return false;
+    };
+    cs.verify(&public_key.to_vec().into(), signature, data).is_ok()
+}
+
 /// Parse a wire-format MLS message.
 pub fn parse_message(bytes: &[u8]) -> Result<MlsMessage, MlsError> {
     Ok(MlsMessage::from_bytes(bytes)?)
@@ -68,6 +81,12 @@ pub struct Session {
     client: Client<CairnConfig>,
     identity: Vec<u8>,
     public_key: Vec<u8>,
+    /// Retained so the device can sign envelopes, not just MLS messages.
+    ///
+    /// MLS authenticates messages *within* a group. It says nothing about a request
+    /// arriving at the server, so envelope authentication needs the same key used
+    /// directly. See `cairn_proto::Envelope::signing_bytes`.
+    secret_key: mls_rs::crypto::SignatureSecretKey,
 }
 
 impl std::fmt::Debug for Session {
@@ -99,6 +118,7 @@ impl Session {
         )?;
 
         let public_key = public.as_ref().to_vec();
+        let secret_key = secret.clone();
         let credential = BasicCredential::new(identity.to_vec()).into_credential();
         let signing_identity = SigningIdentity::new(credential, public);
 
@@ -108,7 +128,20 @@ impl Session {
             .signing_identity(signing_identity, secret, CIPHERSUITE)
             .build();
 
-        Ok(Self { client, identity: identity.to_vec(), public_key })
+        Ok(Self { client, identity: identity.to_vec(), public_key, secret_key })
+    }
+
+    /// Sign arbitrary bytes with this device's identity key.
+    ///
+    /// Used for envelope authentication. The server verifies against the public key
+    /// registered for the device, which is what turns `sender` from a claim into an
+    /// authenticated fact.
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, MlsError> {
+        let crypto = RustCryptoProvider::default();
+        let cs = crypto
+            .cipher_suite_provider(CIPHERSUITE)
+            .expect("rustcrypto provider supports the pinned ciphersuite");
+        cs.sign(&self.secret_key, data).map_err(|e| MlsError::Crypto(e.to_string()))
     }
 
     /// This participant's identity (credential) bytes.
@@ -338,6 +371,39 @@ mod tests {
         assert_eq!(alice.fingerprint(), alice.fingerprint());
         assert!(!alice.public_key().is_empty());
         assert_eq!(alice.identity(), b"alice@instance");
+    }
+
+    #[test]
+    fn a_signature_verifies_against_its_own_key_and_no_other() {
+        let alice = Session::new(b"alice").unwrap();
+        let mallory = Session::new(b"mallory").unwrap();
+        let data = b"authenticated envelope bytes";
+
+        let sig = alice.sign(data).unwrap();
+        assert!(verify_signature(alice.public_key(), data, &sig));
+        assert!(
+            !verify_signature(mallory.public_key(), data, &sig),
+            "a signature must not verify under someone else's key"
+        );
+    }
+
+    #[test]
+    fn a_signature_does_not_carry_over_to_different_data() {
+        let alice = Session::new(b"alice").unwrap();
+        let sig = alice.sign(b"original").unwrap();
+        assert!(!verify_signature(alice.public_key(), b"tampered", &sig));
+    }
+
+    #[test]
+    fn malformed_input_fails_closed() {
+        // Every failure mode must return false rather than panicking or, worse,
+        // accidentally succeeding.
+        let alice = Session::new(b"alice").unwrap();
+        let sig = alice.sign(b"data").unwrap();
+        assert!(!verify_signature(b"", b"data", &sig));
+        assert!(!verify_signature(b"not a key", b"data", &sig));
+        assert!(!verify_signature(alice.public_key(), b"data", b""));
+        assert!(!verify_signature(alice.public_key(), b"data", b"garbage"));
     }
 
     #[test]

@@ -54,6 +54,10 @@ performance measurements. Those are still owed.
   recipient unable to prove what they received.
 - **Safety numbers work against real MLS identity keys**, not just synthetic input. An
   impostor claiming the same identity string still produces a different number.
+- **Envelope authentication had to come before franking could mean anything.** A franking
+  tag binds a commitment to a *claimed* sender; while anyone could claim to be anyone, the
+  tag proved nothing and unframeability did not hold. Signing the envelope and fixing the
+  device→account binding at registration is what makes the attribution real.
 
 ## Still owed
 
@@ -78,7 +82,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | No key transparency; safety numbers not surfaced in a UI | The primitive exists and is tested, but nothing displays it and no contact store persists verification state, so in practice E2EE still holds against an honest-but-curious server rather than a malicious one (`01-threat-model.md` §4) |
 | Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
 | No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
-| No authentication on the server | Anyone can post as anyone |
+| No account system | Messages are authenticated per device, but anyone can *register* any unused user id — no passwords, sessions, invites, or rate limits |
 | No group franking (AGMF) | T2 franking is not yet sound for groups |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
 | No TLS termination | Must sit behind a reverse proxy |
