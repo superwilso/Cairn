@@ -1,0 +1,92 @@
+# Protocol Evaluation
+
+**Status:** Architecture decided; measurements outstanding
+**Decision record:** [ADR-005](adr/005-protocol-core.md)
+
+## What this was
+
+A timeboxed evaluation between three options for the protocol core — custom MLS-native,
+build on Matrix, or fork Stoat — decided against criteria fixed **before** measuring, so
+that the numbers decided the outcome rather than being recruited to justify it.
+
+## What actually happened
+
+The architecture was settled early by a requirement rather than a benchmark: **native
+clients on Windows, macOS, Linux, iOS, and Android**. Both non-custom options derived most
+of their value from existing non-native clients (Element-derived for Matrix, TypeScript for
+Stoat), so that requirement removed their main advantage. See
+[ADR-005](adr/005-protocol-core.md).
+
+This is worth being explicit about: the decision was made on architectural grounds, not on
+performance measurements. Those are still owed.
+
+## Criteria, and status
+
+| # | Criterion | Weight | Status |
+|---|---|---|---|
+| 1 | Cost to reach E2EE DMs + a 1,000-member MLS group | High | ⚠️ DMs done; 1,000-member untested |
+| 2 | Mobile sync and battery under MLS commit churn | High | ❌ Not measured — no mobile client |
+| 3 | Public-server read path at 50k members | High | ❌ Not measured |
+| 4 | Can the safety stack be implemented natively | High | ✅ Franking implemented and tested |
+| 5 | Ecosystem and migration path | Medium | ✅ Assessed — custom core has none; accepted |
+| 6 | Governance independence | Medium | ✅ Full |
+
+## Findings so far
+
+**From building the scaffold (`crates/`):**
+
+- **A DM as a two-member MLS group works**, and the one-code-path approach holds up.
+  Verified by `two_member_dm_round_trip`.
+- **Post-compromise security after removal is real**, not merely claimed — a removed member
+  cannot decrypt subsequent messages (`removed_member_cannot_read_later_messages`).
+- **`mls-rs` is synchronous by default.** It generates both surfaces via `maybe_async`. An
+  initial reading of the source suggested async-only; the compiler corrected it. This
+  matters well beyond style: no async runtime needs to cross the FFI boundary, which
+  materially simplifies the Swift and Kotlin bindings ([ADR-006](adr/006-platform-architecture.md)).
+- **Build and iteration speed are not a concern.** `mls-rs` compiles cold in ~27s; the full
+  workspace test suite runs in well under a second.
+- **Transcript franking is practical** — a plain HMAC hash chain gives verifiable causality
+  with no exotic cryptography. Detecting an omitted middle message costs nothing extra.
+
+## Still owed
+
+These block fixing the tier constants and any public claim about group sizes:
+
+- [ ] **1,000-member MLS group**: join, leave, and commit latency; memory per client
+- [ ] **Mobile battery and sync** under sustained commit churn — needs a mobile client
+- [ ] **50,000-member public channel** read path
+- [ ] **Group state persistence** across restarts (currently in-memory, so nothing survives)
+- [ ] **`T1_MAX_MEMBERS` / `T2_MAX_MEMBERS`** — currently provisional placeholders
+      (256 / 2,000) in `crates/cairn-proto/src/tier.rs`, clearly marked as such
+
+A benchmark harness should live in `crates/cairn-crypto/benches/`.
+
+## Known gaps in the scaffold
+
+Deliberate omissions, listed so nobody mistakes the scaffold for a product:
+
+| Gap | Consequence |
+|---|---|
+| No key transparency or safety-number verification | E2EE holds against an honest-but-curious server, **not a malicious one** (`01-threat-model.md` §4) |
+| Franking openings not yet inside the encrypted payload | Currently returned alongside; must move in-envelope |
+| Franking key regenerated on restart | All historical reports become unverifiable |
+| No persistence anywhere | Nothing survives a restart |
+| No authentication on the server | Anyone can post as anyone |
+| No group franking (AGMF) | T2 franking is not yet sound for groups |
+| JSON + hex wire format | A development convenience; a binary format replaces it |
+| No TLS termination | Must sit behind a reverse proxy |
+
+## Verification standard
+
+Before any of this protects a real user:
+
+1. **External cryptographic review** of the protocol spec, by someone who is not on the
+   project. This is the cheapest security spend available and it is not optional.
+2. **Two-device end-to-end test**: confirm via packet capture and server logs that the
+   server stored only ciphertext.
+3. **Franking end-to-end**: generate a report, verify it validates, and verify a tampered
+   transcript fails.
+4. **Independent MLS interop** against another RFC 9420 implementation.
+
+Item 3 is currently satisfied in-process by `cargo run -p cairn-cli`; items 1, 2, and 4 are
+outstanding.

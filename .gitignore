@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local config and secrets. A committed franking key would invalidate every report
+# it ever signed, so keep these out by default.
+/.env
+*.local.toml
+/data
