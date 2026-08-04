@@ -57,9 +57,17 @@ Honest reporting of what has actually been verified, and where:
 
 | Target | Status |
 |---|---|
-| Linux x86_64 — build + tests | ✅ **Verified.** 48 tests pass; the demo runs; the server responds over HTTP |
-| Windows / macOS — build | ⚠️ **Not verified locally.** The development container has only the `x86_64-unknown-linux-gnu` toolchain installed, so cross-compilation was not attempted. CI must cover these |
+| Linux x86_64 — build + tests | ✅ **Verified locally and in CI.** 48 tests pass; the demo runs; the server responds over HTTP |
+| Windows x86_64 — build + tests | ✅ **Verified in CI.** Full test suite and the vertical slice pass on `windows-latest` |
+| macOS — build + tests | ✅ **Verified in CI.** Full test suite and the vertical slice pass on `macos-latest` |
 | iOS / Android — build | ⚠️ Not attempted; no bindings exist yet |
+
+The cross-platform claim is therefore checked rather than assumed: the same source tree
+builds and passes its tests on all three desktop platforms today, before any UI exists.
+
+**Minimum supported Rust version: 1.85.** This is a hard floor rather than a preference —
+the crypto dependency tree pulls in crates requiring `edition2024`, which stabilized in
+exactly that release. CI enforces it.
 
 CI (`.github/workflows/ci.yml`) builds and tests on Linux, Windows, and macOS so the
 cross-platform claim is continuously checked rather than assumed.

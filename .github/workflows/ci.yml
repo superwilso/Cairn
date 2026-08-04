@@ -51,11 +51,13 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit
 
+  # 1.85 is a hard floor, not a preference: the crypto dependency tree pulls in crates
+  # that require edition2024, which stabilized in exactly that release.
   msrv:
     name: minimum supported rust version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
