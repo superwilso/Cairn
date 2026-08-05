@@ -22,7 +22,8 @@ use crate::state::{ServerError, SharedInstance};
 pub fn router(instance: SharedInstance) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/v1/devices", post(register_device))
+        .route("/v1/accounts", post(claim_account))
+        .route("/v1/devices", post(link_device))
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room}", get(describe_room))
         .route("/v1/rooms/{room}/messages", post(send_message).get(fetch_messages))
@@ -48,7 +49,17 @@ impl IntoResponse for ServerError {
             | ServerError::UnknownDevice
             | ServerError::BadSignature
             | ServerError::DeviceUserMismatch => StatusCode::UNAUTHORIZED,
-            ServerError::DeviceAlreadyRegistered => StatusCode::CONFLICT,
+            ServerError::DeviceAlreadyRegistered | ServerError::AccountAlreadyClaimed => {
+                StatusCode::CONFLICT
+            }
+            ServerError::NoSuchAccount => StatusCode::NOT_FOUND,
+            // Authorization failures on device linking. Distinguishable because an honest
+            // client needs to know which of its inputs was wrong, and an attacker already
+            // knows what they forged.
+            ServerError::AuthorizingDeviceNotOnAccount
+            | ServerError::BadDeviceAuthorization
+            | ServerError::InviteRequired
+            | ServerError::InviteInvalid => StatusCode::UNAUTHORIZED,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -64,30 +75,68 @@ async fn health() -> &'static str {
 }
 
 #[derive(Deserialize)]
-struct RegisterDeviceRequest {
+struct ClaimAccountRequest {
     user: uuid::Uuid,
     device: uuid::Uuid,
     /// Hex-encoded signature public key.
     public_key: String,
+    /// Required unless the instance's registration policy is `open`.
+    #[serde(default)]
+    invite: Option<String>,
 }
 
-/// Register a device's signing key.
+/// Claim a user id, creating the account and registering its first device.
 ///
-/// There is no account system yet, so anyone may claim any `user` on first registration.
-/// That is a real gap — it means account *creation* is unauthenticated even though
-/// message *sending* now is not. What this does provide is that once a device is bound to
-/// an account, nobody else can send as that account without its key.
-async fn register_device(
+/// A user id is public — it appears on every message the account sends — so this is the
+/// only point at which one becomes owned. Once claimed, adding further devices requires
+/// authorization from a device already on the account.
+async fn claim_account(
     State(instance): State<SharedInstance>,
-    Json(req): Json<RegisterDeviceRequest>,
+    Json(req): Json<ClaimAccountRequest>,
 ) -> Result<StatusCode, ServerError> {
     let public_key = hex::decode(&req.public_key).map_err(|_| ServerError::BadSignature)?;
-    instance.register_device(
+    instance.claim_account(
         cairn_proto::UserId::from_uuid(req.user),
         cairn_proto::DeviceId::from_uuid(req.device),
         &public_key,
+        req.invite.as_deref(),
+        now_ms(),
     )?;
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+struct LinkDeviceRequest {
+    user: uuid::Uuid,
+    device: uuid::Uuid,
+    public_key: String,
+    /// A device already on the account, which vouches for the new one.
+    authorizing_device: uuid::Uuid,
+    /// Hex signature by `authorizing_device` over `device_authorization_bytes`.
+    authorization: String,
+}
+
+/// Add a device to an existing account.
+async fn link_device(
+    State(instance): State<SharedInstance>,
+    Json(req): Json<LinkDeviceRequest>,
+) -> Result<StatusCode, ServerError> {
+    let public_key = hex::decode(&req.public_key).map_err(|_| ServerError::BadSignature)?;
+    let authorization =
+        hex::decode(&req.authorization).map_err(|_| ServerError::BadDeviceAuthorization)?;
+    instance.link_device(
+        cairn_proto::UserId::from_uuid(req.user),
+        cairn_proto::DeviceId::from_uuid(req.device),
+        &public_key,
+        cairn_proto::DeviceId::from_uuid(req.authorizing_device),
+        &authorization,
+    )?;
+    Ok(StatusCode::CREATED)
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 #[derive(Deserialize)]
