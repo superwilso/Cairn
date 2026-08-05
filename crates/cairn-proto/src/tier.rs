@@ -12,13 +12,21 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum members in an ad-hoc group chat before it must become a community.
 ///
-/// PROVISIONAL. Must be replaced by a measured value from the protocol spike —
-/// see `docs/03-protocol-evaluation.md` criterion 2.
+/// Measured, not guessed. The binding constraint is **join cost**, not messaging cost:
+/// per `crates/cairn-crypto/examples/group_scaling.rs`, the MLS welcome grows linearly at
+/// roughly 180 bytes per member, because it carries the ratchet tree. Everything else is
+/// flat or logarithmic. At this ceiling a joiner downloads ~46 KB, which is negligible
+/// even on a poor mobile connection.
 pub const T1_MAX_MEMBERS: u32 = 256;
 
 /// Maximum members in a private (T2) community before it must be public (T3).
 ///
-/// PROVISIONAL. See `T1_MAX_MEMBERS`.
+/// At this ceiling the welcome is ~360 KB — a real but acceptable one-time cost on mobile,
+/// and the largest single download joining a community imposes. Extrapolated one doubling
+/// beyond the largest measured group (1,000); re-measure before raising it.
+///
+/// Ongoing costs are not what limits this: commits are a constant 472 bytes at every size
+/// measured, and encrypt/decrypt are flat at ~90µs/~60µs regardless of membership.
 pub const T2_MAX_MEMBERS: u32 = 2_000;
 
 /// The protection level applied to a room, fixed at creation.

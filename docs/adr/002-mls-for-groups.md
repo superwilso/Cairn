@@ -64,6 +64,12 @@ As of 2026, MLS is no longer an emerging bet:
   starting line.
 - MLS state is heavier on the client than sender keys. Mobile storage and battery under
   commit churn must be measured, not assumed — it is criterion #2 in the spike.
+- **Joining is O(n), even though ongoing operations are O(log n).** Measured after this
+  ADR was written: the welcome message carries the ratchet tree and grows at roughly 180
+  bytes per member, so a joiner at 1,000 members downloads ~183 KB. Commits stay a
+  constant 472 bytes and message cost is flat, so this is purely a join-time cost — but it
+  is the constraint that sets the encrypted-community ceiling, not the messaging cost this
+  ADR focused on. See `docs/03-protocol-evaluation.md`.
 - `mls-rs` is conformance-validated but, per its own README, has not had a full third-party
   security audit. Track this and budget for review.
 
