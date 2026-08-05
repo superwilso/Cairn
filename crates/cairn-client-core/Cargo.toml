@@ -1,0 +1,19 @@
+[package]
+name = "cairn-client-core"
+description = "Cairn shared client logic. Platform UIs bind to this; it contains no UI code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cairn-proto.workspace = true
+cairn-crypto.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true

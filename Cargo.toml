@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cairn-proto",
+    "crates/cairn-crypto",
+    "crates/cairn-client-core",
+    "crates/cairn-server",
+    "crates/cairn-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/superwilso/Cairn"
+authors = ["The Cairn Contributors"]
+
+[workspace.dependencies]
+cairn-proto = { path = "crates/cairn-proto", version = "0.0.1" }
+cairn-crypto = { path = "crates/cairn-crypto", version = "0.0.1" }
+cairn-client-core = { path = "crates/cairn-client-core", version = "0.0.1" }
+
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto
+mls-rs = "0.55"
+mls-rs-crypto-rustcrypto = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+# Async / server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

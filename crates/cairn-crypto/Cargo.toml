@@ -1,0 +1,28 @@
+[package]
+name = "cairn-crypto"
+description = "Cairn cryptography: MLS group sessions and message franking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cairn-proto.workspace = true
+
+mls-rs.workspace = true
+mls-rs-crypto-rustcrypto.workspace = true
+
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

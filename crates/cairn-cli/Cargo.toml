@@ -1,0 +1,16 @@
+[package]
+name = "cairn-cli"
+description = "Headless Cairn client for testing and protocol demos."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-or-later"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cairn-proto.workspace = true
+cairn-crypto.workspace = true
+cairn-client-core.workspace = true
+
+serde_json.workspace = true
