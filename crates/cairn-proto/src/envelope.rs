@@ -349,3 +349,57 @@ mod tests {
         assert!(h.is_opaque_to_server());
     }
 }
+
+/// Canonical bytes a device signs to authorize *another* device to join its account.
+///
+/// Adding a device to an existing account must be authorized by a device that already
+/// belongs to it. Without this, anyone who learns a user id — which is public, it appears
+/// on every message that account sends — can register their own device against it and
+/// speak as that account.
+///
+/// Length-prefixed for the same reason as [`Envelope::signing_bytes`]: so no two distinct
+/// authorizations can share a byte encoding.
+pub fn device_authorization_bytes(
+    user: crate::UserId,
+    new_device: crate::DeviceId,
+    new_public_key: &[u8],
+) -> Vec<u8> {
+    fn push(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let mut out = Vec::new();
+    push(&mut out, b"cairn/device-authorization/v1");
+    push(&mut out, user.as_uuid().as_bytes());
+    push(&mut out, new_device.as_uuid().as_bytes());
+    push(&mut out, new_public_key);
+    out
+}
+
+#[cfg(test)]
+mod device_auth_tests {
+    use super::*;
+
+    #[test]
+    fn authorization_covers_every_field() {
+        let user = UserId::new();
+        let device = DeviceId::new();
+        let key = b"public-key-bytes";
+        let base = device_authorization_bytes(user, device, key);
+
+        assert_eq!(base, device_authorization_bytes(user, device, key), "deterministic");
+        assert_ne!(base, device_authorization_bytes(UserId::new(), device, key), "user covered");
+        assert_ne!(base, device_authorization_bytes(user, DeviceId::new(), key), "device covered");
+        assert_ne!(base, device_authorization_bytes(user, device, b"other-key"), "key covered");
+    }
+
+    #[test]
+    fn an_authorization_cannot_be_replayed_for_a_different_device() {
+        // The signature is over the specific new device and key, so an attacker who
+        // captures one cannot reuse it to attach a device of their own.
+        let user = UserId::new();
+        let honest = device_authorization_bytes(user, DeviceId::new(), b"k1");
+        let attacker = device_authorization_bytes(user, DeviceId::new(), b"k2");
+        assert_ne!(honest, attacker);
+    }
+}

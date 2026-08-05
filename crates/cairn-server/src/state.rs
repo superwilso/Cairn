@@ -39,6 +39,18 @@ pub enum ServerError {
     DeviceUserMismatch,
     #[error("device is already registered")]
     DeviceAlreadyRegistered,
+    #[error("account is already claimed; link a device instead")]
+    AccountAlreadyClaimed,
+    #[error("no such account")]
+    NoSuchAccount,
+    #[error("the authorizing device does not belong to this account")]
+    AuthorizingDeviceNotOnAccount,
+    #[error("device authorization signature does not verify")]
+    BadDeviceAuthorization,
+    #[error("registration on this instance requires an invite")]
+    InviteRequired,
+    #[error("invite is unknown, already used, or expired")]
+    InviteInvalid,
 }
 
 /// A room as the server knows it.
@@ -71,14 +83,52 @@ pub struct StoredMessage {
 
 /// A registered sending device.
 ///
-/// The `user` binding is fixed at registration and never rewritten. That is the whole
-/// defence against impersonation: an attacker may register their own device, but they
-/// cannot make it speak for somebody else's account.
+/// The `user` binding is fixed at registration and never rewritten. On its own that is
+/// **not** sufficient against impersonation — an earlier version of this code allowed
+/// anyone to register a device against any user id, and the binding then faithfully
+/// recorded the attacker's claim. What makes it sound is [`AccountRecord`]: a user id must
+/// be claimed, and adding a device to a claimed account requires authorization from a
+/// device already on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRecord {
     pub user: UserId,
     /// Hex-encoded signature public key.
     pub public_key: String,
+}
+
+/// An account, and the devices entitled to speak for it.
+///
+/// The existence of this record is what makes a user id *claimed*. Before accounts
+/// existed, `register_device` bound a device to any user id the caller named — so anyone
+/// who knew a user id, which is public and appears on every message that account sends,
+/// could attach their own device and send as that account. Signatures verified correctly
+/// and the impersonation went through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountRecord {
+    pub devices: Vec<DeviceId>,
+}
+
+/// A single-use registration invite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteRecord {
+    /// Consumed invites are retained rather than deleted, so a replay is distinguishable
+    /// from an unknown token and an operator can audit who joined with what.
+    pub used_by: Option<UserId>,
+    /// Milliseconds since the Unix epoch, or `None` for no expiry.
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Who may create an account on this instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationPolicy {
+    /// Anyone may claim any unused user id. Appropriate for a private test instance and
+    /// nothing else — it lets an attacker race a user for their own id.
+    Open,
+    /// A valid, unused, unexpired invite is required. The sane default for a self-hosted
+    /// instance, and what the operator guide should recommend.
+    #[default]
+    InviteOnly,
 }
 
 /// Everything about an instance that must survive a restart.
@@ -90,6 +140,24 @@ pub struct PersistedState {
     pub rooms: Vec<PersistedRoom>,
     #[serde(default)]
     pub devices: Vec<PersistedDevice>,
+    #[serde(default)]
+    pub accounts: Vec<PersistedAccount>,
+    #[serde(default)]
+    pub invites: Vec<PersistedInvite>,
+    #[serde(default)]
+    pub registration_policy: RegistrationPolicy,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedAccount {
+    id: UserId,
+    record: AccountRecord,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedInvite {
+    token: String,
+    record: InviteRecord,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -108,6 +176,9 @@ pub struct PersistedRoom {
 pub struct Instance {
     rooms: Mutex<HashMap<RoomId, Room>>,
     devices: Mutex<HashMap<DeviceId, DeviceRecord>>,
+    accounts: Mutex<HashMap<UserId, AccountRecord>>,
+    invites: Mutex<HashMap<String, InviteRecord>>,
+    registration_policy: Mutex<RegistrationPolicy>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -130,7 +201,17 @@ impl Instance {
         let persisted = storage.load_state()?;
         let rooms = persisted.rooms.into_iter().map(|r| (r.id, r.room)).collect();
         let devices = persisted.devices.into_iter().map(|d| (d.id, d.record)).collect();
-        Ok(Self { rooms: Mutex::new(rooms), devices: Mutex::new(devices), franking_key, storage })
+        let accounts = persisted.accounts.into_iter().map(|a| (a.id, a.record)).collect();
+        let invites = persisted.invites.into_iter().map(|i| (i.token, i.record)).collect();
+        Ok(Self {
+            rooms: Mutex::new(rooms),
+            devices: Mutex::new(devices),
+            accounts: Mutex::new(accounts),
+            invites: Mutex::new(invites),
+            registration_policy: Mutex::new(persisted.registration_policy),
+            franking_key,
+            storage,
+        })
     }
 
     /// An ephemeral instance backed by nothing. Tests and throwaway runs only.
@@ -145,6 +226,8 @@ impl Instance {
     /// with a mutation and record a torn view of the state.
     fn persist(&self, rooms: &HashMap<RoomId, Room>) -> Result<(), ServerError> {
         let devices = self.devices.lock().expect("devices mutex poisoned");
+        let accounts = self.accounts.lock().expect("accounts mutex poisoned");
+        let invites = self.invites.lock().expect("invites mutex poisoned");
         let state = PersistedState {
             rooms: rooms
                 .iter()
@@ -154,33 +237,140 @@ impl Instance {
                 .iter()
                 .map(|(id, record)| PersistedDevice { id: *id, record: record.clone() })
                 .collect(),
+            accounts: accounts
+                .iter()
+                .map(|(id, record)| PersistedAccount { id: *id, record: record.clone() })
+                .collect(),
+            invites: invites
+                .iter()
+                .map(|(token, record)| PersistedInvite {
+                    token: token.clone(),
+                    record: record.clone(),
+                })
+                .collect(),
+            registration_policy: *self.registration_policy.lock().expect("policy mutex poisoned"),
         };
         self.storage.save_state(&state)?;
         Ok(())
     }
 
-    /// Register a device's signing key against an account.
+    /// The instance's registration policy.
+    pub fn registration_policy(&self) -> RegistrationPolicy {
+        *self.registration_policy.lock().expect("policy mutex poisoned")
+    }
+
+    /// Set the registration policy. Operator action.
+    pub fn set_registration_policy(&self, policy: RegistrationPolicy) -> Result<(), ServerError> {
+        *self.registration_policy.lock().expect("policy mutex poisoned") = policy;
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        self.persist(&rooms)
+    }
+
+    /// Mint a registration invite. Operator action.
+    pub fn create_invite(
+        &self,
+        token: &str,
+        expires_at_ms: Option<i64>,
+    ) -> Result<(), ServerError> {
+        self.invites
+            .lock()
+            .expect("invites mutex poisoned")
+            .insert(token.to_owned(), InviteRecord { used_by: None, expires_at_ms });
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        self.persist(&rooms)
+    }
+
+    /// Claim a user id, creating the account and registering its first device.
     ///
-    /// Registration is **append-only**: an existing device cannot be re-registered with a
-    /// different key or a different account. Allowing that would let anyone who learns a
-    /// device ID overwrite its key and then send as its owner, which is exactly the attack
-    /// signatures are here to stop. Rotating a key means registering a new device, which
-    /// is visible to the account's other devices.
-    pub fn register_device(
+    /// This is the only way an account comes into existence, and it is why a user id is a
+    /// *claim* rather than a free-for-all. Under [`RegistrationPolicy::InviteOnly`] it
+    /// additionally requires an unused, unexpired invite.
+    pub fn claim_account(
         &self,
         user: UserId,
         device: DeviceId,
         public_key: &[u8],
+        invite: Option<&str>,
+        now_ms: i64,
     ) -> Result<(), ServerError> {
+        let mut accounts = self.accounts.lock().expect("accounts mutex poisoned");
+        if accounts.contains_key(&user) {
+            // Never fall through to "link a device" here: that decision belongs to a
+            // holder of the account, not to whoever asked.
+            return Err(ServerError::AccountAlreadyClaimed);
+        }
+
         let mut devices = self.devices.lock().expect("devices mutex poisoned");
         if devices.contains_key(&device) {
             return Err(ServerError::DeviceAlreadyRegistered);
         }
+
+        let mut invites = self.invites.lock().expect("invites mutex poisoned");
+        if self.registration_policy() == RegistrationPolicy::InviteOnly {
+            let token = invite.ok_or(ServerError::InviteRequired)?;
+            let record = invites.get_mut(token).ok_or(ServerError::InviteInvalid)?;
+            if record.used_by.is_some() {
+                return Err(ServerError::InviteInvalid);
+            }
+            if record.expires_at_ms.is_some_and(|exp| now_ms >= exp) {
+                return Err(ServerError::InviteInvalid);
+            }
+            record.used_by = Some(user);
+        }
+
         devices.insert(device, DeviceRecord { user, public_key: hex::encode(public_key) });
+        accounts.insert(user, AccountRecord { devices: vec![device] });
+
         drop(devices);
+        drop(accounts);
+        drop(invites);
         let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)?;
-        Ok(())
+        self.persist(&rooms)
+    }
+
+    /// Add a device to an account that already exists.
+    ///
+    /// Requires a signature from a device **already on that account** over
+    /// [`cairn_proto::device_authorization_bytes`]. That signature is the entire defence:
+    /// a user id is public — it appears on every message the account sends — so without
+    /// proof of possession anyone could attach a device of their own and speak as that
+    /// account, with the signature check passing because they signed with their own key.
+    pub fn link_device(
+        &self,
+        user: UserId,
+        new_device: DeviceId,
+        new_public_key: &[u8],
+        authorizing_device: DeviceId,
+        authorization: &[u8],
+    ) -> Result<(), ServerError> {
+        let mut accounts = self.accounts.lock().expect("accounts mutex poisoned");
+        let account = accounts.get_mut(&user).ok_or(ServerError::NoSuchAccount)?;
+
+        if !account.devices.contains(&authorizing_device) {
+            return Err(ServerError::AuthorizingDeviceNotOnAccount);
+        }
+
+        let mut devices = self.devices.lock().expect("devices mutex poisoned");
+        if devices.contains_key(&new_device) {
+            return Err(ServerError::DeviceAlreadyRegistered);
+        }
+
+        let authorizer = devices.get(&authorizing_device).ok_or(ServerError::UnknownDevice)?;
+        let authorizer_key =
+            hex::decode(&authorizer.public_key).map_err(|_| ServerError::BadDeviceAuthorization)?;
+
+        let signed = cairn_proto::device_authorization_bytes(user, new_device, new_public_key);
+        if !cairn_crypto::mls::verify_signature(&authorizer_key, &signed, authorization) {
+            return Err(ServerError::BadDeviceAuthorization);
+        }
+
+        devices.insert(new_device, DeviceRecord { user, public_key: hex::encode(new_public_key) });
+        account.devices.push(new_device);
+
+        drop(devices);
+        drop(accounts);
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        self.persist(&rooms)
     }
 
     /// Authenticate an envelope against its claimed sending device.
@@ -310,7 +500,7 @@ fn decode_commitment(hex_str: &str) -> Option<Commitment> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cairn_proto::{DeviceId, EnvelopePayload, Tier, UserId};
 
@@ -318,25 +508,26 @@ mod tests {
         RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 }
     }
 
-    fn public_shape() -> RoomShape {
+    pub(crate) fn public_shape() -> RoomShape {
         RoomShape { is_direct: false, is_publicly_discoverable: true, member_ceiling: 50_000 }
     }
 
     /// A registered device that can produce properly signed envelopes.
-    struct TestSender {
-        session: cairn_crypto::mls::Session,
-        user: UserId,
-        device: DeviceId,
+    pub(crate) struct TestSender {
+        pub(crate) session: cairn_crypto::mls::Session,
+        pub(crate) user: UserId,
+        pub(crate) device: DeviceId,
     }
 
     impl TestSender {
-        fn registered(inst: &Instance) -> Self {
+        pub(crate) fn registered(inst: &Instance) -> Self {
             let s = Self {
                 session: cairn_crypto::mls::Session::new(b"tester").unwrap(),
                 user: UserId::new(),
                 device: DeviceId::new(),
             };
-            inst.register_device(s.user, s.device, s.session.public_key()).unwrap();
+            inst.set_registration_policy(RegistrationPolicy::Open).unwrap();
+            inst.claim_account(s.user, s.device, s.session.public_key(), None, 0).unwrap();
             s
         }
 
@@ -538,8 +729,8 @@ mod tests {
         // restart. Re-registering the same device must be refused, which proves the
         // record was actually restored rather than quietly recreated.
         assert!(matches!(
-            restarted.register_device(user, device, &pubkey),
-            Err(ServerError::DeviceAlreadyRegistered)
+            restarted.claim_account(user, device, &pubkey, None, 0),
+            Err(ServerError::AccountAlreadyClaimed)
         ));
 
         // Sequence numbers must continue, not restart — a repeated server_seq would let
@@ -630,8 +821,8 @@ mod tests {
         let alice = TestSender::registered(&inst);
         let attacker_key = cairn_crypto::mls::Session::new(b"attacker").unwrap();
         assert!(matches!(
-            inst.register_device(alice.user, alice.device, attacker_key.public_key()),
-            Err(ServerError::DeviceAlreadyRegistered)
+            inst.claim_account(alice.user, alice.device, attacker_key.public_key(), None, 0),
+            Err(ServerError::AccountAlreadyClaimed)
         ));
     }
 
@@ -734,5 +925,257 @@ mod tests {
         assert_eq!(inst.messages_since(room, 0).unwrap().len(), 3);
         assert_eq!(inst.messages_since(room, 2).unwrap().len(), 1);
         assert_eq!(inst.messages_since(room, 99).unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod accounts {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn signed_as(
+        key: &cairn_crypto::mls::Session,
+        user: UserId,
+        device: DeviceId,
+        room: RoomId,
+        body: &str,
+    ) -> Envelope {
+        let e = Envelope {
+            version: cairn_proto::PROTOCOL_VERSION,
+            id: cairn_proto::MessageId::new(),
+            room,
+            sender: user,
+            sender_device: device,
+            sent_at_ms: 0,
+            payload: EnvelopePayload::Plaintext { body: body.into() },
+            franking_commitment: None,
+            signature: None,
+        };
+        let sig = key.sign(&e.signing_bytes()).unwrap();
+        e.with_signature(hex::encode(sig))
+    }
+
+    /// Regression test for a real vulnerability.
+    ///
+    /// Before accounts existed, `register_device` bound a device to whatever user id the
+    /// caller named. A user id is public — it is on every message the account sends — so
+    /// an attacker could attach their own device to someone else's id and send as them,
+    /// with the signature check passing because they signed with their own key. This was
+    /// confirmed against the shipped code before the fix.
+    #[test]
+    fn an_attacker_cannot_attach_a_device_to_someone_elses_account() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape()).unwrap();
+
+        let mallory_key = cairn_crypto::mls::Session::new(b"mallory").unwrap();
+        let mallory_device = DeviceId::new();
+
+        // Claiming Alice's id outright is refused: it is already claimed.
+        assert!(matches!(
+            inst.claim_account(alice.user, mallory_device, mallory_key.public_key(), None, 0),
+            Err(ServerError::AccountAlreadyClaimed)
+        ));
+
+        // Linking is refused too: Mallory holds no device on Alice's account, and she
+        // cannot produce a signature from one.
+        let forged = mallory_key
+            .sign(&cairn_proto::device_authorization_bytes(
+                alice.user,
+                mallory_device,
+                mallory_key.public_key(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            inst.link_device(
+                alice.user,
+                mallory_device,
+                mallory_key.public_key(),
+                mallory_device,
+                &forged,
+            ),
+            Err(ServerError::AuthorizingDeviceNotOnAccount)
+        ));
+
+        // And with no registered device, she cannot send as Alice at all.
+        let e = signed_as(&mallory_key, alice.user, mallory_device, room, "not alice");
+        assert!(matches!(inst.accept(e), Err(ServerError::UnknownDevice)));
+    }
+
+    #[test]
+    fn a_holder_can_link_a_second_device_and_it_can_send() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape()).unwrap();
+
+        let laptop = cairn_crypto::mls::Session::new(b"alice-laptop").unwrap();
+        let laptop_id = DeviceId::new();
+        let auth = alice
+            .session
+            .sign(&cairn_proto::device_authorization_bytes(
+                alice.user,
+                laptop_id,
+                laptop.public_key(),
+            ))
+            .unwrap();
+
+        inst.link_device(alice.user, laptop_id, laptop.public_key(), alice.device, &auth).unwrap();
+
+        let e = signed_as(&laptop, alice.user, laptop_id, room, "from my laptop");
+        assert!(inst.accept(e).is_ok());
+    }
+
+    #[test]
+    fn an_authorization_for_one_device_cannot_be_replayed_for_another() {
+        // The signature covers the specific new device and key, so capturing one off the
+        // wire does not let an attacker attach a device of their own.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+
+        let honest = cairn_crypto::mls::Session::new(b"alice-laptop").unwrap();
+        let honest_id = DeviceId::new();
+        let auth = alice
+            .session
+            .sign(&cairn_proto::device_authorization_bytes(
+                alice.user,
+                honest_id,
+                honest.public_key(),
+            ))
+            .unwrap();
+
+        let mallory = cairn_crypto::mls::Session::new(b"mallory").unwrap();
+        assert!(matches!(
+            inst.link_device(
+                alice.user,
+                DeviceId::new(),
+                mallory.public_key(),
+                alice.device,
+                &auth
+            ),
+            Err(ServerError::BadDeviceAuthorization)
+        ));
+    }
+
+    #[test]
+    fn linking_to_an_unclaimed_account_is_refused() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let key = cairn_crypto::mls::Session::new(b"x").unwrap();
+        assert!(matches!(
+            inst.link_device(UserId::new(), DeviceId::new(), key.public_key(), alice.device, b"x"),
+            Err(ServerError::NoSuchAccount)
+        ));
+    }
+
+    #[test]
+    fn invite_only_is_the_default_and_is_enforced() {
+        let inst = Instance::in_memory();
+        assert_eq!(inst.registration_policy(), RegistrationPolicy::InviteOnly);
+
+        let key = cairn_crypto::mls::Session::new(b"newcomer").unwrap();
+        assert!(matches!(
+            inst.claim_account(UserId::new(), DeviceId::new(), key.public_key(), None, 0),
+            Err(ServerError::InviteRequired)
+        ));
+    }
+
+    #[test]
+    fn an_invite_works_once() {
+        let inst = Instance::in_memory();
+        inst.create_invite("token-abc", None).unwrap();
+
+        let first = cairn_crypto::mls::Session::new(b"first").unwrap();
+        inst.claim_account(
+            UserId::new(),
+            DeviceId::new(),
+            first.public_key(),
+            Some("token-abc"),
+            0,
+        )
+        .unwrap();
+
+        // Reuse must fail, or one leaked invite becomes unlimited registrations.
+        let second = cairn_crypto::mls::Session::new(b"second").unwrap();
+        assert!(matches!(
+            inst.claim_account(
+                UserId::new(),
+                DeviceId::new(),
+                second.public_key(),
+                Some("token-abc"),
+                0
+            ),
+            Err(ServerError::InviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn an_expired_invite_is_refused() {
+        let inst = Instance::in_memory();
+        inst.create_invite("expiring", Some(1_000)).unwrap();
+        let key = cairn_crypto::mls::Session::new(b"late").unwrap();
+        assert!(matches!(
+            inst.claim_account(
+                UserId::new(),
+                DeviceId::new(),
+                key.public_key(),
+                Some("expiring"),
+                1_000
+            ),
+            Err(ServerError::InviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn an_unknown_invite_is_refused() {
+        let inst = Instance::in_memory();
+        let key = cairn_crypto::mls::Session::new(b"guess").unwrap();
+        assert!(matches!(
+            inst.claim_account(
+                UserId::new(),
+                DeviceId::new(),
+                key.public_key(),
+                Some("guessed"),
+                0
+            ),
+            Err(ServerError::InviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn accounts_and_invites_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cairn-acct-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+
+        let (user, device) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            inst.create_invite("persisted", None).unwrap();
+            let key = cairn_crypto::mls::Session::new(b"a").unwrap();
+            let (u, d) = (UserId::new(), DeviceId::new());
+            inst.claim_account(u, d, key.public_key(), Some("persisted"), 0).unwrap();
+            (u, d)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        // The account is still claimed…
+        let key = cairn_crypto::mls::Session::new(b"b").unwrap();
+        assert!(matches!(
+            restarted.claim_account(user, DeviceId::new(), key.public_key(), None, 0),
+            Err(ServerError::AccountAlreadyClaimed)
+        ));
+        // …and the consumed invite is still consumed, not reusable after a restart.
+        assert!(matches!(
+            restarted.claim_account(
+                UserId::new(),
+                DeviceId::new(),
+                key.public_key(),
+                Some("persisted"),
+                0
+            ),
+            Err(ServerError::InviteInvalid)
+        ));
+        let _ = device;
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -15,11 +15,11 @@ Specifically, and non-exhaustively:
   the end-to-end encryption still holds only against an honest-but-curious server, **not
   a malicious one**. Key transparency — which makes server equivocation detectable without
   manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
-- **Account creation is unauthenticated.** Messages are now authenticated — every envelope
-  is signed by its sending device, and the device→account binding is fixed at registration,
-  so nobody can send as an account they do not hold a key for. But *registering* an account
-  is open: anyone can claim any unused user id on first registration. There are no
-  passwords, sessions, invites, or rate limits yet.
+- **No sessions, passwords, or rate limits.** Accounts are claimed and invite-gated by
+  default, and adding a device to an existing account requires authorization from a device
+  already on it. What is still missing: rate limiting on registration and sending, any
+  notion of a login session, and account recovery. Losing every device on an account
+  currently means losing the account.
 - **Storage is a JSON snapshot rewritten on every message.** State and the franking key
   now survive restarts, but the whole file is rewritten per write, and a crash between
   writes loses everything since the last one (never a partial file — writes are atomic).
