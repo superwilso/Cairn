@@ -376,6 +376,63 @@ pub fn device_authorization_bytes(
     out
 }
 
+/// Canonical bytes a device signs to authenticate a request that is not a message.
+///
+/// Messages authenticate themselves via [`Envelope::signing_bytes`]. Everything else —
+/// reading a room's history, creating a room, joining one — had no authentication at all,
+/// which meant membership could be enforced in the state layer and then trivially
+/// bypassed by lying at the HTTP boundary.
+///
+/// `issued_at_ms` bounds replay: the server rejects requests outside a window. It is not a
+/// nonce, so a captured request can be replayed inside that window; that is an accepted
+/// limitation for read operations and is documented in `SECURITY.md`.
+pub fn request_signing_bytes(
+    action: &str,
+    resource: Option<crate::RoomId>,
+    issued_at_ms: i64,
+) -> Vec<u8> {
+    fn push(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let mut out = Vec::new();
+    push(&mut out, b"cairn/request/v1");
+    push(&mut out, action.as_bytes());
+    match resource {
+        Some(r) => {
+            out.push(1);
+            push(&mut out, r.as_uuid().as_bytes());
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&issued_at_ms.to_be_bytes());
+    out
+}
+
+#[cfg(test)]
+mod request_auth_tests {
+    use super::*;
+
+    #[test]
+    fn request_signing_covers_action_resource_and_time() {
+        let room = RoomId::new();
+        let base = request_signing_bytes("read", Some(room), 1_000);
+        assert_eq!(base, request_signing_bytes("read", Some(room), 1_000));
+        // An authorization to read must not also authorize a write.
+        assert_ne!(base, request_signing_bytes("write", Some(room), 1_000));
+        // …nor the same action against a different room.
+        assert_ne!(base, request_signing_bytes("read", Some(RoomId::new()), 1_000));
+        assert_ne!(base, request_signing_bytes("read", None, 1_000));
+        assert_ne!(base, request_signing_bytes("read", Some(room), 2_000));
+    }
+
+    #[test]
+    fn action_boundaries_cannot_be_confused() {
+        // Without length prefixes "read" + room could collide with "readroom" + nothing.
+        assert_ne!(request_signing_bytes("read", None, 0), request_signing_bytes("rea", None, 0));
+    }
+}
+
 #[cfg(test)]
 mod device_auth_tests {
     use super::*;

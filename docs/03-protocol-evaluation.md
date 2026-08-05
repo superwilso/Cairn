@@ -112,6 +112,8 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | No sessions or rate limits | Accounts are claimed, invite-gated, and device linking is authorized — but there is no session concept, no rate limiting, and no account recovery |
 | Franking unreviewed | Groups are handled, but no external cryptographic review yet |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
+| Replay window, not nonces | Signed requests carry a timestamp checked against a 60s window; replay inside that window is possible |
+| No room roles or permissions | Membership is flat — any member can add another. No owners, moderators, or bans yet |
 | No TLS termination | Must sit behind a reverse proxy |
 
 ## Verification standard
