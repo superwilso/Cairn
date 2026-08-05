@@ -165,9 +165,13 @@ class were found by probing shipped code rather than by reading it, and both are
   to other users. Fixed by explicit membership, enforced on both the read and write paths
   and behind signed requests so it cannot be bypassed at the HTTP boundary.
 
-What this class still permits: any member of a room can add any other account to it, since
-there are no roles or permissions yet. Do not treat membership of a shared room as evidence
-that a moderator vetted the participants.
+Rooms now carry roles — owner, moderator, member — and only moderators and owners may
+admit or remove accounts. A room always retains at least one owner, because a room with
+none could never be moderated again.
+
+What this class still permits: a removed account can be re-added by any moderator, and
+there is no instance-wide ban. Removal is a room-scoped action, not a platform one, until
+policy lists exist.
 
 ## 5. The malicious group member (A6)
 

@@ -105,7 +105,13 @@ deniable protocol offers. Cairn accepts this trade on frankable surfaces and sta
 
 ## 2. Policy lists and ACLs — the highest-leverage item
 
-**Where:** all tiers. **Status:** designed, not implemented.
+**Where:** all tiers. **Status:** room-level roles implemented; subscribable lists designed,
+not implemented.
+
+Rooms now have owner/moderator/member roles with removal, which is the floor: before this
+a room could never eject anyone, so a single malicious member could admit attackers
+permanently. That is per-room enforcement only — the cross-instance, subscribable part
+below is still ahead.
 
 Matrix's subscribable ban lists (Mjolnir, then Draupnir) are the most effective federated
 moderation tool that exists in the wild. Communities publish ban lists as data; other

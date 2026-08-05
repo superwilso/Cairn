@@ -57,6 +57,12 @@ pub enum ServerError {
     RoomNotOpen,
     #[error("room is at its member ceiling")]
     RoomFull,
+    #[error("insufficient role in this room for that action")]
+    InsufficientRole,
+    #[error("a room must keep at least one owner")]
+    LastOwner,
+    #[error("that account is not a member of this room")]
+    TargetNotAMember,
     #[error("request signature is missing, malformed, or does not verify")]
     BadRequestAuth,
     #[error("request timestamp is outside the accepted window")]
@@ -68,6 +74,31 @@ pub enum ServerError {
 /// Bounds replay without requiring server-side nonce storage. Generous enough to tolerate
 /// ordinary clock skew, tight enough that a captured request is not indefinitely useful.
 pub const REQUEST_WINDOW_MS: i64 = 60_000;
+
+/// What an account may do in a room.
+///
+/// Ordered so comparisons express authority directly: an actor may only act on a target
+/// whose role is strictly lower than their own. Flat membership was a moderation dead
+/// end — any member could add anyone, nobody could remove anyone, so one malicious member
+/// could admit attackers permanently and the room had no recourse. A platform whose
+/// stated differentiator is moderation cannot lack an eject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomRole {
+    /// May read and write. May not change anyone's membership but their own.
+    Member,
+    /// May admit accounts and remove members.
+    Moderator,
+    /// May do anything a moderator can, plus change roles.
+    Owner,
+}
+
+/// An account's place in a room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMember {
+    pub user: UserId,
+    pub role: RoomRole,
+}
 
 /// A room as the server knows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,13 +126,21 @@ struct Room {
     /// an injected franked message advances the room's franking chain and corrupts the
     /// evidence honest members would later report.
     #[serde(default)]
-    members: Vec<UserId>,
+    members: Vec<RoomMember>,
     log: Vec<StoredMessage>,
 }
 
 impl Room {
     fn has_member(&self, user: UserId) -> bool {
-        self.members.contains(&user)
+        self.members.iter().any(|m| m.user == user)
+    }
+
+    fn role_of(&self, user: UserId) -> Option<RoomRole> {
+        self.members.iter().find(|m| m.user == user).map(|m| m.role)
+    }
+
+    fn owner_count(&self) -> usize {
+        self.members.iter().filter(|m| m.role == RoomRole::Owner).count()
     }
 }
 
@@ -443,17 +482,24 @@ impl Instance {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         rooms.insert(
             id,
-            Room { seal, next_seq: 0, last_franked: None, members: vec![creator], log: Vec::new() },
+            Room {
+                seal,
+                next_seq: 0,
+                last_franked: None,
+                members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
+                log: Vec::new(),
+            },
         );
         self.persist(&rooms)?;
         Ok((id, seal))
     }
 
-    /// Add an account to a room, at the request of an existing member.
+    /// Add an account to a room, at the request of a moderator or owner.
     ///
-    /// Only a member may extend membership. This is deliberately the *only* way into a
-    /// non-public room: the tier model says a T1/T2 room cannot mint a public invite
-    /// (`RoomSeal::may_mint_public_invite`), so there is no self-service path in.
+    /// Ordinary members cannot admit people. Letting them would mean one compromised
+    /// account could flood a private room with attackers, and the tier model promises that
+    /// a T1/T2 room's membership is deliberate — it cannot mint a public invite
+    /// (`RoomSeal::may_mint_public_invite`), so there is no self-service path in either.
     pub fn add_room_member(
         &self,
         room: RoomId,
@@ -462,16 +508,84 @@ impl Instance {
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
-        if !r.has_member(actor) {
-            return Err(ServerError::NotAMember);
+        let actor_role = r.role_of(actor).ok_or(ServerError::NotAMember)?;
+        if actor_role < RoomRole::Moderator {
+            return Err(ServerError::InsufficientRole);
         }
         if r.members.len() as u32 >= r.seal.member_ceiling() {
             return Err(ServerError::RoomFull);
         }
         if !r.has_member(new_member) {
-            r.members.push(new_member);
+            r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
         }
         self.persist(&rooms)
+    }
+
+    /// Remove an account from a room.
+    ///
+    /// An actor may only remove someone strictly below them, so moderators cannot depose
+    /// each other or the owner. Anyone may remove themselves — leaving is not a privilege.
+    ///
+    /// The removed account's existing messages stay in the log. They are evidence, and a
+    /// removal that erased history would let an abuser launder their own transcript by
+    /// getting themselves ejected.
+    pub fn remove_room_member(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        target: UserId,
+    ) -> Result<(), ServerError> {
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let actor_role = r.role_of(actor).ok_or(ServerError::NotAMember)?;
+        let target_role = r.role_of(target).ok_or(ServerError::TargetNotAMember)?;
+
+        let leaving = actor == target;
+        if !leaving {
+            if actor_role < RoomRole::Moderator {
+                return Err(ServerError::InsufficientRole);
+            }
+            if target_role >= actor_role {
+                return Err(ServerError::InsufficientRole);
+            }
+        }
+
+        // A room with no owner can never be moderated again, so the last one cannot go —
+        // not even voluntarily.
+        if target_role == RoomRole::Owner && r.owner_count() <= 1 {
+            return Err(ServerError::LastOwner);
+        }
+
+        r.members.retain(|m| m.user != target);
+        self.persist(&rooms)
+    }
+
+    /// Change an account's role. Owners only.
+    pub fn set_room_role(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        target: UserId,
+        role: RoomRole,
+    ) -> Result<(), ServerError> {
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Owner {
+            return Err(ServerError::InsufficientRole);
+        }
+        let previous = r.role_of(target).ok_or(ServerError::TargetNotAMember)?;
+        if previous == RoomRole::Owner && role != RoomRole::Owner && r.owner_count() <= 1 {
+            return Err(ServerError::LastOwner);
+        }
+        if let Some(m) = r.members.iter_mut().find(|m| m.user == target) {
+            m.role = role;
+        }
+        self.persist(&rooms)
+    }
+
+    /// An account's role in a room, if any.
+    pub fn room_role(&self, room: RoomId, user: UserId) -> Option<RoomRole> {
+        self.rooms.lock().expect("rooms mutex poisoned").get(&room).and_then(|r| r.role_of(user))
     }
 
     /// Join a room that is open to anyone.
@@ -489,7 +603,7 @@ impl Instance {
             return Err(ServerError::RoomFull);
         }
         if !r.has_member(user) {
-            r.members.push(user);
+            r.members.push(RoomMember { user, role: RoomRole::Member });
         }
         self.persist(&rooms)
     }
@@ -1505,6 +1619,183 @@ mod membership {
         assert!(matches!(
             restarted.messages_since(room, outsider, 0),
             Err(ServerError::NotAMember)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod roles {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn room_with(inst: &Instance, owner: UserId) -> RoomId {
+        inst.create_room(
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 16 },
+            owner,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn the_creator_owns_the_room() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        assert_eq!(inst.room_role(room, alice.user), Some(RoomRole::Owner));
+    }
+
+    #[test]
+    fn an_ordinary_member_cannot_admit_anyone() {
+        // Otherwise one compromised account can flood a private room with attackers, and
+        // the tier badge stops meaning that membership was deliberate.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+
+        assert_eq!(inst.room_role(room, bob.user), Some(RoomRole::Member));
+        assert!(matches!(
+            inst.add_room_member(room, bob.user, UserId::new()),
+            Err(ServerError::InsufficientRole)
+        ));
+    }
+
+    #[test]
+    fn an_owner_can_eject_a_member_who_then_cannot_read_or_write() {
+        // The whole point: a room must be able to remove someone. Before roles existed
+        // there was no removal path at all.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, mallory.user).unwrap();
+
+        inst.accept(
+            mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+        )
+        .unwrap();
+
+        inst.remove_room_member(room, alice.user, mallory.user).unwrap();
+
+        assert!(matches!(
+            inst.accept(
+                mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] })
+            ),
+            Err(ServerError::NotAMember)
+        ));
+        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+    }
+
+    #[test]
+    fn removal_keeps_the_removed_members_messages() {
+        // Erasing them on removal would let an abuser launder their own transcript by
+        // getting themselves ejected.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, mallory.user).unwrap();
+        inst.accept(
+            mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+        )
+        .unwrap();
+
+        inst.remove_room_member(room, alice.user, mallory.user).unwrap();
+
+        let log = inst.messages_since(room, alice.user, 0).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].envelope.sender, mallory.user);
+    }
+
+    #[test]
+    fn a_moderator_cannot_depose_the_owner_or_a_peer() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mod1 = TestSender::registered(&inst);
+        let mod2 = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, mod1.user).unwrap();
+        inst.add_room_member(room, alice.user, mod2.user).unwrap();
+        inst.set_room_role(room, alice.user, mod1.user, RoomRole::Moderator).unwrap();
+        inst.set_room_role(room, alice.user, mod2.user, RoomRole::Moderator).unwrap();
+
+        assert!(matches!(
+            inst.remove_room_member(room, mod1.user, alice.user),
+            Err(ServerError::InsufficientRole)
+        ));
+        assert!(matches!(
+            inst.remove_room_member(room, mod1.user, mod2.user),
+            Err(ServerError::InsufficientRole)
+        ));
+    }
+
+    #[test]
+    fn anyone_may_leave_but_the_last_owner_may_not() {
+        // A room with no owner can never be moderated again.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+
+        inst.remove_room_member(room, bob.user, bob.user).unwrap();
+        assert_eq!(inst.room_role(room, bob.user), None);
+
+        assert!(matches!(
+            inst.remove_room_member(room, alice.user, alice.user),
+            Err(ServerError::LastOwner)
+        ));
+    }
+
+    #[test]
+    fn only_an_owner_changes_roles_and_cannot_orphan_the_room() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+
+        assert!(matches!(
+            inst.set_room_role(room, bob.user, bob.user, RoomRole::Owner),
+            Err(ServerError::InsufficientRole)
+        ));
+        // Demoting the only owner would leave the room unmoderatable.
+        assert!(matches!(
+            inst.set_room_role(room, alice.user, alice.user, RoomRole::Member),
+            Err(ServerError::LastOwner)
+        ));
+        // With a second owner it is allowed.
+        inst.set_room_role(room, alice.user, bob.user, RoomRole::Owner).unwrap();
+        inst.set_room_role(room, alice.user, alice.user, RoomRole::Member).unwrap();
+        assert_eq!(inst.room_role(room, alice.user), Some(RoomRole::Member));
+    }
+
+    #[test]
+    fn roles_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cairn-roles-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+
+        let (room, owner, member) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let alice = TestSender::registered(&inst);
+            let bob = TestSender::registered(&inst);
+            let room = room_with(&inst, alice.user);
+            inst.add_room_member(room, alice.user, bob.user).unwrap();
+            (room, alice.user, bob.user)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.room_role(room, owner), Some(RoomRole::Owner));
+        assert_eq!(restarted.room_role(room, member), Some(RoomRole::Member));
+        // A restart must not silently promote anyone.
+        assert!(matches!(
+            restarted.add_room_member(room, member, UserId::new()),
+            Err(ServerError::InsufficientRole)
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
