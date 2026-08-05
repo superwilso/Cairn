@@ -150,6 +150,29 @@ who has to use it. A primitive nobody sees protects nobody.
 
 ---
 
+## 4a. Other users of the same instance (A7, expanded)
+
+An account on the same instance is not a passive bystander. Two vulnerabilities in this
+class were found by probing shipped code rather than by reading it, and both are fixed:
+
+- **Impersonation via device registration.** A user id is public — it is on every message
+  the account sends — and any account could register a device against any id, then send as
+  that account. Fixed by requiring accounts to be claimed and device linking to be
+  authorized by a device already on the account.
+- **Room access without membership.** Rooms had no membership concept, so any account
+  could post into, and read the history of, any room it knew the id of — including private
+  E2EE rooms. The read half broke §3.1 directly: metadata is conceded to the *server*, not
+  to other users. Fixed by explicit membership, enforced on both the read and write paths
+  and behind signed requests so it cannot be bypassed at the HTTP boundary.
+
+Rooms now carry roles — owner, moderator, member — and only moderators and owners may
+admit or remove accounts. A room always retains at least one owner, because a room with
+none could never be moderated again.
+
+What this class still permits: a removed account can be re-added by any moderator, and
+there is no instance-wide ban. Removal is a room-scoped action, not a platform one, until
+policy lists exist.
+
 ## 5. The malicious group member (A6)
 
 There is no cryptographic defense against a participant who was legitimately given the

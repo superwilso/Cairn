@@ -27,6 +27,10 @@ Specifically, and non-exhaustively:
 - **Franking is unaudited.** It now handles groups correctly (the server anchors the
   ordering chain, so concurrent senders stay reportable), but no cryptographer outside
   the project has reviewed the construction.
+- **Request replay is bounded by a time window, not a nonce.** Non-message requests are
+  signed and carry a timestamp; the server rejects anything outside a 60-second window. A
+  captured request can still be replayed inside it. Acceptable for reads, and it should
+  become a nonce before anything state-changing is exposed to a hostile network.
 - **No transport security of its own.** Must sit behind a TLS-terminating proxy.
 
 A full list is in `docs/03-protocol-evaluation.md`.

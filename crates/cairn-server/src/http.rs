@@ -8,9 +8,10 @@
 //! end to end.
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,9 @@ pub fn router(instance: SharedInstance) -> Router {
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room}", get(describe_room))
         .route("/v1/rooms/{room}/messages", post(send_message).get(fetch_messages))
+        .route("/v1/rooms/{room}/members", post(add_room_member))
+        .route("/v1/rooms/{room}/members/{target}", delete(remove_room_member).put(set_room_role))
+        .route("/v1/rooms/{room}/join", post(join_room))
         .route("/v1/reports", post(submit_report))
         .with_state(instance)
 }
@@ -59,7 +63,17 @@ impl IntoResponse for ServerError {
             ServerError::AuthorizingDeviceNotOnAccount
             | ServerError::BadDeviceAuthorization
             | ServerError::InviteRequired
-            | ServerError::InviteInvalid => StatusCode::UNAUTHORIZED,
+            | ServerError::InviteInvalid
+            | ServerError::BadRequestAuth
+            | ServerError::RequestExpired => StatusCode::UNAUTHORIZED,
+            // Membership failures are 403, not 404: the caller proved who they are, and
+            // hiding the room's existence would be pretence — they already hold its id.
+            ServerError::NotAMember
+            | ServerError::RoomNotOpen
+            | ServerError::InsufficientRole
+            | ServerError::LastOwner => StatusCode::FORBIDDEN,
+            ServerError::TargetNotAMember => StatusCode::NOT_FOUND,
+            ServerError::RoomFull => StatusCode::CONFLICT,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -134,6 +148,98 @@ async fn link_device(
     Ok(StatusCode::CREATED)
 }
 
+/// Authenticate a non-message request from its headers and return the acting account.
+///
+/// Membership checks in the state layer are only as good as the identity they are checked
+/// against, so every membership-gated endpoint proves the caller's account first.
+fn signed_actor(
+    instance: &SharedInstance,
+    headers: &HeaderMap,
+    action: &str,
+    resource: Option<RoomId>,
+) -> Result<cairn_proto::UserId, ServerError> {
+    fn header<'a>(h: &'a HeaderMap, name: &str) -> Result<&'a str, ServerError> {
+        h.get(name).and_then(|v| v.to_str().ok()).ok_or(ServerError::BadRequestAuth)
+    }
+
+    let device = header(headers, "x-cairn-device")?
+        .parse::<uuid::Uuid>()
+        .map_err(|_| ServerError::BadRequestAuth)?;
+    let issued_at: i64 =
+        header(headers, "x-cairn-timestamp")?.parse().map_err(|_| ServerError::BadRequestAuth)?;
+    let signature = hex::decode(header(headers, "x-cairn-signature")?)
+        .map_err(|_| ServerError::BadRequestAuth)?;
+
+    instance.authenticate_request(
+        cairn_proto::DeviceId::from_uuid(device),
+        action,
+        resource,
+        issued_at,
+        &signature,
+        now_ms(),
+    )
+}
+
+#[derive(Deserialize)]
+struct RoomMemberRequest {
+    user: uuid::Uuid,
+}
+
+/// Add an account to a room. The caller must already be a member.
+async fn add_room_member(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<RoomMemberRequest>,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "add_member", Some(room))?;
+    instance.add_room_member(room, actor, cairn_proto::UserId::from_uuid(req.user))?;
+    Ok(StatusCode::CREATED)
+}
+
+/// Remove an account from a room, or leave it.
+async fn remove_room_member(
+    State(instance): State<SharedInstance>,
+    Path((room, target)): Path<(uuid::Uuid, uuid::Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "remove_member", Some(room))?;
+    instance.remove_room_member(room, actor, cairn_proto::UserId::from_uuid(target))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SetRoleRequest {
+    role: crate::state::RoomRole,
+}
+
+/// Change an account's role in a room. Owners only.
+async fn set_room_role(
+    State(instance): State<SharedInstance>,
+    Path((room, target)): Path<(uuid::Uuid, uuid::Uuid)>,
+    headers: HeaderMap,
+    Json(req): Json<SetRoleRequest>,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "set_role", Some(room))?;
+    instance.set_room_role(room, actor, cairn_proto::UserId::from_uuid(target), req.role)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Join a room that is open to anyone. Refused for private rooms.
+async fn join_room(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "join", Some(room))?;
+    instance.join_room(room, actor)?;
+    Ok(StatusCode::CREATED)
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -159,13 +265,18 @@ struct CreateRoomResponse {
 
 async fn create_room(
     State(instance): State<SharedInstance>,
+    headers: HeaderMap,
     Json(req): Json<CreateRoomRequest>,
 ) -> Result<Json<CreateRoomResponse>, ServerError> {
-    let (room, seal) = instance.create_room(RoomShape {
-        is_direct: req.is_direct,
-        is_publicly_discoverable: req.is_publicly_discoverable,
-        member_ceiling: req.member_ceiling,
-    })?;
+    let creator = signed_actor(&instance, &headers, "create_room", None)?;
+    let (room, seal) = instance.create_room(
+        RoomShape {
+            is_direct: req.is_direct,
+            is_publicly_discoverable: req.is_publicly_discoverable,
+            member_ceiling: req.member_ceiling,
+        },
+        creator,
+    )?;
     Ok(Json(CreateRoomResponse { room, tier: seal.tier().label(), e2ee: seal.tier().is_e2ee() }))
 }
 
@@ -176,9 +287,20 @@ async fn create_room(
 async fn describe_room(
     State(instance): State<SharedInstance>,
     Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<CreateRoomResponse>, ServerError> {
     let room = RoomId::from_uuid(room);
     let seal = instance.room_seal(room).ok_or(ServerError::NoSuchRoom)?;
+
+    // A public room is discoverable by definition, so describing it reveals nothing its
+    // tier does not already concede. A private one must not confirm its own existence to
+    // a stranger holding the id, which was previously free.
+    if !seal.may_mint_public_invite() {
+        let actor = signed_actor(&instance, &headers, "describe", Some(room))?;
+        if instance.room_role(room, actor).is_none() {
+            return Err(ServerError::NotAMember);
+        }
+    }
     Ok(Json(CreateRoomResponse { room, tier: seal.tier().label(), e2ee: seal.tier().is_e2ee() }))
 }
 
@@ -219,9 +341,12 @@ struct FetchedMessage {
 async fn fetch_messages(
     State(instance): State<SharedInstance>,
     Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
     Query(since): Query<Since>,
 ) -> Result<Json<Vec<FetchedMessage>>, ServerError> {
-    let messages = instance.messages_since(RoomId::from_uuid(room), since.after)?;
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "read", Some(room))?;
+    let messages = instance.messages_since(room, actor, since.after)?;
     Ok(Json(
         messages
             .into_iter()

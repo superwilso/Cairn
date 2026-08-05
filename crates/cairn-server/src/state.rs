@@ -51,6 +51,53 @@ pub enum ServerError {
     InviteRequired,
     #[error("invite is unknown, already used, or expired")]
     InviteInvalid,
+    #[error("not a member of this room")]
+    NotAMember,
+    #[error("this room is not open to join; a member must add you")]
+    RoomNotOpen,
+    #[error("room is at its member ceiling")]
+    RoomFull,
+    #[error("insufficient role in this room for that action")]
+    InsufficientRole,
+    #[error("a room must keep at least one owner")]
+    LastOwner,
+    #[error("that account is not a member of this room")]
+    TargetNotAMember,
+    #[error("request signature is missing, malformed, or does not verify")]
+    BadRequestAuth,
+    #[error("request timestamp is outside the accepted window")]
+    RequestExpired,
+}
+
+/// How far outside the present a signed request's timestamp may be.
+///
+/// Bounds replay without requiring server-side nonce storage. Generous enough to tolerate
+/// ordinary clock skew, tight enough that a captured request is not indefinitely useful.
+pub const REQUEST_WINDOW_MS: i64 = 60_000;
+
+/// What an account may do in a room.
+///
+/// Ordered so comparisons express authority directly: an actor may only act on a target
+/// whose role is strictly lower than their own. Flat membership was a moderation dead
+/// end — any member could add anyone, nobody could remove anyone, so one malicious member
+/// could admit attackers permanently and the room had no recourse. A platform whose
+/// stated differentiator is moderation cannot lack an eject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomRole {
+    /// May read and write. May not change anyone's membership but their own.
+    Member,
+    /// May admit accounts and remove members.
+    Moderator,
+    /// May do anything a moderator can, plus change roles.
+    Owner,
+}
+
+/// An account's place in a room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMember {
+    pub user: UserId,
+    pub role: RoomRole,
 }
 
 /// A room as the server knows it.
@@ -69,7 +116,32 @@ struct Room {
     /// precedes its message — see `cairn_crypto::franking` module docs.
     #[serde(default)]
     last_franked: Option<Commitment>,
+    /// Accounts entitled to read and write this room.
+    ///
+    /// Before this existed there was no membership concept at all: any authenticated
+    /// account could post into any room by id — including a private end-to-end encrypted
+    /// one — and could enumerate its history, learning who spoke and when. The read side
+    /// broke a stated guarantee: `docs/01-threat-model.md` §3.1 concedes that the *server*
+    /// sees metadata, not that any user does. The write side was worse than spam, because
+    /// an injected franked message advances the room's franking chain and corrupts the
+    /// evidence honest members would later report.
+    #[serde(default)]
+    members: Vec<RoomMember>,
     log: Vec<StoredMessage>,
+}
+
+impl Room {
+    fn has_member(&self, user: UserId) -> bool {
+        self.members.iter().any(|m| m.user == user)
+    }
+
+    fn role_of(&self, user: UserId) -> Option<RoomRole> {
+        self.members.iter().find(|m| m.user == user).map(|m| m.role)
+    }
+
+    fn owner_count(&self) -> usize {
+        self.members.iter().filter(|m| m.role == RoomRole::Owner).count()
+    }
 }
 
 /// A message the server has accepted.
@@ -400,13 +472,167 @@ impl Instance {
     }
 
     /// Create a room, deriving and sealing its tier.
-    pub fn create_room(&self, shape: RoomShape) -> Result<(RoomId, RoomSeal), ServerError> {
+    pub fn create_room(
+        &self,
+        shape: RoomShape,
+        creator: UserId,
+    ) -> Result<(RoomId, RoomSeal), ServerError> {
         let seal = RoomSeal::new(shape)?;
         let id = RoomId::new();
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        rooms.insert(id, Room { seal, next_seq: 0, last_franked: None, log: Vec::new() });
+        rooms.insert(
+            id,
+            Room {
+                seal,
+                next_seq: 0,
+                last_franked: None,
+                members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
+                log: Vec::new(),
+            },
+        );
         self.persist(&rooms)?;
         Ok((id, seal))
+    }
+
+    /// Add an account to a room, at the request of a moderator or owner.
+    ///
+    /// Ordinary members cannot admit people. Letting them would mean one compromised
+    /// account could flood a private room with attackers, and the tier model promises that
+    /// a T1/T2 room's membership is deliberate — it cannot mint a public invite
+    /// (`RoomSeal::may_mint_public_invite`), so there is no self-service path in either.
+    pub fn add_room_member(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        new_member: UserId,
+    ) -> Result<(), ServerError> {
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let actor_role = r.role_of(actor).ok_or(ServerError::NotAMember)?;
+        if actor_role < RoomRole::Moderator {
+            return Err(ServerError::InsufficientRole);
+        }
+        if r.members.len() as u32 >= r.seal.member_ceiling() {
+            return Err(ServerError::RoomFull);
+        }
+        if !r.has_member(new_member) {
+            r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
+        }
+        self.persist(&rooms)
+    }
+
+    /// Remove an account from a room.
+    ///
+    /// An actor may only remove someone strictly below them, so moderators cannot depose
+    /// each other or the owner. Anyone may remove themselves — leaving is not a privilege.
+    ///
+    /// The removed account's existing messages stay in the log. They are evidence, and a
+    /// removal that erased history would let an abuser launder their own transcript by
+    /// getting themselves ejected.
+    pub fn remove_room_member(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        target: UserId,
+    ) -> Result<(), ServerError> {
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let actor_role = r.role_of(actor).ok_or(ServerError::NotAMember)?;
+        let target_role = r.role_of(target).ok_or(ServerError::TargetNotAMember)?;
+
+        let leaving = actor == target;
+        if !leaving {
+            if actor_role < RoomRole::Moderator {
+                return Err(ServerError::InsufficientRole);
+            }
+            if target_role >= actor_role {
+                return Err(ServerError::InsufficientRole);
+            }
+        }
+
+        // A room with no owner can never be moderated again, so the last one cannot go —
+        // not even voluntarily.
+        if target_role == RoomRole::Owner && r.owner_count() <= 1 {
+            return Err(ServerError::LastOwner);
+        }
+
+        r.members.retain(|m| m.user != target);
+        self.persist(&rooms)
+    }
+
+    /// Change an account's role. Owners only.
+    pub fn set_room_role(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        target: UserId,
+        role: RoomRole,
+    ) -> Result<(), ServerError> {
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Owner {
+            return Err(ServerError::InsufficientRole);
+        }
+        let previous = r.role_of(target).ok_or(ServerError::TargetNotAMember)?;
+        if previous == RoomRole::Owner && role != RoomRole::Owner && r.owner_count() <= 1 {
+            return Err(ServerError::LastOwner);
+        }
+        if let Some(m) = r.members.iter_mut().find(|m| m.user == target) {
+            m.role = role;
+        }
+        self.persist(&rooms)
+    }
+
+    /// An account's role in a room, if any.
+    pub fn room_role(&self, room: RoomId, user: UserId) -> Option<RoomRole> {
+        self.rooms.lock().expect("rooms mutex poisoned").get(&room).and_then(|r| r.role_of(user))
+    }
+
+    /// Join a room that is open to anyone.
+    ///
+    /// Permitted only where the tier already implies public access — the same predicate
+    /// that governs public invites. A private room is never self-joinable, or its tier
+    /// badge would be claiming a confidentiality the membership rules do not enforce.
+    pub fn join_room(&self, room: RoomId, user: UserId) -> Result<(), ServerError> {
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if !r.seal.may_mint_public_invite() {
+            return Err(ServerError::RoomNotOpen);
+        }
+        if r.members.len() as u32 >= r.seal.member_ceiling() {
+            return Err(ServerError::RoomFull);
+        }
+        if !r.has_member(user) {
+            r.members.push(RoomMember { user, role: RoomRole::Member });
+        }
+        self.persist(&rooms)
+    }
+
+    /// Verify a signed non-message request and return the acting account.
+    ///
+    /// Membership enforced only in this layer would be bypassable by lying at the HTTP
+    /// boundary, so the caller has to prove which account it is before membership means
+    /// anything.
+    pub fn authenticate_request(
+        &self,
+        device: DeviceId,
+        action: &str,
+        resource: Option<RoomId>,
+        issued_at_ms: i64,
+        signature: &[u8],
+        now_ms: i64,
+    ) -> Result<UserId, ServerError> {
+        if (now_ms - issued_at_ms).abs() > REQUEST_WINDOW_MS {
+            return Err(ServerError::RequestExpired);
+        }
+        let devices = self.devices.lock().expect("devices mutex poisoned");
+        let record = devices.get(&device).ok_or(ServerError::UnknownDevice)?;
+        let key = hex::decode(&record.public_key).map_err(|_| ServerError::BadRequestAuth)?;
+        let signed = cairn_proto::request_signing_bytes(action, resource, issued_at_ms);
+        if !cairn_crypto::mls::verify_signature(&key, &signed, signature) {
+            return Err(ServerError::BadRequestAuth);
+        }
+        Ok(record.user)
     }
 
     pub fn room_seal(&self, room: RoomId) -> Option<RoomSeal> {
@@ -427,6 +653,12 @@ impl Instance {
 
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let room = rooms.get_mut(&envelope.room).ok_or(ServerError::NoSuchRoom)?;
+
+        if !room.has_member(envelope.sender) {
+            // A non-member's message would advance next_seq and the franking chain of a
+            // room they are not in, corrupting evidence for the members who are.
+            return Err(ServerError::NotAMember);
+        }
 
         envelope.validate_for_tier(room.seal.tier())?;
 
@@ -458,13 +690,22 @@ impl Instance {
     }
 
     /// Fetch messages after a sequence number.
+    /// Fetch messages after a sequence number, for a member of the room.
+    ///
+    /// `actor` is required and checked. Without it any account could enumerate any room by
+    /// id and learn who spoke and when — metadata the threat model concedes to the server,
+    /// not to other users.
     pub fn messages_since(
         &self,
         room: RoomId,
+        actor: UserId,
         after: u64,
     ) -> Result<Vec<StoredMessage>, ServerError> {
         let rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let room = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+        if !room.has_member(actor) {
+            return Err(ServerError::NotAMember);
+        }
         Ok(room.log.iter().filter(|m| m.server_seq > after).cloned().collect())
     }
 
@@ -531,7 +772,7 @@ pub(crate) mod tests {
             s
         }
 
-        fn envelope(&self, room: RoomId, payload: EnvelopePayload) -> Envelope {
+        pub(crate) fn envelope(&self, room: RoomId, payload: EnvelopePayload) -> Envelope {
             self.sign(self.unsigned(room, payload))
         }
 
@@ -558,9 +799,10 @@ pub(crate) mod tests {
     #[test]
     fn rooms_get_the_tier_their_shape_implies() {
         let inst = Instance::in_memory();
-        let (_, dm) = inst.create_room(dm_shape()).unwrap();
+        let sender = TestSender::registered(&inst);
+        let (_, dm) = inst.create_room(dm_shape(), sender.user).unwrap();
         assert_eq!(dm.tier(), Tier::Private);
-        let (_, pubc) = inst.create_room(public_shape()).unwrap();
+        let (_, pubc) = inst.create_room(public_shape(), sender.user).unwrap();
         assert_eq!(pubc.tier(), Tier::PublicCommunity);
     }
 
@@ -569,7 +811,7 @@ pub(crate) mod tests {
         // The defence that does not depend on the client behaving.
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(dm_shape()).unwrap();
+        let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e = sender.envelope(room, EnvelopePayload::Plaintext { body: "sneaky".into() });
         assert!(matches!(inst.accept(e), Err(ServerError::Rejected(_))));
     }
@@ -578,7 +820,7 @@ pub(crate) mod tests {
     fn server_accepts_ciphertext_in_an_encrypted_room() {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(dm_shape()).unwrap();
+        let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e =
             sender.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1, 2, 3] });
         assert!(inst.accept(e).is_ok());
@@ -588,7 +830,7 @@ pub(crate) mod tests {
     fn sequence_numbers_are_strictly_increasing() {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         let mut last = 0;
         for i in 0..5 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
@@ -610,7 +852,7 @@ pub(crate) mod tests {
     fn messages_are_franked_when_a_commitment_is_present() {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(dm_shape()).unwrap();
+        let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let (commitment, _opening) = cairn_crypto::commit(b"hello");
 
         let e = sender
@@ -634,7 +876,7 @@ pub(crate) mod tests {
     fn malformed_commitment_is_rejected() {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(dm_shape()).unwrap();
+        let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e = sender
             .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
             .with_franking_commitment("not-hex");
@@ -661,7 +903,7 @@ pub(crate) mod tests {
         let (room, sender, device, commitment, opening, tag, seq) = {
             let inst = Instance::open(storage.clone()).unwrap();
             let sender = TestSender::registered(&inst);
-            let (room, _) = inst.create_room(dm_shape()).unwrap();
+            let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
             let (commitment, opening) = cairn_crypto::commit(b"evidence");
             let e = sender
                 .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
@@ -713,7 +955,7 @@ pub(crate) mod tests {
         let (room, user, device, pubkey) = {
             let inst = Instance::open(storage.clone()).unwrap();
             let sender = TestSender::registered(&inst);
-            let (room, _) = inst.create_room(public_shape()).unwrap();
+            let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
             for i in 0..3 {
                 let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
                 inst.accept(e).unwrap();
@@ -723,7 +965,7 @@ pub(crate) mod tests {
 
         let restarted = Instance::open(storage).unwrap();
         assert_eq!(restarted.room_seal(room).unwrap().tier(), Tier::PublicCommunity);
-        assert_eq!(restarted.messages_since(room, 0).unwrap().len(), 3);
+        assert_eq!(restarted.messages_since(room, user, 0).unwrap().len(), 3);
 
         // Device registrations must survive too, or every client is locked out after a
         // restart. Re-registering the same device must be refused, which proves the
@@ -735,7 +977,9 @@ pub(crate) mod tests {
 
         // Sequence numbers must continue, not restart — a repeated server_seq would let
         // two different messages carry interchangeable franking contexts.
+        // Room membership must survive the restart too, or every member is locked out.
         let sender2 = TestSender::registered(&restarted);
+        restarted.join_room(room, sender2.user).unwrap();
         let e = sender2.envelope(room, EnvelopePayload::Plaintext { body: "after".into() });
         assert_eq!(restarted.accept(e).unwrap().server_seq, 4);
 
@@ -746,7 +990,7 @@ pub(crate) mod tests {
     fn unsigned_messages_are_rejected() {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         let e = sender.unsigned(room, EnvelopePayload::Plaintext { body: "hi".into() });
         assert!(matches!(inst.accept(e), Err(ServerError::Unsigned)));
     }
@@ -754,7 +998,8 @@ pub(crate) mod tests {
     #[test]
     fn an_unregistered_device_cannot_send() {
         let inst = Instance::in_memory();
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let owner = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape(), owner.user).unwrap();
         let stranger = TestSender {
             session: cairn_crypto::mls::Session::new(b"stranger").unwrap(),
             user: UserId::new(),
@@ -773,7 +1018,8 @@ pub(crate) mod tests {
         let inst = Instance::in_memory();
         let alice = TestSender::registered(&inst);
         let mallory = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), alice.user).unwrap();
+        inst.join_room(room, mallory.user).unwrap();
 
         let mut e = mallory.unsigned(room, EnvelopePayload::Plaintext { body: "not me".into() });
         e.sender = alice.user; // claim Alice's account
@@ -788,7 +1034,7 @@ pub(crate) mod tests {
         // must invalidate the signature.
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
 
         let mut e = sender.envelope(room, EnvelopePayload::Plaintext { body: "original".into() });
         e.payload = EnvelopePayload::Plaintext { body: "rewritten in transit".into() };
@@ -802,7 +1048,8 @@ pub(crate) mod tests {
         let inst = Instance::in_memory();
         let alice = TestSender::registered(&inst);
         let mallory = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), alice.user).unwrap();
+        inst.join_room(room, mallory.user).unwrap();
 
         let mut e = alice.unsigned(room, EnvelopePayload::Plaintext { body: "forged".into() });
         e.sender = alice.user;
@@ -837,7 +1084,8 @@ pub(crate) mod tests {
         let inst = Instance::in_memory();
         let alice = TestSender::registered(&inst);
         let bob = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(dm_shape()).unwrap();
+        let (room, _) = inst.create_room(dm_shape(), alice.user).unwrap();
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
 
         let mut reported = Vec::new();
         for (sender, text) in [(&alice, &b"alice speaks"[..]), (&bob, &b"bob speaks"[..])] {
@@ -879,7 +1127,7 @@ pub(crate) mod tests {
         // franked ones, or an unfranked message in between would orphan the next report.
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
 
         let (c1, _) = cairn_crypto::commit(b"one");
         let e = sender
@@ -917,14 +1165,14 @@ pub(crate) mod tests {
     fn messages_since_filters_by_sequence() {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         for i in 0..3 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
             inst.accept(e).unwrap();
         }
-        assert_eq!(inst.messages_since(room, 0).unwrap().len(), 3);
-        assert_eq!(inst.messages_since(room, 2).unwrap().len(), 1);
-        assert_eq!(inst.messages_since(room, 99).unwrap().len(), 0);
+        assert_eq!(inst.messages_since(room, sender.user, 0).unwrap().len(), 3);
+        assert_eq!(inst.messages_since(room, sender.user, 2).unwrap().len(), 1);
+        assert_eq!(inst.messages_since(room, sender.user, 99).unwrap().len(), 0);
     }
 }
 
@@ -967,7 +1215,7 @@ mod accounts {
     fn an_attacker_cannot_attach_a_device_to_someone_elses_account() {
         let inst = Instance::in_memory();
         let alice = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), alice.user).unwrap();
 
         let mallory_key = cairn_crypto::mls::Session::new(b"mallory").unwrap();
         let mallory_device = DeviceId::new();
@@ -1007,7 +1255,7 @@ mod accounts {
     fn a_holder_can_link_a_second_device_and_it_can_send() {
         let inst = Instance::in_memory();
         let alice = TestSender::registered(&inst);
-        let (room, _) = inst.create_room(public_shape()).unwrap();
+        let (room, _) = inst.create_room(public_shape(), alice.user).unwrap();
 
         let laptop = cairn_crypto::mls::Session::new(b"alice-laptop").unwrap();
         let laptop_id = DeviceId::new();
@@ -1176,6 +1424,379 @@ mod accounts {
             Err(ServerError::InviteInvalid)
         ));
         let _ = device;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod membership {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn private_room(inst: &Instance, owner: UserId) -> RoomId {
+        inst.create_room(
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 8 },
+            owner,
+        )
+        .unwrap()
+        .0
+    }
+
+    /// Regression test for a real vulnerability.
+    ///
+    /// Rooms had no membership concept. Any authenticated account could post into any room
+    /// by id — including a private end-to-end encrypted one it had never been added to.
+    /// Confirmed against the shipped code before the fix: the injected message was accepted
+    /// as server_seq 2.
+    #[test]
+    fn a_non_member_cannot_write_to_a_private_room() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = private_room(&inst, alice.user);
+
+        let e = mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] });
+        assert!(matches!(inst.accept(e), Err(ServerError::NotAMember)));
+    }
+
+    /// The read half of the same vulnerability, and the worse one.
+    ///
+    /// A non-member could enumerate any room by id and learn who spoke and when. The
+    /// ciphertext was useless to them, but the metadata was not — and
+    /// `docs/01-threat-model.md` §3.1 concedes metadata to the *server*, not to other
+    /// users. Confirmed before the fix: two messages returned, with both sender ids.
+    #[test]
+    fn a_non_member_cannot_read_a_private_room() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = private_room(&inst, alice.user);
+
+        inst.accept(alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }))
+            .unwrap();
+
+        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+        // The member still can, so the check is not simply refusing everyone.
+        assert_eq!(inst.messages_since(room, alice.user, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_private_room_cannot_be_self_joined() {
+        // Otherwise membership would be decorative: anyone holding the id could add
+        // themselves and the T1/T2 badge would claim a confidentiality nothing enforces.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = private_room(&inst, alice.user);
+
+        assert!(matches!(inst.join_room(room, mallory.user), Err(ServerError::RoomNotOpen)));
+    }
+
+    #[test]
+    fn a_member_can_add_someone_and_a_non_member_cannot() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = private_room(&inst, alice.user);
+
+        // Mallory cannot add herself by asking on her own authority.
+        assert!(matches!(
+            inst.add_room_member(room, mallory.user, mallory.user),
+            Err(ServerError::NotAMember)
+        ));
+
+        // Alice, a member, can add Bob — and then Bob can speak.
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+        assert!(inst
+            .accept(bob.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_public_room_is_self_joinable() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let newcomer = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape(), alice.user).unwrap();
+
+        inst.join_room(room, newcomer.user).unwrap();
+        assert!(inst
+            .accept(newcomer.envelope(room, EnvelopePayload::Plaintext { body: "hello".into() }))
+            .is_ok());
+    }
+
+    #[test]
+    fn membership_respects_the_room_ceiling() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = inst
+            .create_room(
+                RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 },
+                alice.user,
+            )
+            .unwrap()
+            .0;
+
+        inst.add_room_member(room, alice.user, UserId::new()).unwrap();
+        assert!(matches!(
+            inst.add_room_member(room, alice.user, UserId::new()),
+            Err(ServerError::RoomFull)
+        ));
+    }
+
+    #[test]
+    fn signed_requests_authenticate_the_actor_and_bound_replay() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = private_room(&inst, alice.user);
+
+        let issued = 10_000i64;
+        let sig = alice
+            .session
+            .sign(&cairn_proto::request_signing_bytes("read", Some(room), issued))
+            .unwrap();
+
+        assert_eq!(
+            inst.authenticate_request(alice.device, "read", Some(room), issued, &sig, issued)
+                .unwrap(),
+            alice.user
+        );
+
+        // A read authorization must not also authorize a write.
+        assert!(matches!(
+            inst.authenticate_request(alice.device, "add_member", Some(room), issued, &sig, issued),
+            Err(ServerError::BadRequestAuth)
+        ));
+
+        // …nor the same action against a different room.
+        assert!(matches!(
+            inst.authenticate_request(
+                alice.device,
+                "read",
+                Some(RoomId::new()),
+                issued,
+                &sig,
+                issued
+            ),
+            Err(ServerError::BadRequestAuth)
+        ));
+
+        // Outside the window it is refused, which bounds how long a captured request is
+        // useful. It is a window, not a nonce — replay inside it is still possible.
+        assert!(matches!(
+            inst.authenticate_request(
+                alice.device,
+                "read",
+                Some(room),
+                issued,
+                &sig,
+                issued + REQUEST_WINDOW_MS + 1
+            ),
+            Err(ServerError::RequestExpired)
+        ));
+    }
+
+    #[test]
+    fn room_membership_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cairn-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+
+        let (room, member, outsider) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let alice = TestSender::registered(&inst);
+            let mallory = TestSender::registered(&inst);
+            let room = private_room(&inst, alice.user);
+            (room, alice.user, mallory.user)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        // A member must not be locked out by a restart…
+        assert!(restarted.messages_since(room, member, 0).is_ok());
+        // …and an outsider must not be let in by one.
+        assert!(matches!(
+            restarted.messages_since(room, outsider, 0),
+            Err(ServerError::NotAMember)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod roles {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn room_with(inst: &Instance, owner: UserId) -> RoomId {
+        inst.create_room(
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 16 },
+            owner,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn the_creator_owns_the_room() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        assert_eq!(inst.room_role(room, alice.user), Some(RoomRole::Owner));
+    }
+
+    #[test]
+    fn an_ordinary_member_cannot_admit_anyone() {
+        // Otherwise one compromised account can flood a private room with attackers, and
+        // the tier badge stops meaning that membership was deliberate.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+
+        assert_eq!(inst.room_role(room, bob.user), Some(RoomRole::Member));
+        assert!(matches!(
+            inst.add_room_member(room, bob.user, UserId::new()),
+            Err(ServerError::InsufficientRole)
+        ));
+    }
+
+    #[test]
+    fn an_owner_can_eject_a_member_who_then_cannot_read_or_write() {
+        // The whole point: a room must be able to remove someone. Before roles existed
+        // there was no removal path at all.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, mallory.user).unwrap();
+
+        inst.accept(
+            mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+        )
+        .unwrap();
+
+        inst.remove_room_member(room, alice.user, mallory.user).unwrap();
+
+        assert!(matches!(
+            inst.accept(
+                mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] })
+            ),
+            Err(ServerError::NotAMember)
+        ));
+        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+    }
+
+    #[test]
+    fn removal_keeps_the_removed_members_messages() {
+        // Erasing them on removal would let an abuser launder their own transcript by
+        // getting themselves ejected.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, mallory.user).unwrap();
+        inst.accept(
+            mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+        )
+        .unwrap();
+
+        inst.remove_room_member(room, alice.user, mallory.user).unwrap();
+
+        let log = inst.messages_since(room, alice.user, 0).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].envelope.sender, mallory.user);
+    }
+
+    #[test]
+    fn a_moderator_cannot_depose_the_owner_or_a_peer() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mod1 = TestSender::registered(&inst);
+        let mod2 = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, mod1.user).unwrap();
+        inst.add_room_member(room, alice.user, mod2.user).unwrap();
+        inst.set_room_role(room, alice.user, mod1.user, RoomRole::Moderator).unwrap();
+        inst.set_room_role(room, alice.user, mod2.user, RoomRole::Moderator).unwrap();
+
+        assert!(matches!(
+            inst.remove_room_member(room, mod1.user, alice.user),
+            Err(ServerError::InsufficientRole)
+        ));
+        assert!(matches!(
+            inst.remove_room_member(room, mod1.user, mod2.user),
+            Err(ServerError::InsufficientRole)
+        ));
+    }
+
+    #[test]
+    fn anyone_may_leave_but_the_last_owner_may_not() {
+        // A room with no owner can never be moderated again.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+
+        inst.remove_room_member(room, bob.user, bob.user).unwrap();
+        assert_eq!(inst.room_role(room, bob.user), None);
+
+        assert!(matches!(
+            inst.remove_room_member(room, alice.user, alice.user),
+            Err(ServerError::LastOwner)
+        ));
+    }
+
+    #[test]
+    fn only_an_owner_changes_roles_and_cannot_orphan_the_room() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+
+        assert!(matches!(
+            inst.set_room_role(room, bob.user, bob.user, RoomRole::Owner),
+            Err(ServerError::InsufficientRole)
+        ));
+        // Demoting the only owner would leave the room unmoderatable.
+        assert!(matches!(
+            inst.set_room_role(room, alice.user, alice.user, RoomRole::Member),
+            Err(ServerError::LastOwner)
+        ));
+        // With a second owner it is allowed.
+        inst.set_room_role(room, alice.user, bob.user, RoomRole::Owner).unwrap();
+        inst.set_room_role(room, alice.user, alice.user, RoomRole::Member).unwrap();
+        assert_eq!(inst.room_role(room, alice.user), Some(RoomRole::Member));
+    }
+
+    #[test]
+    fn roles_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cairn-roles-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+
+        let (room, owner, member) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let alice = TestSender::registered(&inst);
+            let bob = TestSender::registered(&inst);
+            let room = room_with(&inst, alice.user);
+            inst.add_room_member(room, alice.user, bob.user).unwrap();
+            (room, alice.user, bob.user)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.room_role(room, owner), Some(RoomRole::Owner));
+        assert_eq!(restarted.room_role(room, member), Some(RoomRole::Member));
+        // A restart must not silently promote anyone.
+        assert!(matches!(
+            restarted.add_room_member(room, member, UserId::new()),
+            Err(ServerError::InsufficientRole)
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

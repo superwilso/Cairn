@@ -1,0 +1,22 @@
+# Paths where a human must look before merge.
+#
+# Not bureaucracy. Three vulnerability classes shipped to main in code that was
+# merged, CI-green, and covered by tests that looked adequate — impersonation,
+# room access, and no-eject — and none were caught by review. Everywhere else can
+# auto-merge on green CI; these paths keep the one check that has ever worked.
+
+# All cryptography.
+/crates/cairn-crypto/                @superwilso
+
+# Authentication, membership, and the rules the server enforces.
+/crates/cairn-server/src/state.rs    @superwilso
+/crates/cairn-server/src/storage.rs  @superwilso
+
+# Canonical signing bytes and the tier model. A change here can silently
+# invalidate every signature or weaken a tier.
+/crates/cairn-proto/src/envelope.rs  @superwilso
+/crates/cairn-proto/src/tier.rs      @superwilso
+
+# The document every security claim is measured against.
+/docs/01-threat-model.md             @superwilso
+/SECURITY.md                         @superwilso
