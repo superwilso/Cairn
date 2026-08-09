@@ -17,7 +17,9 @@
 #![forbid(unsafe_code)]
 
 pub mod conversation;
+pub mod store;
 
 pub use conversation::{
     Conversation, ConversationError, OutboundMessage, ReceivedFranking, ReceivedMessage,
 };
+pub use store::{ConversationIndex, ConversationRecord, IndexError};

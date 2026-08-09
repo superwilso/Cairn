@@ -36,8 +36,8 @@ pub struct OutboundMessage {
     pub envelope: Envelope,
     /// The franking opening, as retained by the *sender*.
     ///
-    /// Recipients get their own copy from inside the encrypted body — see [`InnerBody`].
-    /// This copy never goes to the server.
+    /// Recipients get their own copy from inside the encrypted body, so both ends can
+    /// report the same message. This copy never goes to the server.
     pub opening: Opening,
     /// The commitment for this message, which becomes the next message's `prev`.
     pub commitment: Commitment,
@@ -100,6 +100,38 @@ impl Conversation {
             return Err(ConversationError::NotEncrypted);
         }
         Ok(Self { seal, room, user, device, session, group: Some(group) })
+    }
+
+    /// Resume an encrypted conversation whose MLS group is already on disk.
+    ///
+    /// `room` must be the id the **server** knows, not a fresh one: a resumed conversation
+    /// that minted its own id would post into a room nobody else is reading, and its
+    /// franking chain would not line up with the server's. That is why this takes the room
+    /// id rather than generating one the way [`Conversation::create_encrypted`] does.
+    ///
+    /// Requires a session opened with [`Session::open`]; an in-memory session has nothing
+    /// to load.
+    pub fn resume_encrypted(
+        seal: RoomSeal,
+        room: RoomId,
+        user: UserId,
+        device: DeviceId,
+        session: Arc<Session>,
+        group_id: &[u8],
+    ) -> Result<Self, ConversationError> {
+        if !seal.tier().is_e2ee() {
+            return Err(ConversationError::NotEncrypted);
+        }
+        let group = session.load_group(group_id)?;
+        Ok(Self { seal, room, user, device, session, group: Some(group) })
+    }
+
+    /// The MLS group id backing this conversation, if it is encrypted.
+    ///
+    /// A client persists this against the room id so it can find the group again after a
+    /// restart — see [`crate::store::ConversationIndex`].
+    pub fn group_id(&self) -> Option<&[u8]> {
+        self.group.as_ref().map(|g| g.group_id())
     }
 
     /// Open a public (T3) conversation. No MLS group; the server reads content.
@@ -409,6 +441,96 @@ mod tests {
         .unwrap();
 
         (alice, bob)
+    }
+
+    /// M1's exit condition at the layer a client actually drives.
+    ///
+    /// `linked_pair` above proves the round trip; this proves it still works when both
+    /// sides are rebuilt from disk with nothing carried over in memory but the ids a
+    /// server would have handed back.
+    #[test]
+    fn a_conversation_resumes_from_disk_and_keeps_talking() {
+        use crate::store::ConversationIndex;
+
+        let dir =
+            std::env::temp_dir().join("cairn-convo-resume").join(format!("{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let alice_dir = dir.join("alice");
+        let bob_dir = dir.join("bob");
+
+        let (room, alice_user, alice_device, bob_user, bob_device) =
+            (RoomId::new(), UserId::new(), DeviceId::new(), UserId::new(), DeviceId::new());
+
+        {
+            let alice_session = Arc::new(Session::open(&alice_dir, b"alice").unwrap());
+            let bob_session = Arc::new(Session::open(&bob_dir, b"bob").unwrap());
+
+            let mut alice = Conversation::create_encrypted(
+                dm_seal(),
+                alice_user,
+                alice_device,
+                alice_session.clone(),
+            )
+            .unwrap();
+            let commit =
+                alice.group_mut().unwrap().add_member(bob_session.key_package().unwrap()).unwrap();
+            let bob_group = bob_session.join(&commit.welcome.unwrap()).unwrap();
+            let bob = Conversation::join_encrypted(
+                dm_seal(),
+                room,
+                bob_user,
+                bob_device,
+                bob_session.clone(),
+                bob_group,
+            )
+            .unwrap();
+
+            // Both ends write the room→group mapping, which is the part MLS does not
+            // store for us.
+            let group_id = alice.group_id().expect("an encrypted room has a group").to_vec();
+            for (store_dir, seal) in [(&alice_dir, dm_seal()), (&bob_dir, dm_seal())] {
+                ConversationIndex::open(store_dir)
+                    .unwrap()
+                    .record(room, &seal, Some(&group_id))
+                    .unwrap();
+            }
+            assert_eq!(bob.group_id().unwrap(), group_id.as_slice());
+        }
+
+        // Restart. Only the directories survive.
+        let alice_session = Arc::new(Session::open(&alice_dir, b"alice").unwrap());
+        let bob_session = Arc::new(Session::open(&bob_dir, b"bob").unwrap());
+        let alice_index = ConversationIndex::open(&alice_dir).unwrap();
+        let bob_index = ConversationIndex::open(&bob_dir).unwrap();
+
+        let mut alice = Conversation::resume_encrypted(
+            dm_seal(),
+            room,
+            alice_user,
+            alice_device,
+            alice_session,
+            &alice_index.group_id(&room).unwrap().expect("alice must remember the group"),
+        )
+        .unwrap();
+        let mut bob = Conversation::resume_encrypted(
+            dm_seal(),
+            room,
+            bob_user,
+            bob_device,
+            bob_session,
+            &bob_index.group_id(&room).unwrap().expect("bob must remember the group"),
+        )
+        .unwrap();
+
+        let sent = alice.send(b"still here", 1).unwrap();
+        let received = bob.receive(&sent.envelope).unwrap().expect("an application message");
+        assert_eq!(received.body, b"still here");
+
+        // And the franking material still lines up, so a resumed conversation is still
+        // reportable — a resumed room that cannot be reported would be a safety
+        // regression hiding behind a working chat.
+        let franking = received.franking.expect("E2EE messages must carry franking material");
+        assert_eq!(franking.commitment, sent.commitment);
     }
 
     #[test]

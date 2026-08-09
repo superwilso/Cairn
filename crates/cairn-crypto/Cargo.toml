@@ -12,6 +12,7 @@ authors.workspace = true
 cairn-proto.workspace = true
 
 mls-rs.workspace = true
+mls-rs-core.workspace = true
 mls-rs-crypto-rustcrypto.workspace = true
 
 hmac.workspace = true
@@ -22,7 +23,5 @@ zeroize.workspace = true
 hex.workspace = true
 
 serde.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true

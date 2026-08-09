@@ -31,6 +31,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Crypto
 mls-rs = "0.55"
+# Needed directly for the storage-provider traits' associated types (`GroupState`,
+# `EpochRecord`, `KeyPackageData`), which `mls-rs` does not re-export. Kept pinned to the
+# version `mls-rs` itself depends on — a skew here silently produces two incompatible
+# copies of the same trait.
+mls-rs-core = "0.27"
 mls-rs-crypto-rustcrypto = "0.22"
 hmac = "0.12"
 sha2 = "0.10"

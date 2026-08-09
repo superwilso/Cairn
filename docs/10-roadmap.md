@@ -16,11 +16,13 @@ move to the next milestone while the current one's exit condition is unmet.
 **Goal:** two people on two machines can hold an end-to-end encrypted conversation across a
 real network, and both can close their clients and resume.
 
-Today the vertical slice runs *in-process*. `cairn-cli` fakes the server. A client cannot
-resume after restart because MLS group state is in memory only. Those are the gaps.
+Today the vertical slice runs *in-process*. `cairn-cli` fakes the server. Client state now
+persists, so what is left is the network.
 
-- [ ] **Client-side MLS state persistence.** A client that cannot resume is not a client.
-      This is the single largest blocker and everything downstream waits on it.
+- [x] **Client-side MLS state persistence.** Group state, key package secrets, the device
+      key, and the room→group index survive a restart; `Conversation::resume_encrypted`
+      rebuilds a conversation from disk alone. Covered by
+      `a_conversation_resumes_from_disk_and_keeps_talking`.
 - [ ] **A real network client.** `cairn-cli` talks to `cairn-server` over HTTP: claim an
       account, create a room, add a member, send, receive, report.
 - [ ] **Key package distribution.** Adding someone to a group needs their key package from

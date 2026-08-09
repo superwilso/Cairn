@@ -20,6 +20,7 @@
 
 pub mod franking;
 pub mod mls;
+pub mod store;
 pub mod verification;
 
 pub use franking::{
@@ -27,4 +28,5 @@ pub use franking::{
     ReportedMessage, ServerFrankingKey, Tag, TranscriptReport,
 };
 pub use mls::{CommitOutput, GroupHandle, MlsError, Session};
+pub use store::{ClientStore, DeviceKey, StoreError};
 pub use verification::{ContactVerification, Fingerprint, SafetyNumber, VerificationState};

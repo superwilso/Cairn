@@ -54,6 +54,17 @@ performance measurements. Those are still owed.
   recipient unable to prove what they received.
 - **Safety numbers work against real MLS identity keys**, not just synthetic input. An
   impostor claiming the same identity string still produces a different number.
+- **`mls-rs` does not persist group state for you.** `write_to_storage` is explicit, and
+  omitting it fails silently rather than loudly. Probing the omission on the encrypt path:
+  two handles loaded from one saved state each encrypt once, the receiver takes the first
+  message and rejects the second with `KeyMissing` — the second is undeliverable and the
+  sender never learns. It is *not* an AEAD nonce collision, because RFC 9420 §7.3.1's
+  4-byte reuse guard randomizes the nonce, and the first draft of this module's docs
+  claimed otherwise before the claim was checked. `GroupHandle` therefore persists after
+  every mutation rather than exposing a `save()`.
+- **The room→group mapping is client-only state.** MLS picks group ids and the server picks
+  room ids; nothing but the client holds the correspondence. Losing that index leaves the
+  group state on disk and unreachable, which is indistinguishable from losing it.
 - **Envelope authentication had to come before franking could mean anything.** A franking
   tag binds a commitment to a *claimed* sender; while anyone could claim to be anyone, the
   tag proved nothing and unframeability did not hold. Signing the envelope and fixing the
@@ -96,8 +107,7 @@ largest measured group; re-measure before raising it.
 - [ ] **Memory per client** at large group sizes
 - [ ] **Mobile battery and sync** under sustained commit churn — needs a mobile client
 - [ ] **50,000-member public channel** read path
-- [ ] **MLS group state persistence** on the *client* (server state now persists; client
-      group state is still in-memory, so a client cannot resume a session after restart)
+- [x] **MLS group state persistence** on the *client* — done; see the finding below
 The benchmark harness lives at `crates/cairn-crypto/examples/group_scaling.rs`.
 
 ## Known gaps in the scaffold
@@ -109,6 +119,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | No key transparency; safety numbers not surfaced in a UI | The primitive exists and is tested, but nothing displays it and no contact store persists verification state, so in practice E2EE still holds against an honest-but-curious server rather than a malicious one (`01-threat-model.md` §4) |
 | Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
 | No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
+| Client state stored unencrypted | Group state and key package secrets sit on disk in the clear, 0600 on Unix and default ACLs on Windows. Consistent with `01-threat-model.md` §3.4, but weaker than the platform keystores a shipping client needs |
 | No sessions or rate limits | Accounts are claimed, invite-gated, and device linking is authorized — but there is no session concept, no rate limiting, and no account recovery |
 | Franking unreviewed | Groups are handled, but no external cryptographic review yet |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
