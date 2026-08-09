@@ -376,6 +376,57 @@ pub fn device_authorization_bytes(
     out
 }
 
+/// What a signed request acts on.
+///
+/// A request that names no resource authorizes only the action, so a signature captured
+/// from one call can be replayed against any other call with the same action inside the
+/// replay window. Endpoints that act on a specific thing must therefore name it here —
+/// which is why this is not just `RoomId`: claiming a key package targets a *user*, and
+/// binding it as "no resource" would let a captured claim be redirected at anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRef {
+    Room(crate::RoomId),
+    User(crate::UserId),
+    Device(crate::DeviceId),
+}
+
+impl ResourceRef {
+    /// A stable label, signed alongside the id so two kinds cannot be confused.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            ResourceRef::Room(_) => "room",
+            ResourceRef::User(_) => "user",
+            ResourceRef::Device(_) => "device",
+        }
+    }
+
+    pub fn uuid(&self) -> &uuid::Uuid {
+        match self {
+            ResourceRef::Room(id) => id.as_uuid(),
+            ResourceRef::User(id) => id.as_uuid(),
+            ResourceRef::Device(id) => id.as_uuid(),
+        }
+    }
+}
+
+impl From<crate::RoomId> for ResourceRef {
+    fn from(id: crate::RoomId) -> Self {
+        ResourceRef::Room(id)
+    }
+}
+
+impl From<crate::UserId> for ResourceRef {
+    fn from(id: crate::UserId) -> Self {
+        ResourceRef::User(id)
+    }
+}
+
+impl From<crate::DeviceId> for ResourceRef {
+    fn from(id: crate::DeviceId) -> Self {
+        ResourceRef::Device(id)
+    }
+}
+
 /// Canonical bytes a device signs to authenticate a request that is not a message.
 ///
 /// Messages authenticate themselves via [`Envelope::signing_bytes`]. Everything else —
@@ -388,7 +439,7 @@ pub fn device_authorization_bytes(
 /// limitation for read operations and is documented in `SECURITY.md`.
 pub fn request_signing_bytes(
     action: &str,
-    resource: Option<crate::RoomId>,
+    resource: Option<ResourceRef>,
     issued_at_ms: i64,
 ) -> Vec<u8> {
     fn push(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -401,7 +452,12 @@ pub fn request_signing_bytes(
     match resource {
         Some(r) => {
             out.push(1);
-            push(&mut out, r.as_uuid().as_bytes());
+            // The kind is signed as well as the id. Without it a room and a user that
+            // happened to share a UUID would produce identical bytes, and more usefully,
+            // an authorization naming one kind of resource could be replayed against
+            // another endpoint that names a different kind.
+            push(&mut out, r.kind().as_bytes());
+            push(&mut out, r.uuid().as_bytes());
         }
         None => out.push(0),
     }
@@ -416,14 +472,41 @@ mod request_auth_tests {
     #[test]
     fn request_signing_covers_action_resource_and_time() {
         let room = RoomId::new();
-        let base = request_signing_bytes("read", Some(room), 1_000);
-        assert_eq!(base, request_signing_bytes("read", Some(room), 1_000));
+        let base = request_signing_bytes("read", Some(room.into()), 1_000);
+        assert_eq!(base, request_signing_bytes("read", Some(room.into()), 1_000));
         // An authorization to read must not also authorize a write.
-        assert_ne!(base, request_signing_bytes("write", Some(room), 1_000));
+        assert_ne!(base, request_signing_bytes("write", Some(room.into()), 1_000));
         // …nor the same action against a different room.
-        assert_ne!(base, request_signing_bytes("read", Some(RoomId::new()), 1_000));
+        assert_ne!(base, request_signing_bytes("read", Some(RoomId::new().into()), 1_000));
         assert_ne!(base, request_signing_bytes("read", None, 1_000));
-        assert_ne!(base, request_signing_bytes("read", Some(room), 2_000));
+        assert_ne!(base, request_signing_bytes("read", Some(room.into()), 2_000));
+    }
+
+    #[test]
+    fn a_resource_kind_is_part_of_the_authorization() {
+        // Same uuid, different kind of thing. Without the kind in the signed bytes, an
+        // authorization to act on a room could be replayed against a user endpoint.
+        let id = uuid::Uuid::new_v4();
+        let as_room = request_signing_bytes("claim", Some(RoomId::from_uuid(id).into()), 1);
+        let as_user = request_signing_bytes("claim", Some(crate::UserId::from_uuid(id).into()), 1);
+        let as_device =
+            request_signing_bytes("claim", Some(crate::DeviceId::from_uuid(id).into()), 1);
+        assert_ne!(as_room, as_user);
+        assert_ne!(as_user, as_device);
+        assert_ne!(as_room, as_device);
+    }
+
+    #[test]
+    fn a_signature_for_one_target_does_not_authorize_another() {
+        // The property the key package endpoints depend on: a claim signed against one
+        // account must not be redirectable at a different account inside the replay
+        // window.
+        let victim = crate::UserId::new();
+        let bystander = crate::UserId::new();
+        assert_ne!(
+            request_signing_bytes("claim_key_packages", Some(victim.into()), 1),
+            request_signing_bytes("claim_key_packages", Some(bystander.into()), 1)
+        );
     }
 
     #[test]

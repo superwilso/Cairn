@@ -19,7 +19,9 @@ pub mod envelope;
 pub mod ids;
 pub mod tier;
 
-pub use envelope::{device_authorization_bytes, request_signing_bytes, Envelope, EnvelopePayload};
+pub use envelope::{
+    device_authorization_bytes, request_signing_bytes, Envelope, EnvelopePayload, ResourceRef,
+};
 pub use ids::{DeviceId, InstanceId, MessageId, RoomId, UserId};
 pub use tier::{derive_tier, RoomSeal, RoomShape, ShapeError, Tier};
 

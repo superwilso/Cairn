@@ -16,20 +16,35 @@ move to the next milestone while the current one's exit condition is unmet.
 **Goal:** two people on two machines can hold an end-to-end encrypted conversation across a
 real network, and both can close their clients and resume.
 
-Today the vertical slice runs *in-process*. `cairn-cli` fakes the server. A client cannot
-resume after restart because MLS group state is in memory only. Those are the gaps.
+Today the vertical slice runs *in-process*. `cairn-cli` fakes the server. Client state now
+persists, so what is left is the network.
 
-- [ ] **Client-side MLS state persistence.** A client that cannot resume is not a client.
-      This is the single largest blocker and everything downstream waits on it.
-- [ ] **A real network client.** `cairn-cli` talks to `cairn-server` over HTTP: claim an
-      account, create a room, add a member, send, receive, report.
-- [ ] **Key package distribution.** Adding someone to a group needs their key package from
-      the server; there is no endpoint for publishing or fetching one.
-- [ ] **Message delivery.** Polling is enough for M1. WebSocket can wait.
-- [ ] **Franking round-trip over the wire**, not just in-process.
+- [x] **Client-side MLS state persistence.** Group state, key package secrets, the device
+      key, and the room→group index survive a restart; `Conversation::resume_encrypted`
+      rebuilds a conversation from disk alone. Covered by
+      `a_conversation_resumes_from_disk_and_keeps_talking`.
+- [x] **A real network client.** `cairn_client_core::Client` over a `Transport` seam,
+      with a rustls-backed `HttpTransport`. It builds and signs every request, so a
+      platform UI cannot construct a wrongly-scoped one (ADR-006). `cairn-cli` still
+      prints the in-process slice; rewiring its presentation onto `Client` is cosmetic and
+      outstanding.
+- [x] **Key package distribution.** `POST /v1/devices/{device}/key-packages` publishes,
+      `POST /v1/users/{user}/key-packages` claims one per device and consumes them. Both
+      require a signed request naming the target. Verified over a real socket in
+      `crates/cairn-server/tests/key_packages_http.rs`. **No rate limiting yet**, so an
+      authenticated account can still drain another's supply — M3.
+- [x] **Message delivery.** `Client::fetch_since` polls; WebSocket can wait.
+- [x] **Franking round-trip over the wire**, not just in-process.
 
 **Exit:** two processes on two machines exchange E2EE messages, both restart, both resume,
 and a recipient files a report the server verifies.
+
+**Status: met in one process over a real socket**, by
+`crates/cairn-server/tests/vertical_slice_http.rs` — two clients with separate sessions and
+separate on-disk stores, talking HTTP, both restarting mid-conversation, ending in a report
+the server verifies and a tampered one it rejects. **Not yet demonstrated on two physical
+machines**, which is the part of the exit condition still owed and belongs with M3's
+self-hosting guide.
 
 ## M2 — Basic client
 

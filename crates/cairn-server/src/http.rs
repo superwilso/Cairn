@@ -31,6 +31,8 @@ pub fn router(instance: SharedInstance) -> Router {
         .route("/v1/rooms/{room}/members", post(add_room_member))
         .route("/v1/rooms/{room}/members/{target}", delete(remove_room_member).put(set_room_role))
         .route("/v1/rooms/{room}/join", post(join_room))
+        .route("/v1/devices/{device}/key-packages", post(publish_key_packages))
+        .route("/v1/users/{user}/key-packages", post(claim_key_packages))
         .route("/v1/reports", post(submit_report))
         .with_state(instance)
 }
@@ -74,6 +76,13 @@ impl IntoResponse for ServerError {
             | ServerError::LastOwner => StatusCode::FORBIDDEN,
             ServerError::TargetNotAMember => StatusCode::NOT_FOUND,
             ServerError::RoomFull => StatusCode::CONFLICT,
+            // Publishing for a device you do not own is an authorization failure, not a
+            // bad request: the caller is authenticated, just not entitled.
+            ServerError::NotYourDevice => StatusCode::FORBIDDEN,
+            ServerError::BadKeyPackage => StatusCode::BAD_REQUEST,
+            // 409, not 404. The account exists and may be addable later; a 404 would tell
+            // the caller to stop trying, which is the wrong instruction.
+            ServerError::NoKeyPackages | ServerError::TooManyKeyPackages => StatusCode::CONFLICT,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -156,7 +165,7 @@ fn signed_actor(
     instance: &SharedInstance,
     headers: &HeaderMap,
     action: &str,
-    resource: Option<RoomId>,
+    resource: Option<cairn_proto::ResourceRef>,
 ) -> Result<cairn_proto::UserId, ServerError> {
     fn header<'a>(h: &'a HeaderMap, name: &str) -> Result<&'a str, ServerError> {
         h.get(name).and_then(|v| v.to_str().ok()).ok_or(ServerError::BadRequestAuth)
@@ -193,7 +202,7 @@ async fn add_room_member(
     Json(req): Json<RoomMemberRequest>,
 ) -> Result<StatusCode, ServerError> {
     let room = RoomId::from_uuid(room);
-    let actor = signed_actor(&instance, &headers, "add_member", Some(room))?;
+    let actor = signed_actor(&instance, &headers, "add_member", Some(room.into()))?;
     instance.add_room_member(room, actor, cairn_proto::UserId::from_uuid(req.user))?;
     Ok(StatusCode::CREATED)
 }
@@ -205,7 +214,7 @@ async fn remove_room_member(
     headers: HeaderMap,
 ) -> Result<StatusCode, ServerError> {
     let room = RoomId::from_uuid(room);
-    let actor = signed_actor(&instance, &headers, "remove_member", Some(room))?;
+    let actor = signed_actor(&instance, &headers, "remove_member", Some(room.into()))?;
     instance.remove_room_member(room, actor, cairn_proto::UserId::from_uuid(target))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -223,7 +232,7 @@ async fn set_room_role(
     Json(req): Json<SetRoleRequest>,
 ) -> Result<StatusCode, ServerError> {
     let room = RoomId::from_uuid(room);
-    let actor = signed_actor(&instance, &headers, "set_role", Some(room))?;
+    let actor = signed_actor(&instance, &headers, "set_role", Some(room.into()))?;
     instance.set_room_role(room, actor, cairn_proto::UserId::from_uuid(target), req.role)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -235,9 +244,66 @@ async fn join_room(
     headers: HeaderMap,
 ) -> Result<StatusCode, ServerError> {
     let room = RoomId::from_uuid(room);
-    let actor = signed_actor(&instance, &headers, "join", Some(room))?;
+    let actor = signed_actor(&instance, &headers, "join", Some(room.into()))?;
     instance.join_room(room, actor)?;
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+struct PublishKeyPackagesRequest {
+    /// Hex-encoded MLS key package messages.
+    packages: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PublishKeyPackagesResponse {
+    /// How many the device now has unclaimed, so a client knows when to top up.
+    remaining: usize,
+}
+
+/// Publish key packages for one of the caller's own devices.
+async fn publish_key_packages(
+    State(instance): State<SharedInstance>,
+    Path(device): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<PublishKeyPackagesRequest>,
+) -> Result<(StatusCode, Json<PublishKeyPackagesResponse>), ServerError> {
+    let device = cairn_proto::DeviceId::from_uuid(device);
+    let actor = signed_actor(&instance, &headers, "publish_key_packages", Some(device.into()))?;
+    let remaining = instance.publish_key_packages(actor, device, req.packages)?;
+    Ok((StatusCode::CREATED, Json(PublishKeyPackagesResponse { remaining })))
+}
+
+#[derive(Serialize)]
+struct ClaimedKeyPackage {
+    device: cairn_proto::DeviceId,
+    key_package: String,
+}
+
+/// Claim one key package for each of an account's devices, consuming them.
+///
+/// `POST` rather than `GET` because it mutates: each call permanently consumes packages.
+/// A `GET` here would be cached and retried by every intermediary that assumes reads are
+/// safe, and each retry would silently burn another set.
+///
+/// Authenticated, because an anonymous caller could otherwise drain any account's supply
+/// and make it unaddable. Authentication bounds that to accounts on the instance rather
+/// than preventing it — a hostile member can still drain another member, and there is no
+/// rate limiting yet (`docs/10-roadmap.md` M3).
+async fn claim_key_packages(
+    State(instance): State<SharedInstance>,
+    Path(user): Path<uuid::Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ClaimedKeyPackage>>, ServerError> {
+    let user = cairn_proto::UserId::from_uuid(user);
+    signed_actor(&instance, &headers, "claim_key_packages", Some(user.into()))?;
+    let claimed = instance.claim_key_packages(user)?;
+    Ok(Json(
+        claimed
+            .into_iter()
+            .map(|(device, key_package)| ClaimedKeyPackage { device, key_package })
+            .collect(),
+    ))
 }
 
 fn now_ms() -> i64 {
@@ -296,7 +362,7 @@ async fn describe_room(
     // tier does not already concede. A private one must not confirm its own existence to
     // a stranger holding the id, which was previously free.
     if !seal.may_mint_public_invite() {
-        let actor = signed_actor(&instance, &headers, "describe", Some(room))?;
+        let actor = signed_actor(&instance, &headers, "describe", Some(room.into()))?;
         if instance.room_role(room, actor).is_none() {
             return Err(ServerError::NotAMember);
         }
@@ -345,7 +411,7 @@ async fn fetch_messages(
     Query(since): Query<Since>,
 ) -> Result<Json<Vec<FetchedMessage>>, ServerError> {
     let room = RoomId::from_uuid(room);
-    let actor = signed_actor(&instance, &headers, "read", Some(room))?;
+    let actor = signed_actor(&instance, &headers, "read", Some(room.into()))?;
     let messages = instance.messages_since(room, actor, since.after)?;
     Ok(Json(
         messages

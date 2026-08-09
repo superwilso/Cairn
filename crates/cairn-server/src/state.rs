@@ -6,7 +6,7 @@
 //! State is held in memory and snapshotted through [`crate::storage`] on every mutation,
 //! so rooms, the message log, and — critically — the franking key survive a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,22 @@ pub enum ServerError {
     BadRequestAuth,
     #[error("request timestamp is outside the accepted window")]
     RequestExpired,
+    #[error("that device is registered to a different account")]
+    NotYourDevice,
+    #[error("no key packages are available for that account; it must publish more")]
+    NoKeyPackages,
+    #[error("key package is malformed")]
+    BadKeyPackage,
+    #[error("too many key packages; publish at most {MAX_KEY_PACKAGES_PER_DEVICE} per device")]
+    TooManyKeyPackages,
 }
+
+/// How many unclaimed key packages one device may hold.
+///
+/// A ceiling rather than a target. Every stored package is server-held state an
+/// unauthenticated party never sees but an authenticated one can drain, and without a cap
+/// a device could park unbounded storage on someone else's instance.
+pub const MAX_KEY_PACKAGES_PER_DEVICE: usize = 100;
 
 /// How far outside the present a signed request's timestamp may be.
 ///
@@ -217,7 +232,15 @@ pub struct PersistedState {
     #[serde(default)]
     pub invites: Vec<PersistedInvite>,
     #[serde(default)]
+    pub key_packages: Vec<PersistedKeyPackages>,
+    #[serde(default)]
     pub registration_policy: RegistrationPolicy,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedKeyPackages {
+    device: DeviceId,
+    packages: VecDeque<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +273,14 @@ pub struct Instance {
     devices: Mutex<HashMap<DeviceId, DeviceRecord>>,
     accounts: Mutex<HashMap<UserId, AccountRecord>>,
     invites: Mutex<HashMap<String, InviteRecord>>,
+    /// Unclaimed key packages, per device, oldest first.
+    ///
+    /// Single-use by construction: `mls-rs` deletes a key package's secrets once it is
+    /// used to join, so handing the same package to two groups would leave the second
+    /// welcome permanently unopenable. There is deliberately **no** last-resort package
+    /// for that reason — an exhausted device is an error the caller can see, not a silent
+    /// half-add.
+    key_packages: Mutex<HashMap<DeviceId, VecDeque<String>>>,
     registration_policy: Mutex<RegistrationPolicy>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
@@ -280,6 +311,9 @@ impl Instance {
             devices: Mutex::new(devices),
             accounts: Mutex::new(accounts),
             invites: Mutex::new(invites),
+            key_packages: Mutex::new(
+                persisted.key_packages.into_iter().map(|k| (k.device, k.packages)).collect(),
+            ),
             registration_policy: Mutex::new(persisted.registration_policy),
             franking_key,
             storage,
@@ -318,6 +352,16 @@ impl Instance {
                 .map(|(token, record)| PersistedInvite {
                     token: token.clone(),
                     record: record.clone(),
+                })
+                .collect(),
+            key_packages: self
+                .key_packages
+                .lock()
+                .expect("key packages mutex poisoned")
+                .iter()
+                .map(|(device, packages)| PersistedKeyPackages {
+                    device: *device,
+                    packages: packages.clone(),
                 })
                 .collect(),
             registration_policy: *self.registration_policy.lock().expect("policy mutex poisoned"),
@@ -617,7 +661,7 @@ impl Instance {
         &self,
         device: DeviceId,
         action: &str,
-        resource: Option<RoomId>,
+        resource: Option<cairn_proto::ResourceRef>,
         issued_at_ms: i64,
         signature: &[u8],
         now_ms: i64,
@@ -633,6 +677,99 @@ impl Instance {
             return Err(ServerError::BadRequestAuth);
         }
         Ok(record.user)
+    }
+
+    /// Publish key packages for one of the caller's own devices.
+    ///
+    /// `actor` must own `device`. Letting an account publish packages for someone else's
+    /// device would be a key substitution with extra steps: a group creator asking for the
+    /// victim's key package would receive one whose private half the attacker holds, and
+    /// would then add the attacker while believing it added the victim. Safety numbers
+    /// would catch it; nothing else here would.
+    pub fn publish_key_packages(
+        &self,
+        actor: UserId,
+        device: DeviceId,
+        packages: Vec<String>,
+    ) -> Result<usize, ServerError> {
+        if packages.iter().any(|p| p.is_empty() || hex::decode(p).is_err()) {
+            return Err(ServerError::BadKeyPackage);
+        }
+
+        {
+            let devices = self.devices.lock().expect("devices mutex poisoned");
+            let record = devices.get(&device).ok_or(ServerError::UnknownDevice)?;
+            if record.user != actor {
+                return Err(ServerError::NotYourDevice);
+            }
+        }
+
+        let mut store = self.key_packages.lock().expect("key packages mutex poisoned");
+        let queue = store.entry(device).or_default();
+        if queue.len() + packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
+            return Err(ServerError::TooManyKeyPackages);
+        }
+        queue.extend(packages);
+        let remaining = queue.len();
+        drop(store);
+
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        self.persist(&rooms)?;
+        Ok(remaining)
+    }
+
+    /// How many unclaimed packages a device still has. For a client deciding to top up.
+    pub fn key_packages_remaining(&self, device: DeviceId) -> usize {
+        self.key_packages
+            .lock()
+            .expect("key packages mutex poisoned")
+            .get(&device)
+            .map_or(0, |q| q.len())
+    }
+
+    /// Claim one key package for **every** device on an account, consuming each.
+    ///
+    /// Every device, not one: an account's devices each hold their own MLS leaf
+    /// (`docs/01-threat-model.md` §6), so adding a user to a group means adding all of
+    /// them. Returning a single package would quietly add one device and leave the
+    /// account's other devices unable to read the room — a silent partial add, which is
+    /// exactly the class of failure a user cannot diagnose.
+    ///
+    /// If any device has run out, this fails rather than returning a partial set, for the
+    /// same reason. The caller learns the account cannot currently be added.
+    pub fn claim_key_packages(&self, user: UserId) -> Result<Vec<(DeviceId, String)>, ServerError> {
+        let accounts = self.accounts.lock().expect("accounts mutex poisoned");
+        let account = accounts.get(&user).ok_or(ServerError::NoSuchAccount)?;
+        let devices = account.devices.clone();
+        drop(accounts);
+
+        if devices.is_empty() {
+            return Err(ServerError::NoKeyPackages);
+        }
+
+        let mut store = self.key_packages.lock().expect("key packages mutex poisoned");
+
+        // Check every device before consuming any, so a failure does not burn the
+        // packages of the devices that did have one.
+        if devices.iter().any(|d| store.get(d).is_none_or(|q| q.is_empty())) {
+            return Err(ServerError::NoKeyPackages);
+        }
+
+        let claimed: Vec<(DeviceId, String)> = devices
+            .iter()
+            .map(|device| {
+                let package = store
+                    .get_mut(device)
+                    .and_then(|q| q.pop_front())
+                    .expect("checked non-empty above");
+                (*device, package)
+            })
+            .collect();
+        drop(store);
+
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        self.persist(&rooms)?;
+        Ok(claimed)
     }
 
     pub fn room_seal(&self, room: RoomId) -> Option<RoomSeal> {
@@ -1555,18 +1692,32 @@ mod membership {
         let issued = 10_000i64;
         let sig = alice
             .session
-            .sign(&cairn_proto::request_signing_bytes("read", Some(room), issued))
+            .sign(&cairn_proto::request_signing_bytes("read", Some(room.into()), issued))
             .unwrap();
 
         assert_eq!(
-            inst.authenticate_request(alice.device, "read", Some(room), issued, &sig, issued)
-                .unwrap(),
+            inst.authenticate_request(
+                alice.device,
+                "read",
+                Some(room.into()),
+                issued,
+                &sig,
+                issued
+            )
+            .unwrap(),
             alice.user
         );
 
         // A read authorization must not also authorize a write.
         assert!(matches!(
-            inst.authenticate_request(alice.device, "add_member", Some(room), issued, &sig, issued),
+            inst.authenticate_request(
+                alice.device,
+                "add_member",
+                Some(room.into()),
+                issued,
+                &sig,
+                issued
+            ),
             Err(ServerError::BadRequestAuth)
         ));
 
@@ -1575,7 +1726,7 @@ mod membership {
             inst.authenticate_request(
                 alice.device,
                 "read",
-                Some(RoomId::new()),
+                Some(RoomId::new().into()),
                 issued,
                 &sig,
                 issued
@@ -1589,7 +1740,7 @@ mod membership {
             inst.authenticate_request(
                 alice.device,
                 "read",
-                Some(room),
+                Some(room.into()),
                 issued,
                 &sig,
                 issued + REQUEST_WINDOW_MS + 1

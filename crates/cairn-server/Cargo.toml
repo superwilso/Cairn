@@ -22,3 +22,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 hex.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+cairn-client-core.workspace = true

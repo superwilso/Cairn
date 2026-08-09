@@ -17,3 +17,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
+uuid.workspace = true
+
+# Optional so the crate still builds for FFI targets that supply their own networking.
+# `ureq` is blocking and rustls-backed, which matches the rest of the client: `mls-rs` is
+# sync here, so no async runtime has to cross the FFI boundary (ADR-006).
+ureq = { version = "3", optional = true }
+
+[features]
+default = ["http"]
+http = ["dep:ureq"]
