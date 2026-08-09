@@ -115,6 +115,18 @@ survive someone else's scrutiny.
 Only after M5. Native clients per ADR-006, mobile, communities at scale, authenticated
 embeds, voice. The feature scorecard in `08-feature-parity.md` is the target.
 
+- [ ] **Attachments.** Encrypted blob storage, chunked and resumable upload/download, a
+      per-attachment key carried inside the encrypted message. **A prerequisite, not a
+      nice-to-have**: sending a photo or video needs it, and so does any embed that
+      re-hosts media. Nothing in the envelope today can carry a file — `EnvelopePayload`
+      has no attachment variant — and the server's snapshot storage rewrites all state per
+      message, so this lands on a known scaling gap. Deserves its own ADR.
+- [ ] **Video sending.** Table stakes against every product in `08-feature-parity.md`.
+      Blocked on attachments; unrelated to embeds despite sharing the word.
+- [ ] **Authenticated embeds**, per `05-embeds.md` — including multi-media cards
+      (Instagram carousels) and video, whose inline playback requires re-hosting because
+      Cairn cannot use an iframe player.
+
 ---
 
 ## Working order for an autonomous session

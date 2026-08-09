@@ -128,7 +128,9 @@ copies attract takedown requests.
 - What is the self-hoster's exposure, and does it differ by jurisdiction?
 
 These need an actual legal answer before the feature ships publicly, and they interact with
-[`07-regulatory-posture.md`](07-regulatory-posture.md).
+[`07-regulatory-posture.md`](07-regulatory-posture.md). Re-hosted **video** sharpens all
+four questions rather than raising new ones — it is the media type takedown requests
+actually target.
 
 ## Tiered behaviour
 
@@ -136,6 +138,74 @@ These need an actual legal answer before the feature ships publicly, and they in
 |---|---|
 | T1 / T2 | Sender-side only. Card travels inside the encrypted envelope. |
 | T3 | Server-side unfurl is acceptable — the server already sees the content. Cheaper, cached once, and avoids every sender fetching the same URL. |
+
+## Carousels and multi-media posts
+
+An Instagram carousel is one post carrying several images. So is an X post with four
+attachments, and a Bluesky post with a gallery. **The card model is therefore a list of
+media items, not a single image**, and it has to be a list from the first version.
+
+This is a wire-format decision, not a rendering one. Retrofitting a list into a card format
+that assumed one image means a second format and a migration, in a payload that travels
+inside the encrypted envelope where both ends must agree. Cheap now, expensive later.
+
+**Requirements:**
+
+- A card carries an **ordered list** of media items, each with its own dimensions, alt
+  text, and content type. One image is the list of length one, not a special case.
+- **Item count is bounded**, and the bound is part of the size limit, not separate from
+  it. Ten images at full resolution is a file transfer wearing a carousel's clothes.
+- **Preserve order.** A carousel whose panels arrive shuffled misrepresents the post.
+- **Carry alt text** where the platform provides it. Dropping it makes Cairn's rendering
+  less accessible than the original, which is not a trade worth making for a card.
+- Partial retrieval **degrades to what was fetched**, labelled as partial — never silently
+  present three of five panels as though that were the whole post.
+
+Worth knowing before anyone estimates this: **Instagram's public oEmbed endpoint was
+deprecated in 2020** and the replacement requires a Facebook app token, and neither returns
+carousel children. So carousels are reachable through the authenticated path and
+essentially nowhere else. That makes them a good demonstration of why the authenticated
+unfurl exists — and it also means carousel support is hostage to §2's adapter breakage in
+exactly the way the rest of the Instagram adapter is.
+
+## Video
+
+Two different features get called "video", and conflating them produces bad decisions.
+
+### Sending your own video
+
+This is **attachments**, not embeds. It is table stakes against every product in
+`08-feature-parity.md`, and it needs a subsystem Cairn does not have: encrypted blob
+storage, chunked upload and download, a per-attachment key travelling inside the encrypted
+message, and resumable transfers. That belongs in its own ADR and its own roadmap item.
+Nothing in this document constrains it, and the size ceilings here do not apply to it.
+
+### Embedding someone else's video
+
+Here the constraint is real, and it comes from a rule three lines up in this document:
+**no scripts, no iframes.** The inline player Discord shows for a YouTube link is an
+embedded iframe streaming from the platform. Cairn cannot do that — it executes remote code
+in the client and it contacts the platform from the *recipient's* device, which is the leak
+the whole design exists to avoid.
+
+So inline playback of a linked video is not a rendering choice. It requires the sender to
+re-host the file inside the envelope, and that is the only way to get it. The options are:
+
+| Approach | Cost |
+|---|---|
+| Thumbnail + link out | Cheap. Playing it contacts the platform, but that is the recipient's informed click. |
+| Sender re-hosts the file | Inline playback works and leaks nothing. Costs bandwidth, storage, and takedown exposure (§4). |
+
+**The default is thumbnail plus link.** Re-hosting is permitted for short clips under an
+explicit size ceiling, opt-in, and never silently: a recipient on a metered connection
+should not discover a 40 MB autoplay after the fact. An earlier draft of this document said
+video was "never the file", which was wrong — it stated a default as a prohibition, and
+the costs here are bandwidth, storage, and copyright rather than security. Those are
+trade-offs to price, not lines to hold.
+
+What does *not* move: the ceiling is enforced, the recipient still fetches nothing, and
+re-hosted video is subject to §4's takedown questions in exactly the way re-hosted images
+are — more so, since video attracts more of them.
 
 ## GIF pickers — the same problem, quietly
 
@@ -151,12 +221,7 @@ provider as untrusted (`01-threat-model.md` §8).
 - **The recipient fetches nothing.** The card renders from what arrived inside the
   envelope. A client that resolves the URL to draw the card has moved the IP leak onto the
   recipient, who never opted in to that platform and cannot see that it happened.
-- Enforce **size limits** — an embed must not become a file-transfer channel.
-- **Video is a thumbnail plus a link, never the file.** A re-uploaded video crosses the
-  size limit above by an order of magnitude, and every recipient pays for it on a
-  connection they did not choose. Neither Signal nor Discord re-hosts video; there is no
-  reason to be the first. The still frame travels in the envelope, the link travels beside
-  it, and playing it is the recipient's decision — made knowing it contacts the platform.
+- Enforce **size limits** — see "Video" below for where the ceiling actually binds.
 - This lands on a storage limit that already exists: `03-protocol-evaluation.md` records
   that the server rewrites all state per message. Media in envelopes makes that materially
   worse, so **that gap closes before embeds ship**, not after.
