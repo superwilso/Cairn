@@ -62,6 +62,12 @@ performance measurements. Those are still owed.
   4-byte reuse guard randomizes the nonce, and the first draft of this module's docs
   claimed otherwise before the claim was checked. `GroupHandle` therefore persists after
   every mutation rather than exposing a `save()`.
+- **A conversation cannot be allowed to invent its own room id.** `create_encrypted`
+  minted one locally, which worked only because the vertical slice faked the server
+  in-process. Against a real server every message was addressed to a room that did not
+  exist and came back `404 no such room`. The constructors now require the id the server
+  assigned. This is precisely the class of defect `CLAUDE.md` says to expect from
+  in-process testing, and it took one HTTP request to find.
 - **A signed request has to name what it acts on, not just what it does.** Request
   authorization could originally bind only a `RoomId`, so the key package endpoints would
   have had to sign "no resource" — authorizing the action alone. One legitimately obtained
@@ -140,7 +146,8 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | JSON + hex wire format | A development convenience; a binary format replaces it |
 | Replay window, not nonces | Signed requests carry a timestamp checked against a 60s window; replay inside that window is possible |
 | No bans or instance-wide moderation | Rooms have owner/moderator/member roles and removal, but a removed account can be re-added, and there is no instance-level ban or the subscribable policy lists `04-safety-architecture.md` §2 calls the highest-leverage item |
-| No TLS termination | Must sit behind a reverse proxy |
+| No TLS termination | Must sit behind a reverse proxy. `HttpTransport` verifies certificates via rustls, but pointing it at a bare `http://` origin is a plaintext connection and defeats A1/A2 in `01-threat-model.md` §2 |
+| Vertical slice is one process | Two clients over a real socket, but not yet two machines — the last part of M1's exit condition |
 
 ## Verification standard
 

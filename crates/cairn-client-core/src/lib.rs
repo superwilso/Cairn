@@ -16,10 +16,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod conversation;
 pub mod store;
+pub mod transport;
 
+pub use client::{Client, ClientError};
 pub use conversation::{
     Conversation, ConversationError, OutboundMessage, ReceivedFranking, ReceivedMessage,
 };
 pub use store::{ConversationIndex, ConversationRecord, IndexError};
+pub use transport::{Transport, TransportError};
+
+#[cfg(feature = "http")]
+pub use transport::HttpTransport;

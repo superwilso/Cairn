@@ -70,8 +70,15 @@ impl std::fmt::Debug for Conversation {
 
 impl Conversation {
     /// Open an encrypted (T1/T2) conversation, creating the MLS group.
+    ///
+    /// `room` is the id the **server** assigned when the room was created. This used to
+    /// mint its own, which worked only because the vertical slice faked the server
+    /// in-process; against a real one every message was addressed to a room that did not
+    /// exist and came back `404 no such room`. A conversation cannot invent its own room
+    /// id, so it does not get the chance to.
     pub fn create_encrypted(
         seal: RoomSeal,
+        room: RoomId,
         user: UserId,
         device: DeviceId,
         session: Arc<Session>,
@@ -80,7 +87,7 @@ impl Conversation {
             return Err(ConversationError::NotEncrypted);
         }
         let group = session.create_group()?;
-        Ok(Self { seal, room: RoomId::new(), user, device, session, group: Some(group) })
+        Ok(Self { seal, room, user, device, session, group: Some(group) })
     }
 
     /// Join an existing encrypted conversation, having accepted an MLS welcome.
@@ -135,8 +142,11 @@ impl Conversation {
     }
 
     /// Open a public (T3) conversation. No MLS group; the server reads content.
+    ///
+    /// Takes the server's room id, for the reason in [`Conversation::create_encrypted`].
     pub fn create_public(
         seal: RoomSeal,
+        room: RoomId,
         user: UserId,
         device: DeviceId,
         session: Arc<Session>,
@@ -144,7 +154,7 @@ impl Conversation {
         if seal.tier().is_e2ee() {
             return Err(ConversationError::Encrypted);
         }
-        Ok(Self { seal, room: RoomId::new(), user, device, session, group: None })
+        Ok(Self { seal, room, user, device, session, group: None })
     }
 
     /// Sign an outbound envelope with this device's key.
@@ -339,6 +349,7 @@ mod tests {
         let session = Arc::new(Session::new(b"alice").unwrap());
         let mut convo = Conversation::create_encrypted(
             dm_seal(),
+            RoomId::new(),
             UserId::new(),
             DeviceId::new(),
             session.clone(),
@@ -361,6 +372,7 @@ mod tests {
         let session = Arc::new(Session::new(b"alice").unwrap());
         let mut convo = Conversation::create_encrypted(
             dm_seal(),
+            RoomId::new(),
             UserId::new(),
             DeviceId::new(),
             session.clone(),
@@ -382,6 +394,7 @@ mod tests {
         let session = Arc::new(Session::new(b"alice").unwrap());
         let mut encrypted = Conversation::create_encrypted(
             dm_seal(),
+            RoomId::new(),
             UserId::new(),
             DeviceId::new(),
             session.clone(),
@@ -391,6 +404,7 @@ mod tests {
 
         let mut public = Conversation::create_public(
             public_seal(),
+            RoomId::new(),
             UserId::new(),
             DeviceId::new(),
             Arc::new(Session::new(b"pub").unwrap()),
@@ -405,6 +419,7 @@ mod tests {
         assert!(matches!(
             Conversation::create_encrypted(
                 public_seal(),
+                RoomId::new(),
                 UserId::new(),
                 DeviceId::new(),
                 session.clone()
@@ -420,6 +435,7 @@ mod tests {
 
         let mut alice = Conversation::create_encrypted(
             dm_seal(),
+            RoomId::new(),
             UserId::new(),
             DeviceId::new(),
             alice_session.clone(),
@@ -467,6 +483,7 @@ mod tests {
 
             let mut alice = Conversation::create_encrypted(
                 dm_seal(),
+                room,
                 alice_user,
                 alice_device,
                 alice_session.clone(),
@@ -607,6 +624,7 @@ mod tests {
     fn public_conversation_sends_plaintext() {
         let mut convo = Conversation::create_public(
             public_seal(),
+            RoomId::new(),
             UserId::new(),
             DeviceId::new(),
             Arc::new(Session::new(b"pub").unwrap()),
