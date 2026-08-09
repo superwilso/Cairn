@@ -25,8 +25,11 @@ persists, so what is left is the network.
       `a_conversation_resumes_from_disk_and_keeps_talking`.
 - [ ] **A real network client.** `cairn-cli` talks to `cairn-server` over HTTP: claim an
       account, create a room, add a member, send, receive, report.
-- [ ] **Key package distribution.** Adding someone to a group needs their key package from
-      the server; there is no endpoint for publishing or fetching one.
+- [x] **Key package distribution.** `POST /v1/devices/{device}/key-packages` publishes,
+      `POST /v1/users/{user}/key-packages` claims one per device and consumes them. Both
+      require a signed request naming the target. Verified over a real socket in
+      `crates/cairn-server/tests/key_packages_http.rs`. **No rate limiting yet**, so an
+      authenticated account can still drain another's supply — M3.
 - [ ] **Message delivery.** Polling is enough for M1. WebSocket can wait.
 - [ ] **Franking round-trip over the wire**, not just in-process.
 

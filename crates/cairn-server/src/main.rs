@@ -12,9 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-mod http;
-mod state;
-mod storage;
+use cairn_server::{http, state, storage};
 
 use std::net::SocketAddr;
 use std::sync::Arc;

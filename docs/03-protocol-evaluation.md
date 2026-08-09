@@ -62,6 +62,21 @@ performance measurements. Those are still owed.
   4-byte reuse guard randomizes the nonce, and the first draft of this module's docs
   claimed otherwise before the claim was checked. `GroupHandle` therefore persists after
   every mutation rather than exposing a `save()`.
+- **A signed request has to name what it acts on, not just what it does.** Request
+  authorization could originally bind only a `RoomId`, so the key package endpoints would
+  have had to sign "no resource" — authorizing the action alone. One legitimately obtained
+  signature would then drain any account inside the 60s replay window. `ResourceRef` now
+  carries a kind label and an id, both signed.
+
+  The first HTTP test written for this **passed against the broken design**, because the
+  test client and the server disagreed about what to sign and the request failed for the
+  wrong reason. It was replaced with one checked against the counterfactual: reverting the
+  handler makes it fail. A test that cannot fail is the project's documented failure mode,
+  not a new one.
+- **MLS key packages are single-use, so there is no last-resort package.** `mls-rs` deletes
+  a package's secrets once it is used to join, so serving one twice would leave the second
+  welcome permanently unopenable. An exhausted account is therefore an error the caller
+  sees (409), not a silent half-add.
 - **The room→group mapping is client-only state.** MLS picks group ids and the server picks
   room ids; nothing but the client holds the correspondence. Losing that index leaves the
   group state on disk and unreachable, which is indistinguishable from losing it.
@@ -120,7 +135,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
 | No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
 | Client state stored unencrypted | Group state and key package secrets sit on disk in the clear, 0600 on Unix and default ACLs on Windows. Consistent with `01-threat-model.md` §3.4, but weaker than the platform keystores a shipping client needs |
-| No sessions or rate limits | Accounts are claimed, invite-gated, and device linking is authorized — but there is no session concept, no rate limiting, and no account recovery |
+| No sessions or rate limits | Accounts are claimed, invite-gated, and device linking is authorized — but there is no session concept, no rate limiting, and no account recovery. Concretely: an authenticated account can drain another account's key packages and make it unaddable until it republishes |
 | Franking unreviewed | Groups are handled, but no external cryptographic review yet |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
 | Replay window, not nonces | Signed requests carry a timestamp checked against a 60s window; replay inside that window is possible |
