@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use cairn_crypto::mls::Session;
 use cairn_crypto::TranscriptReport;
-use cairn_proto::{DeviceId, Envelope, ResourceRef, RoomId, RoomShape, UserId};
+use cairn_proto::{DeviceId, Envelope, ResourceRef, RoomId, RoomSeal, RoomShape, UserId};
 
 use crate::transport::{Response, Transport, TransportError};
 
@@ -30,6 +30,14 @@ pub enum ClientError {
     Mls(#[from] cairn_crypto::mls::MlsError),
     #[error("the instance has no key packages for {0}; it cannot be added yet")]
     NoKeyPackages(UserId),
+    #[error("this room cannot be created as specified: {0}")]
+    Shape(#[from] cairn_proto::ShapeError),
+    #[error(
+        "the instance classified this room as {server} but the published rule makes it \
+         {local}; refusing rather than showing a badge that may not describe what happens \
+         to the messages"
+    )]
+    TierDisagreement { local: &'static str, server: String },
 }
 
 /// Wall clock, in milliseconds since the Unix epoch.
@@ -68,12 +76,32 @@ struct CreateRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct CreatedRoomResponse {
+    room: RoomId,
+    tier: String,
+    e2ee: bool,
+}
+
+/// A room this client just created.
+#[derive(Debug)]
 pub struct CreatedRoom {
     pub room: RoomId,
-    /// The tier label the server derived. A client must show this
-    /// (`docs/02-encryption-tiers.md` §4) rather than assume the tier it asked for.
-    pub tier: String,
-    pub e2ee: bool,
+    /// The tier this client derived, locally, from the shape it asked for.
+    ///
+    /// **This is the badge to display**, not the label the server sent back. The seal is
+    /// what decides whether [`crate::Conversation`] encrypts, so showing anything else
+    /// would let the badge and the behaviour disagree — and a badge that does not describe
+    /// what the client actually does is the false assurance `docs/01-threat-model.md`
+    /// forbids. `derive_tier` is a pure function of the shape, so the client never has to
+    /// ask.
+    pub seal: RoomSeal,
+}
+
+impl CreatedRoom {
+    /// The label to render. Always the locally-derived tier.
+    pub fn tier_label(&self) -> &'static str {
+        self.seal.tier().label()
+    }
 }
 
 #[derive(Serialize)]
@@ -235,7 +263,19 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    /// Create a room, and refuse it if the instance classified it differently.
+    ///
+    /// Both ends derive the tier from the same published rule
+    /// (`docs/02-encryption-tiers.md` §2), so agreement is the normal case and a
+    /// disagreement means one of two things: the instance runs a different version of the
+    /// rule, or it is lying. Neither is safe to paper over. Accepting the room anyway
+    /// would leave the client encrypting a room the server treats as public, or — far
+    /// worse — showing an encrypted badge over a room it is about to send in plaintext.
+    ///
+    /// Failing here costs a room creation. Continuing costs the user's correct belief
+    /// about who can read what.
     pub fn create_room(&self, shape: RoomShape) -> Result<CreatedRoom, ClientError> {
+        let seal = RoomSeal::new(shape)?;
         let body = serde_json::to_string(&CreateRoomRequest {
             is_direct: shape.is_direct,
             is_publicly_discoverable: shape.is_publicly_discoverable,
@@ -243,7 +283,16 @@ impl<T: Transport> Client<T> {
         })?;
         let response =
             self.call("POST", "/v1/rooms", &self.auth("create_room", None)?, Some(&body))?;
-        Ok(serde_json::from_str(&response.body)?)
+        let parsed: CreatedRoomResponse = serde_json::from_str(&response.body)?;
+
+        if parsed.tier != seal.tier().label() || parsed.e2ee != seal.tier().is_e2ee() {
+            return Err(ClientError::TierDisagreement {
+                local: seal.tier().label(),
+                server: parsed.tier,
+            });
+        }
+
+        Ok(CreatedRoom { room: parsed.room, seal })
     }
 
     pub fn add_room_member(&self, room: RoomId, user: UserId) -> Result<(), ClientError> {
@@ -304,5 +353,99 @@ impl<T: Transport> Client<T> {
         let body = serde_json::to_string(report)?;
         let response = self.call("POST", "/v1/reports", &[], Some(&body))?;
         Ok(serde_json::from_str(&response.body)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::Response;
+
+    /// A transport that answers room creation with whatever the test dictates.
+    #[derive(Debug)]
+    struct LyingInstance {
+        tier: &'static str,
+        e2ee: bool,
+    }
+
+    impl Transport for LyingInstance {
+        fn send(
+            &self,
+            _method: &str,
+            _path: &str,
+            _headers: &[(&str, String)],
+            _body: Option<&str>,
+        ) -> Result<Response, TransportError> {
+            Ok(Response {
+                status: 200,
+                body: format!(
+                    r#"{{"room":"{}","tier":"{}","e2ee":{}}}"#,
+                    uuid::Uuid::new_v4(),
+                    self.tier,
+                    self.e2ee
+                ),
+            })
+        }
+    }
+
+    fn client(tier: &'static str, e2ee: bool) -> Client<LyingInstance> {
+        Client::new(
+            LyingInstance { tier, e2ee },
+            Arc::new(Session::new(b"alice@instance").unwrap()),
+            UserId::new(),
+            DeviceId::new(),
+        )
+    }
+
+    fn dm() -> RoomShape {
+        RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 }
+    }
+
+    #[test]
+    fn a_room_the_instance_classifies_differently_is_refused() {
+        // The badge must describe what this client will actually do with the messages. If
+        // the instance calls a DM public, one of us is wrong about who can read it, and
+        // proceeding means displaying a tier that may be a lie.
+        let err = client("T3", false)
+            .create_room(dm())
+            .expect_err("a T1 shape returned as T3 must not be accepted");
+        assert!(
+            matches!(err, ClientError::TierDisagreement { local: "T1", .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_instance_claiming_more_encryption_than_the_rule_allows_is_also_refused() {
+        // The inverse, and the more tempting one to wave through: a server that upgrades
+        // the label looks generous. It is not — the client would encrypt nothing extra,
+        // and the badge would promise what the tier does not deliver.
+        let public =
+            RoomShape { is_direct: false, is_publicly_discoverable: true, member_ceiling: 500 };
+        let err = client("T1", true)
+            .create_room(public)
+            .expect_err("a T3 shape returned as T1 must not be accepted");
+        assert!(matches!(err, ClientError::TierDisagreement { local: "T3", .. }));
+    }
+
+    #[test]
+    fn an_agreeing_instance_yields_the_locally_derived_seal() {
+        let created = client("T1", true).create_room(dm()).unwrap();
+        assert_eq!(created.tier_label(), "T1");
+        assert!(created.seal.tier().is_e2ee());
+    }
+
+    #[test]
+    fn a_shape_the_rule_rejects_never_reaches_the_instance() {
+        // `derive_tier` refuses an oversized direct room rather than downgrading it. That
+        // check has to happen before the request, or a server is free to answer with
+        // whichever tier it prefers for a shape the client should not have offered.
+        let oversized = RoomShape {
+            is_direct: true,
+            is_publicly_discoverable: false,
+            member_ceiling: cairn_proto::tier::T1_MAX_MEMBERS + 1,
+        };
+        let err = client("T1", true).create_room(oversized).expect_err("refused locally");
+        assert!(matches!(err, ClientError::Shape(_)), "unexpected error: {err}");
     }
 }

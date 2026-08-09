@@ -106,8 +106,8 @@ fn two_clients_hold_an_e2ee_conversation_over_http_and_both_resume() {
 
     // --- Alice creates the room and adds Bob. ---
     let created = alice.client.create_room(dm_shape()).unwrap();
-    assert_eq!(created.tier, "T1", "a two-person direct room is T1");
-    assert!(created.e2ee);
+    assert_eq!(created.tier_label(), "T1", "a two-person direct room is T1");
+    assert!(created.seal.tier().is_e2ee());
     let room = created.room;
 
     alice.client.add_room_member(room, bob.user).unwrap();
@@ -149,7 +149,7 @@ fn two_clients_hold_an_e2ee_conversation_over_http_and_both_resume() {
     let fetched = bob.client.fetch_since(room, 0).unwrap();
     assert_eq!(fetched.len(), 1);
     let received =
-        bob_convo.receive(&fetched[0].envelope).unwrap().expect("an application message");
+        bob_convo.receive(&fetched[0].envelope).unwrap().message().expect("an application message");
     assert_eq!(received.body, b"hello over http");
 
     // Bob keeps what he needs to report this message later.
@@ -192,7 +192,7 @@ fn two_clients_hold_an_e2ee_conversation_over_http_and_both_resume() {
     let fetched = bob.client.fetch_since(room, first_seq).unwrap();
     assert_eq!(fetched.len(), 1, "only messages after the last one seen");
     let received2 =
-        bob_convo.receive(&fetched[0].envelope).unwrap().expect("an application message");
+        bob_convo.receive(&fetched[0].envelope).unwrap().message().expect("an application message");
     assert_eq!(received2.body, b"still here after a restart");
 
     // --- Bob reports the transcript, and the server verifies it. ---

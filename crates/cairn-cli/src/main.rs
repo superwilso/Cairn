@@ -91,9 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prev = Some(commitment);
 
         // Recipient: decrypt, and retain what a future report would need.
-        let decrypted = bob_group
-            .process(cairn_crypto::mls::parse_message(&wire)?)?
-            .ok_or("expected an application message")?;
+        let decrypted = match bob_group.process(cairn_crypto::mls::parse_message(&wire)?)? {
+            cairn_crypto::mls::GroupEvent::Application(data) => data,
+            other => return Err(format!("expected an application message, got {other:?}").into()),
+        };
         assert_eq!(decrypted, plaintext, "decrypted text must match what was sent");
 
         println!(

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::{self, Commitment, Opening};
-use cairn_crypto::mls::{GroupHandle, MlsError, Session};
+use cairn_crypto::mls::{GroupEvent, GroupHandle, GroupMember, MlsError, Session};
 use cairn_proto::{DeviceId, Envelope, EnvelopePayload, RoomId, RoomSeal, Tier, UserId};
 
 #[derive(Debug, thiserror::Error)]
@@ -250,21 +250,25 @@ impl Conversation {
     /// a sender could have the server tag a commitment for one message while showing the
     /// recipient another — making the recipient's future report fail to verify, and
     /// leaving them unable to prove what they were sent.
-    pub fn receive(
-        &mut self,
-        envelope: &Envelope,
-    ) -> Result<Option<ReceivedMessage>, ConversationError> {
+    /// Returns a [`TimelineEvent`], not an optional message, because a roster change is
+    /// something the user must be shown rather than a state transition to absorb quietly
+    /// (`docs/02-encryption-tiers.md` §4.6).
+    pub fn receive(&mut self, envelope: &Envelope) -> Result<TimelineEvent, ConversationError> {
         match &envelope.payload {
-            EnvelopePayload::Plaintext { body } => {
-                Ok(Some(ReceivedMessage { body: body.clone().into_bytes(), franking: None }))
-            }
+            EnvelopePayload::Plaintext { body } => Ok(TimelineEvent::Message(ReceivedMessage {
+                body: body.clone().into_bytes(),
+                franking: None,
+            })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
                 let group = self.group.as_mut().ok_or(MlsError::NoGroup)?;
                 let msg = cairn_crypto::mls::parse_message(ciphertext)?;
-                let Some(decrypted) = group.process(msg)? else {
-                    // A handshake message: group state advanced, no application content.
-                    return Ok(None);
+                let decrypted = match group.process(msg)? {
+                    GroupEvent::Application(data) => data,
+                    GroupEvent::MembershipChanged { added, removed, committer } => {
+                        return Ok(TimelineEvent::Membership { added, removed, committer })
+                    }
+                    GroupEvent::Other => return Ok(TimelineEvent::Nothing),
                 };
 
                 let inner: InnerBody =
@@ -280,7 +284,7 @@ impl Conversation {
                     return Err(ConversationError::CommitmentMismatch);
                 }
 
-                Ok(Some(ReceivedMessage {
+                Ok(TimelineEvent::Message(ReceivedMessage {
                     body: inner.body,
                     franking: Some(ReceivedFranking {
                         opening: inner.opening,
@@ -297,6 +301,38 @@ impl Conversation {
 struct InnerBody {
     body: Vec<u8>,
     opening: Opening,
+}
+
+/// What an incoming envelope turned out to be.
+///
+/// A membership change is a first-class outcome. Collapsing it into "not a message" is
+/// what let an added member be invisible: MLS applies the commit either way, so the
+/// difference between a wiretap and a normal handshake existed only in a value the old
+/// signature had no room for.
+#[derive(Debug)]
+pub enum TimelineEvent {
+    /// Content to display.
+    Message(ReceivedMessage),
+    /// The roster changed. **Show this.**
+    Membership {
+        added: Vec<GroupMember>,
+        removed: Vec<GroupMember>,
+        /// Leaf index of the member who committed the change, when the message named one.
+        committer: Option<u32>,
+    },
+    /// A handshake that changed no membership — a proposal, or a key update.
+    Nothing,
+}
+
+impl TimelineEvent {
+    /// The message, if this event was one. Convenient for tests and for callers that
+    /// genuinely only want content; the enum still forced them to say so.
+    pub fn message(self) -> Option<ReceivedMessage> {
+        match self {
+            TimelineEvent::Message(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 /// A decrypted message plus the material needed to report it later.
@@ -540,7 +576,8 @@ mod tests {
         .unwrap();
 
         let sent = alice.send(b"still here", 1).unwrap();
-        let received = bob.receive(&sent.envelope).unwrap().expect("an application message");
+        let received =
+            bob.receive(&sent.envelope).unwrap().message().expect("an application message");
         assert_eq!(received.body, b"still here");
 
         // And the franking material still lines up, so a resumed conversation is still
@@ -555,7 +592,8 @@ mod tests {
         let (mut alice, mut bob) = linked_pair();
 
         let sent = alice.send(b"hello bob", 1_000).unwrap();
-        let received = bob.receive(&sent.envelope).unwrap().expect("an application message");
+        let received =
+            bob.receive(&sent.envelope).unwrap().message().expect("an application message");
 
         assert_eq!(received.body, b"hello bob");
         let franking = received.franking.expect("E2EE messages must carry franking material");
@@ -605,7 +643,7 @@ mod tests {
             let tag = server_key.tag(&context);
             prev = Some(sent.commitment);
 
-            let got = bob.receive(&sent.envelope).unwrap().unwrap();
+            let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
             let franking = got.franking.unwrap();
 
             reported.push(ReportedMessage {
