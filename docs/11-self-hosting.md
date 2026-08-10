@@ -81,15 +81,33 @@ rejected even by its rightful owner.
 
 Then, to talk:
 
-1. Your friend runs `/keys 5` to publish key packages, and `/whoami` to get their user id.
-   **Without published key packages nobody can add them to a room.**
-2. You run `/dm usr_...` with their id. That creates the room and adds them in one step.
+1. Your friend runs `/username theirname` to claim a handle, then `/keys 5` to publish key
+   packages. **Without published key packages nobody can add them to a room.**
+2. You run `/dm @theirname`. That resolves the handle, creates the room, and adds them in one
+   step. Raw `usr_...` ids still work if you prefer.
 3. They run `/open rom_...` with the room id you were shown.
 4. Both of you run `/safety` and compare the numbers **out of band** — on a call, or in
    person. If they match, no key substitution happened. If they differ, stop.
 5. `/verify 0` records that you compared them. It persists.
 
-**There is no invite link yet.** Room ids and user ids are passed by hand. That is the main
+**Usernames now exist**, so step 1 can be `@alice` rather than a uuid — claim one once,
+and it is yours. They resolve by **exact match only**: there is no search or directory, so
+knowing a handle confirms an account exists but nobody can walk your instance for a list of
+who is on it. Lookups are rate limited per account, because exact-match resolution stops
+listing but not guessing.
+
+**Invite links exist now.** A moderator runs `/invite [uses] [hours]` in the open room —
+default one use, 24 hours — and the joiner runs `/join <token>`. The token is shown once;
+the server keeps only a hash, so it cannot be recovered or read out of a backup. There is no
+unlimited link, deliberately: an uncapped one is a public invite in all but name, and a
+public invite to a T1 or T2 room would mean it should have been T3.
+
+**Redeeming joins the room; it does not give you the keys.** The group's keys are held by
+its members, not the instance, so nobody can hand them out on the strength of a token. Until
+an existing member adds you to the encrypted group, the room is visible and unreadable. The
+client says so rather than implying the door is fully open.
+
+**Superseded note.** Room ids and user ids are passed by hand. That is the main
 piece of unfinished work between here and something you would hand to a non-technical
 person (`docs/10-roadmap.md`, M3).
 
@@ -106,22 +124,59 @@ The data volume holds two things:
   floor-level default, since every byte is storage and egress you pay for.
 
 ```bash
+mkdir -p backups && chmod 777 backups     # the image runs as an unprivileged user
 docker compose stop cairn
-docker compose run --rm -v "$PWD:/backup" cairn \
-  sh -c 'cp /data/franking.key /data/cairn.redb /backup/'
+docker compose run --rm -v "$PWD/backups:/backups" cairn backup "/backups/$(date +%F)"
 docker compose start cairn
 ```
 
-Stopped first: the database is crash-consistent, but a plain `cp` of a live one is not a
-snapshot, and the two files must be restored as a matched pair.
+The image's entrypoint *is* `cairn-server`, so the subcommand is the first argument. That
+writes both files plus a `backup.json` manifest, then **reopens what it just wrote and checks
+it** before reporting success. Confirm an older backup at any time, without restoring it:
+
+```bash
+docker compose run --rm -v "$PWD/backups:/backups" cairn verify /backups/2026-08-10
+docker compose run --rm -v "$PWD/backups:/backups" cairn restore /backups/2026-08-10 /data
+```
+
+`restore` writes only into an empty directory: it refuses if the destination already holds an
+instance, since whoever is running it is usually having a bad enough day already.
+
+### Why not just `cp`
+
+The previous version of this section said to stop the instance and copy the two files, which
+is correct and rests entirely on you remembering the first step. Probing what happens when
+you do not:
+
+| Instance | Result of `cp` on a live `cairn.redb` |
+|---|---|
+| Busy | Unopenable: `Failed to repair database. All roots are corrupted` |
+| Idle | **Opens cleanly, every row present, looks like a perfectly good backup** |
+
+So `cp` is not merely unreliable — it succeeds under exactly the conditions in which you
+*test* your backup procedure, and fails under exactly the conditions in which you *need* it,
+with the failure surfacing at restore time. `cairn-server backup` opens the database instead
+of copying the file, so against a running instance it refuses and says so.
+
+### The two files are one artifact
 
 **Back up both, and keep them together.** A restore that brings back `cairn.redb` without
-`franking.key` used to start cleanly and mint a replacement key, which looked like a working
-instance while every report filed before the restore had silently stopped verifying. The
-server now refuses to start in that state and tells you to restore the key — but that only
-converts silent damage into a visible outage. The backup is still your responsibility.
+`franking.key` used to start cleanly and mint a replacement, which looked like a working
+instance while every report filed before the restore had silently stopped verifying.
 
-If you are upgrading an instance that predates this change, it will hold a `state.json`
+Both halves of that are now refused at startup:
+
+- **Key missing**, database populated → refuses, and tells you to restore the key.
+- **Key present but from a different instance** → refuses. This one used to start perfectly
+  cleanly; the database now records a hash of the key it belongs to, so a separated pair is
+  caught rather than served.
+
+One limit, stated because it is real: an instance that was *already* running on a mismatched
+pair before this change has no record of which key was the right one, so the first start
+after upgrading adopts whatever key it finds. The check protects pairs that meet each other
+from here on.
+
+If you are upgrading an instance that predates the database, it will hold a `state.json`
 instead. That is imported automatically on first start and **left in place**, so a rollback
 to the previous release still finds its data. Nothing to do.
 
@@ -220,9 +275,14 @@ Honest list. Each of these is real and none is hypothetical.
   counter lives in memory, so restarting the server clears it. Keep your published supply
   topped up (`/keys 10`) rather than treating this as solved. **Registration and message
   sending are still unthrottled.**
-- **No message history on the client.** Messages arrive by polling and scroll past. A
-  restart does not replay them — it cannot, because MLS discards each message key after
-  use.
+- **Message history is stored in the clear.** A restart now replays a room rather than
+  losing it, which it could not do from the network — MLS discards each message key after
+  use, so the server holds ciphertext your device can no longer open. The copy is written
+  `0600` beside the client state that already sits there unencrypted. **Decided (owner)**,
+  and superseded by the platform keystores when the native clients land. Concretely: a
+  device that is taken is a conversation that is read. A room's disappearing-message timer
+  governs the local copy too, so an expired message is deleted from disk rather than merely
+  hidden.
 - **Polling, not push.** The client fetches when you press enter.
 - **No voice, video, or screen sharing.** Designed, unbuilt, and behind the native clients
   ([`12-realtime-media.md`](12-realtime-media.md)). Worth reading before you plan an
@@ -238,6 +298,11 @@ Honest list. Each of these is real and none is hypothetical.
   account's home directory has the group keys. This is consistent with
   `docs/01-threat-model.md` §3.4, which does not claim to defend a compromised device — but
   it is weaker than a platform keystore, which is what a finished client would use.
+
+- **Disappearing messages are purged lazily**, when someone next reads the room. An
+  abandoned room keeps its messages until it is opened again, so the timer is an upper bound
+  on what a *reader* sees rather than a guarantee about what is on disk at any instant. A
+  background sweep would close that; it does not exist yet.
 
 **Structural, and the reason this is pre-alpha:**
 

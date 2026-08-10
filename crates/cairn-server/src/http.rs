@@ -28,7 +28,7 @@ pub fn router(instance: SharedInstance) -> Router {
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room}", get(describe_room))
         .route("/v1/rooms/{room}/messages", post(send_message).get(fetch_messages))
-        .route("/v1/rooms/{room}/members", post(add_room_member))
+        .route("/v1/rooms/{room}/members", post(add_room_member).get(list_room_members))
         .route("/v1/rooms/{room}/members/{target}", delete(remove_room_member).put(set_room_role))
         .route("/v1/rooms/{room}/join", post(join_room))
         .route("/v1/devices/{device}/key-packages", post(publish_key_packages))
@@ -48,6 +48,11 @@ pub fn router(instance: SharedInstance) -> Router {
                 .layer(DefaultBodyLimit::max(crate::state::MAX_BLOB_BYTES + 64 * 1024)),
         )
         .route("/v1/blobs/{blob}", get(download_blob))
+        .route("/v1/rooms/{room}/ttl", post(set_room_ttl))
+        .route("/v1/rooms/{room}/invites", post(create_room_invite))
+        .route("/v1/invites/redeem", post(redeem_room_invite))
+        .route("/v1/usernames", post(claim_username))
+        .route("/v1/usernames/{name}", get(lookup_username))
         .route("/v1/reports", post(submit_report))
         .with_state(instance)
 }
@@ -75,7 +80,15 @@ impl IntoResponse for ServerError {
             }
             ServerError::NoSuchAccount => StatusCode::NOT_FOUND,
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-            ServerError::NoSuchBlob => StatusCode::NOT_FOUND,
+            ServerError::NoSuchBlob | ServerError::NoSuchUsername => StatusCode::NOT_FOUND,
+            ServerError::UsernameTaken | ServerError::UsernameAlreadySet => StatusCode::CONFLICT,
+            ServerError::BadUsername(_) | ServerError::InviteUsesTooHigh | ServerError::BadTtl => {
+                StatusCode::BAD_REQUEST
+            }
+            // Deliberately the same 401 as any other bad credential, and deliberately not
+            // 404: distinguishing "no such invite" from "spent" would tell someone probing
+            // tokens when they had found a real one.
+            ServerError::RoomInviteInvalid => StatusCode::UNAUTHORIZED,
             // 413 rather than 400: the request was well-formed, the instance just will not
             // hold something this big. An operator raising the ceiling changes the answer.
             ServerError::BlobTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -344,7 +357,7 @@ async fn upload_blob(
 ) -> Result<(StatusCode, Json<UploadedBlob>), ServerError> {
     let room = cairn_proto::RoomId::from_uuid(room);
     let actor = signed_actor(&instance, &headers, "upload_blob", Some(room.into()))?;
-    let id = instance.store_blob(actor, room, body.to_vec())?;
+    let id = instance.store_blob(actor, room, body.to_vec(), now_ms())?;
     Ok((StatusCode::CREATED, Json(UploadedBlob { blob: id.to_string() })))
 }
 
@@ -359,6 +372,140 @@ async fn download_blob(
     let actor = signed_actor(&instance, &headers, "download_blob", Some(blob.into()))?;
     let bytes = instance.fetch_blob(actor, blob)?;
     Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+#[derive(Deserialize)]
+struct SetTtlRequest {
+    /// Milliseconds, or `null` to turn disappearing messages off.
+    #[serde(default)]
+    ttl_ms: Option<i64>,
+}
+
+/// Set the room's disappearing-message timer. Any member may.
+async fn set_room_ttl(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<SetTtlRequest>,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "set_room_ttl", Some(room.into()))?;
+    instance.set_room_ttl(room, actor, request.ttl_ms)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct RoomMemberEntry {
+    user: String,
+    role: String,
+}
+
+/// The room's server-side membership. Members only.
+async fn list_room_members(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RoomMemberEntry>>, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "list_room_members", Some(room.into()))?;
+    Ok(Json(
+        instance
+            .room_members(room, actor)?
+            .into_iter()
+            .map(|m| RoomMemberEntry {
+                user: m.user.to_string(),
+                role: format!("{:?}", m.role).to_lowercase(),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateRoomInviteRequest {
+    /// How many people this link may admit. Capped server-side; there is no unlimited.
+    uses: u32,
+    /// Absolute expiry in ms since the epoch, or `null` for none.
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct MintedInvite {
+    /// Returned **once**. Only a hash is stored, so this cannot be recovered later.
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct RedeemInviteRequest {
+    token: String,
+}
+
+#[derive(Serialize)]
+struct RedeemedInvite {
+    room: String,
+}
+
+/// Mint an invite for a room. Moderator or owner, same as adding someone directly.
+async fn create_room_invite(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<CreateRoomInviteRequest>,
+) -> Result<(StatusCode, Json<MintedInvite>), ServerError> {
+    let room = cairn_proto::RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "create_room_invite", Some(room.into()))?;
+    let token = instance.create_room_invite(actor, room, request.uses, request.expires_at_ms)?;
+    Ok((StatusCode::CREATED, Json(MintedInvite { token })))
+}
+
+/// Redeem an invite, joining the caller to its room.
+///
+/// The token is in the body rather than the path: a path lands in access logs and proxy
+/// logs, and this one is a credential.
+async fn redeem_room_invite(
+    State(instance): State<SharedInstance>,
+    headers: HeaderMap,
+    Json(request): Json<RedeemInviteRequest>,
+) -> Result<Json<RedeemedInvite>, ServerError> {
+    let actor = signed_actor(&instance, &headers, "redeem_room_invite", None)?;
+    let room = instance.redeem_room_invite(actor, &request.token, now_ms())?;
+    Ok(Json(RedeemedInvite { room: room.to_string() }))
+}
+
+#[derive(Deserialize)]
+struct ClaimUsernameRequest {
+    username: String,
+}
+
+#[derive(Serialize)]
+struct ResolvedUser {
+    user: String,
+}
+
+/// Claim a handle for the acting account.
+async fn claim_username(
+    State(instance): State<SharedInstance>,
+    headers: HeaderMap,
+    Json(request): Json<ClaimUsernameRequest>,
+) -> Result<StatusCode, ServerError> {
+    let actor = signed_actor(&instance, &headers, "claim_username", None)?;
+    let name = cairn_proto::Username::parse(&request.username)
+        .map_err(|e| ServerError::BadUsername(e.to_string()))?;
+    instance.claim_username(actor, name)?;
+    Ok(StatusCode::CREATED)
+}
+
+/// Resolve a handle. Authenticated, so lookups can be attributed and bounded.
+async fn lookup_username(
+    State(instance): State<SharedInstance>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ResolvedUser>, ServerError> {
+    let actor = signed_actor(&instance, &headers, "lookup_username", None)?;
+    let name =
+        cairn_proto::Username::parse(&name).map_err(|e| ServerError::BadUsername(e.to_string()))?;
+    let user = instance.lookup_username(actor, &name, now_ms())?;
+    Ok(Json(ResolvedUser { user: user.to_string() }))
 }
 
 fn now_ms() -> i64 {
@@ -382,6 +529,10 @@ struct CreateRoomResponse {
     /// `docs/02-encryption-tiers.md` §4 this must be surfaced in the UI at all times.
     tier: &'static str,
     e2ee: bool,
+    /// The room's disappearing-message timer, so a client can apply the same rule to its
+    /// own stored copy rather than keeping messages the server has already dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ttl_ms: Option<i64>,
 }
 
 async fn create_room(
@@ -398,7 +549,12 @@ async fn create_room(
         },
         creator,
     )?;
-    Ok(Json(CreateRoomResponse { room, tier: seal.tier().label(), e2ee: seal.tier().is_e2ee() }))
+    Ok(Json(CreateRoomResponse {
+        room,
+        tier: seal.tier().label(),
+        e2ee: seal.tier().is_e2ee(),
+        ttl_ms: instance.room_ttl(room),
+    }))
 }
 
 /// Describe a room, so a client can display its tier.
@@ -422,7 +578,12 @@ async fn describe_room(
             return Err(ServerError::NotAMember);
         }
     }
-    Ok(Json(CreateRoomResponse { room, tier: seal.tier().label(), e2ee: seal.tier().is_e2ee() }))
+    Ok(Json(CreateRoomResponse {
+        room,
+        tier: seal.tier().label(),
+        e2ee: seal.tier().is_e2ee(),
+        ttl_ms: instance.room_ttl(room),
+    }))
 }
 
 #[derive(Serialize)]
@@ -438,7 +599,7 @@ async fn send_message(
     Path(_room): Path<String>,
     Json(envelope): Json<Envelope>,
 ) -> Result<Json<SendResponse>, ServerError> {
-    let stored = instance.accept(envelope)?;
+    let stored = instance.accept(envelope, now_ms())?;
     Ok(Json(SendResponse {
         server_seq: stored.server_seq,
         franking_tag: stored.franking_tag.map(|t| hex::encode(t.0)),
@@ -467,7 +628,7 @@ async fn fetch_messages(
 ) -> Result<Json<Vec<FetchedMessage>>, ServerError> {
     let room = RoomId::from_uuid(room);
     let actor = signed_actor(&instance, &headers, "read", Some(room.into()))?;
-    let messages = instance.messages_since(room, actor, since.after)?;
+    let messages = instance.messages_since(room, actor, since.after, now_ms())?;
     Ok(Json(
         messages
             .into_iter()

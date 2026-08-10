@@ -19,10 +19,10 @@ Legend: ✅ has it · ⚠️ partial or qualified · ❌ lacks it · 🎯 Cairn 
 | Threads / replies | ✅ | ⚠️ replies | ⚠️ replies | ⚠️ replies | ✅ | 🎯 v1 |
 | Reactions | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 | Edit / delete | ✅ | ✅ | ✅ | ⚠️ | ✅ | 🎯 v1 |
-| Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | 🎯 v2 |
+| Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ per-room, from send |
 | Read receipts (optional) | ⚠️ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Typing indicators | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
-| Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | 🎯 tiered |
+| Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | ⚠️ local history stored, search unbuilt |
 | Scheduled messages | ❌ | ❌ | ⚠️ | ❌ | ✅ | 🎯 v2 |
 | Voice messages | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 
@@ -73,8 +73,8 @@ question in `01-threat-model.md` §10.
 
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
-| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ server side done |
-| GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
+| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ end to end |
+| GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 — designed in [`14-gifs.md`](14-gifs.md); Tenor's API shut down June 2026, and the naive build leaks search terms and readers to the provider |
 | Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
 | Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |
 | Large file limits | ⚠️ paywalled | ⚠️ | ⚠️ 2 GB | ⚠️ | ✅ 2 GB free | 🎯 operator-set |

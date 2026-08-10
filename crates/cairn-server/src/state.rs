@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::{Commitment, Context as FrankingContext, ServerFrankingKey, Tag};
 use cairn_crypto::TranscriptReport;
-use cairn_proto::{BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId};
+use cairn_proto::{
+    BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId, Username,
+};
 
 use crate::storage::{Storage, StorageError, Write};
 
@@ -86,6 +88,20 @@ pub enum ServerError {
     BlobTooLarge,
     #[error("attachment is empty")]
     BlobEmpty,
+    #[error("that username is already taken")]
+    UsernameTaken,
+    #[error("this account already has a username")]
+    UsernameAlreadySet,
+    #[error("no account has that username")]
+    NoSuchUsername,
+    #[error("not a usable username: {0}")]
+    BadUsername(String),
+    #[error("a disappearing-message timer must be a positive duration")]
+    BadTtl,
+    #[error("this invite is unknown, spent, expired, or revoked")]
+    RoomInviteInvalid,
+    #[error("an invite may admit at most {MAX_INVITE_USES} people; an unlimited one would be a public invite")]
+    InviteUsesTooHigh,
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -119,7 +135,44 @@ pub const MAX_CLAIMS_PER_TARGET: usize = 3;
 /// something.
 pub const MAX_CLAIMS_TOTAL: usize = 30;
 
-/// The window both claim limits are measured over.
+/// The most people a single room invite may admit.
+///
+/// A ceiling rather than a preference, and the reason is the tier model rather than
+/// tidiness. `RoomSeal::may_mint_public_invite` forbids a *public* invite to a T1 or T2 room
+/// because discoverability is an input to `derive_tier` — a published invite would mean the
+/// room should have been T3, and the tier cannot change (ADR-001). A capability spent on
+/// redemption does not make a room discoverable, so a capped link is fine. An **uncapped**
+/// one is a public invite wearing a different name, which is why there is no "unlimited"
+/// option here and must never be one.
+pub const MAX_INVITE_USES: u32 = 100;
+
+/// How many username lookups one account may make per window.
+///
+/// Exact-match-only resolution stops an attacker *listing* the instance's accounts. It does
+/// not stop them *guessing* — a dictionary of common handles is cheap, and without a ceiling
+/// an attacker walks it and rebuilds the roster the design was meant to withhold. So the
+/// lookup path is bounded too, generously enough that a person adding friends never notices.
+pub const MAX_LOOKUPS_TOTAL: usize = 60;
+
+/// How many bytes of attachment one account may upload per window.
+///
+/// `MAX_BLOB_BYTES` caps a single upload and nothing capped the total, which probing turned
+/// into a number: one authenticated account stored **300 MiB without a single refusal**, and
+/// the database file reached 520 MiB doing it — the loop stopped because the probe stopped,
+/// not because the instance objected. On the deployment `docs/11-self-hosting.md` §7
+/// describes, a Raspberry Pi in a spare room, that is somebody's disk gone in an afternoon.
+///
+/// Note the ratio while sizing a volume: 300 MiB of ciphertext cost 520 MiB on disk.
+pub const MAX_UPLOAD_BYTES_PER_WINDOW: usize = 100 * 1024 * 1024;
+
+/// How many messages one account may send per window, across all rooms.
+///
+/// Generous on purpose — this is the product, not an auxiliary path, and a limit that
+/// interrupts a real conversation is worse than no limit at all. Thirty a minute sustained
+/// for an hour is not a person typing.
+pub const MAX_MESSAGES_PER_WINDOW: usize = 1_800;
+
+/// The window the claim, upload, and send limits are all measured over.
 pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 /// How far outside the present a signed request's timestamp may be.
@@ -191,13 +244,28 @@ pub struct Room {
     /// evidence honest members would later report.
     #[serde(default)]
     members: Vec<RoomMember>,
+    /// How long a message lives, in milliseconds, measured from when it was **sent**.
+    ///
+    /// Start-on-send rather than start-on-read: start-on-read needs the client to report
+    /// having read a message, which is a read receipt by another name, and those were
+    /// excluded for broadcasting presence (`docs/10-roadmap.md`).
+    ///
+    /// `default` so rooms created before this existed still decode.
+    #[serde(default)]
+    disappear_after_ms: Option<i64>,
 }
 
 impl Room {
     /// A bare room, for storage tests that need a value rather than a scenario.
     #[cfg(test)]
     pub(crate) fn for_test(seal: RoomSeal) -> Self {
-        Self { seal, next_seq: 0, last_franked: None, members: Vec::new() }
+        Self {
+            seal,
+            next_seq: 0,
+            last_franked: None,
+            members: Vec::new(),
+            disappear_after_ms: None,
+        }
     }
 
     fn has_member(&self, user: UserId) -> bool {
@@ -220,6 +288,24 @@ pub struct StoredMessage {
     pub server_seq: u64,
     /// Present when the message carried a franking commitment.
     pub franking_tag: Option<Tag>,
+}
+
+/// A room invite, stored under the **hash** of its token.
+///
+/// The token itself is never stored. An operator reading the database, or an attacker who
+/// exfiltrates it, finds hashes rather than a set of working invitations — the same reason
+/// passwords are not stored in the clear, applied to a credential that admits someone to a
+/// private room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomInviteRecord {
+    pub room: RoomId,
+    pub created_by: UserId,
+    /// Counts down. Retained at zero rather than deleted, so a replayed invite is
+    /// distinguishable from one that never existed — an operator debugging "my friend says
+    /// the link does not work" needs to tell those apart.
+    pub uses_remaining: u32,
+    pub expires_at_ms: Option<i64>,
+    pub revoked: bool,
 }
 
 /// An attachment the server holds, minus its bytes.
@@ -300,6 +386,43 @@ struct ClaimLimiter {
     events: HashMap<UserId, VecDeque<(i64, UserId)>>,
 }
 
+/// A rolling-window budget, in whatever unit the caller counts.
+///
+/// Used for bytes uploaded and messages sent. **It bounds the rate, not the total** — and
+/// for uploads that distinction is load-bearing, because nothing deletes a blob yet, so an
+/// account's lifetime footprint still grows without bound, just predictably. A genuine
+/// storage quota needs a deletion path first; saying otherwise here would be claiming a
+/// protection that does not hold.
+#[derive(Debug, Default)]
+struct WindowBudget {
+    events: HashMap<UserId, VecDeque<(i64, usize)>>,
+}
+
+impl WindowBudget {
+    /// Charge `cost` against `actor`'s budget, or refuse.
+    ///
+    /// Checks before recording, so a refused attempt does not consume budget and a client
+    /// that retries on a 429 can actually recover.
+    fn admit(
+        &mut self,
+        actor: UserId,
+        cost: usize,
+        cap: usize,
+        now_ms: i64,
+    ) -> Result<(), ServerError> {
+        let recent = self.events.entry(actor).or_default();
+        while recent.front().is_some_and(|(at, _)| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS) {
+            recent.pop_front();
+        }
+        let used: usize = recent.iter().map(|(_, c)| *c).sum();
+        if used.saturating_add(cost) > cap {
+            return Err(ServerError::RateLimited);
+        }
+        recent.push_back((now_ms, cost));
+        Ok(())
+    }
+}
+
 impl ClaimLimiter {
     /// Record a claim by `actor` against `target`, or refuse it.
     ///
@@ -340,6 +463,19 @@ pub struct Instance {
     registration_policy: Mutex<RegistrationPolicy>,
     /// Not persisted; see [`ClaimLimiter`].
     claim_limiter: Mutex<ClaimLimiter>,
+    /// Handle → account, both directions needed: one to resolve, one to refuse a second
+    /// handle for an account that already has one.
+    usernames: Mutex<HashMap<Username, UserId>>,
+    /// Keyed by token hash; see [`RoomInviteRecord`].
+    room_invites: Mutex<HashMap<String, RoomInviteRecord>>,
+    /// Bounds username *guessing*, which exact-match resolution does not. Not persisted,
+    /// for the same reason as [`ClaimLimiter`].
+    lookup_limiter: Mutex<HashMap<UserId, VecDeque<i64>>>,
+    /// Bounds how fast one account can fill an operator's disk. Not persisted, as above.
+    upload_budget: Mutex<WindowBudget>,
+    /// Bounds message flooding. Sending is authenticated, so unlike registration this needs
+    /// no knowledge of the caller's address and lives entirely here with the other rules.
+    send_budget: Mutex<WindowBudget>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -370,6 +506,11 @@ impl Instance {
             key_packages: Mutex::new(directory.key_packages.into_iter().collect()),
             registration_policy: Mutex::new(directory.registration_policy),
             claim_limiter: Mutex::new(ClaimLimiter::default()),
+            usernames: Mutex::new(directory.usernames.into_iter().collect()),
+            room_invites: Mutex::new(directory.room_invites.into_iter().collect()),
+            lookup_limiter: Mutex::new(HashMap::new()),
+            upload_budget: Mutex::default(),
+            send_budget: Mutex::default(),
             franking_key,
             storage,
         })
@@ -572,6 +713,7 @@ impl Instance {
             next_seq: 0,
             last_franked: None,
             members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
+            disappear_after_ms: None,
         };
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         rooms.insert(id, room.clone());
@@ -598,12 +740,19 @@ impl Instance {
         if actor_role < RoomRole::Moderator {
             return Err(ServerError::InsufficientRole);
         }
+        // Already a member: nothing to do, and crucially *not* an error. The ceiling used to
+        // be checked first, which meant re-adding an existing member of a full room failed
+        // with RoomFull — and after invite redemption that is the normal case, because the
+        // joiner is already a server-side member and a DM at its ceiling of 2 is full. It
+        // made invite-then-add fail for exactly the situation invites exist for. Found by
+        // running the flow, not by reading the check.
+        if r.has_member(new_member) {
+            return Ok(());
+        }
         if r.members.len() as u32 >= r.seal.member_ceiling() {
             return Err(ServerError::RoomFull);
         }
-        if !r.has_member(new_member) {
-            r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
-        }
+        r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
         let updated = r.clone();
         drop(rooms);
         self.write(&[Write::Room(room, updated)])
@@ -673,6 +822,89 @@ impl Instance {
         let updated = r.clone();
         drop(rooms);
         self.write(&[Write::Room(room, updated)])
+    }
+
+    /// Set or clear the room's disappearing-message timer. Any member may.
+    ///
+    /// "Any member" rather than moderators-only because a DM has no moderator and both
+    /// parties are equals — either should be able to ask for ephemerality. It applies to
+    /// **future messages only**: retroactively shortening the life of messages people
+    /// already sent under a different expectation is the same category of mistake as
+    /// downgrading a room's tier.
+    pub fn set_room_ttl(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        ttl_ms: Option<i64>,
+    ) -> Result<(), ServerError> {
+        if ttl_ms.is_some_and(|t| t <= 0) {
+            return Err(ServerError::BadTtl);
+        }
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if !r.has_member(actor) {
+            return Err(ServerError::NotAMember);
+        }
+        r.disappear_after_ms = ttl_ms;
+        let updated = r.clone();
+        drop(rooms);
+        self.write(&[Write::Room(room, updated)])
+    }
+
+    /// The room's disappearing-message timer, if set.
+    pub fn room_ttl(&self, room: RoomId) -> Option<i64> {
+        self.rooms
+            .lock()
+            .expect("rooms mutex poisoned")
+            .get(&room)
+            .and_then(|r| r.disappear_after_ms)
+    }
+
+    /// Delete messages past the room's timer.
+    ///
+    /// Actually deletes rather than filtering. A message the server still holds has not
+    /// disappeared, whatever the client shows — and the whole point of the feature is what
+    /// the *instance* stops being able to hand over.
+    ///
+    /// Purged lazily, on read. That means an abandoned room keeps its messages until someone
+    /// looks at it, which is a real limitation and is stated in `docs/11-self-hosting.md`
+    /// rather than implied away.
+    fn purge_expired(&self, room: RoomId, ttl_ms: i64, now_ms: i64) -> Result<(), ServerError> {
+        let cutoff = now_ms.saturating_sub(ttl_ms);
+        let expired: Vec<u64> = self
+            .storage
+            .messages_since(room, 0)?
+            .into_iter()
+            .filter(|m| m.envelope.sent_at_ms <= cutoff)
+            .map(|m| m.server_seq)
+            .collect();
+
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let writes: Vec<Write> =
+            expired.into_iter().map(|seq| Write::DeleteMessage(room, seq)).collect();
+        self.write(&writes)
+    }
+
+    /// The room's server-side membership, for a member.
+    ///
+    /// This is the *server's* view — who may read and write — which is not the same as the
+    /// MLS group's roster. The two diverge whenever someone joins by invite: the server
+    /// admits them immediately, and the encrypted group only gains them when an existing
+    /// member commits an Add. A client showing one and calling it the other would be
+    /// telling a user they are talking to someone who cannot hear them.
+    pub fn room_members(
+        &self,
+        room: RoomId,
+        actor: UserId,
+    ) -> Result<Vec<RoomMember>, ServerError> {
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+        if !r.has_member(actor) {
+            return Err(ServerError::NotAMember);
+        }
+        Ok(r.members.clone())
     }
 
     /// An account's role in a room, if any.
@@ -855,6 +1087,7 @@ impl Instance {
         actor: UserId,
         room: RoomId,
         bytes: Vec<u8>,
+        now_ms: i64,
     ) -> Result<BlobId, ServerError> {
         if bytes.is_empty() {
             return Err(ServerError::BlobEmpty);
@@ -870,6 +1103,15 @@ impl Instance {
                 return Err(ServerError::NotAMember);
             }
         }
+
+        // Charged after membership, so a non-member cannot burn a member's budget, and
+        // before the write, so the bytes are refused rather than stored and regretted.
+        self.upload_budget.lock().expect("upload budget poisoned").admit(
+            actor,
+            bytes.len(),
+            MAX_UPLOAD_BYTES_PER_WINDOW,
+            now_ms,
+        )?;
 
         let id = BlobId::new();
         let record = BlobRecord { room, uploader: actor, size: bytes.len() };
@@ -901,6 +1143,190 @@ impl Instance {
         self.storage.blob_bytes(id)?.ok_or(ServerError::NoSuchBlob)
     }
 
+    /// Mint a room invite. The creator chooses how many people it admits and for how long.
+    ///
+    /// Returns the token **once**. It is stored only as a hash, so an instance that loses
+    /// this value cannot recover it — which is the point.
+    pub fn create_room_invite(
+        &self,
+        actor: UserId,
+        room: RoomId,
+        uses: u32,
+        expires_at_ms: Option<i64>,
+    ) -> Result<String, ServerError> {
+        if uses == 0 || uses > MAX_INVITE_USES {
+            return Err(ServerError::InviteUsesTooHigh);
+        }
+
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            // Same authority as adding someone directly. An invite is a deferred add, so a
+            // member who cannot admit people must not be able to mint one that does it later.
+            if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Moderator {
+                return Err(ServerError::InsufficientRole);
+            }
+        }
+
+        let token = mint_token();
+        let record = RoomInviteRecord {
+            room,
+            created_by: actor,
+            uses_remaining: uses,
+            expires_at_ms,
+            revoked: false,
+        };
+        let hash = hash_token(&token);
+        self.room_invites
+            .lock()
+            .expect("room invites mutex poisoned")
+            .insert(hash.clone(), record.clone());
+        self.write(&[Write::RoomInvite(hash, record)])?;
+        Ok(token)
+    }
+
+    /// Redeem an invite, joining the acting account to its room.
+    ///
+    /// Every reason for refusal collapses into one error deliberately: telling a caller
+    /// *why* a token failed tells an attacker probing tokens whether they found a real one
+    /// that was merely spent.
+    pub fn redeem_room_invite(
+        &self,
+        actor: UserId,
+        token: &str,
+        now_ms: i64,
+    ) -> Result<RoomId, ServerError> {
+        let hash = hash_token(token);
+        let mut invites = self.room_invites.lock().expect("room invites mutex poisoned");
+        let record = invites.get_mut(&hash).ok_or(ServerError::RoomInviteInvalid)?;
+
+        if record.revoked
+            || record.uses_remaining == 0
+            || record.expires_at_ms.is_some_and(|exp| now_ms >= exp)
+        {
+            return Err(ServerError::RoomInviteInvalid);
+        }
+
+        let room_id = record.room;
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let room = rooms.get_mut(&room_id).ok_or(ServerError::RoomInviteInvalid)?;
+
+        // Already a member: succeed without spending a use. Otherwise a shared link burns a
+        // slot every time someone re-opens it.
+        if room.has_member(actor) {
+            return Ok(room_id);
+        }
+        // The ceiling still binds. An invite is not permission to exceed the room's shape,
+        // which is what `derive_tier` was computed from.
+        if room.members.len() as u32 >= room.seal.member_ceiling() {
+            return Err(ServerError::RoomFull);
+        }
+
+        room.members.push(RoomMember { user: actor, role: RoomRole::Member });
+        record.uses_remaining -= 1;
+
+        let updated_room = room.clone();
+        let updated_invite = record.clone();
+        drop(rooms);
+        drop(invites);
+
+        // One batch: a crash between them either admits someone without spending the use, or
+        // spends it without admitting them. Both are wrong, and the second locks out a
+        // person holding a legitimate invite.
+        self.write(&[Write::Room(room_id, updated_room), Write::RoomInvite(hash, updated_invite)])?;
+        Ok(room_id)
+    }
+
+    /// Revoke an invite, so a link that has escaped stops working.
+    pub fn revoke_room_invite(&self, actor: UserId, token: &str) -> Result<(), ServerError> {
+        let hash = hash_token(token);
+        let mut invites = self.room_invites.lock().expect("room invites mutex poisoned");
+        let record = invites.get_mut(&hash).ok_or(ServerError::RoomInviteInvalid)?;
+        let room = record.room;
+
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Moderator {
+                return Err(ServerError::InsufficientRole);
+            }
+        }
+
+        record.revoked = true;
+        let updated = record.clone();
+        drop(invites);
+        self.write(&[Write::RoomInvite(hash, updated)])
+    }
+
+    /// Claim a handle for the acting account.
+    ///
+    /// One per account, and not reassignable here. A handle that could be released and
+    /// re-taken is a handle someone else can inherit: a person who remembers "@alice" and
+    /// types it a month later would reach whoever picked it up, with no signal that anything
+    /// changed. Renaming needs a story about the old name's afterlife before it is offered.
+    pub fn claim_username(&self, actor: UserId, name: Username) -> Result<(), ServerError> {
+        let mut usernames = self.usernames.lock().expect("usernames mutex poisoned");
+
+        if usernames.contains_key(&name) {
+            return Err(ServerError::UsernameTaken);
+        }
+        if usernames.values().any(|u| *u == actor) {
+            return Err(ServerError::UsernameAlreadySet);
+        }
+        // An unclaimed account must not be able to reserve a handle: registration is the
+        // thing that costs an invite, and a handle without an account behind it is squatting.
+        if !self.accounts.lock().expect("accounts mutex poisoned").contains_key(&actor) {
+            return Err(ServerError::NoSuchAccount);
+        }
+
+        usernames.insert(name.clone(), actor);
+        drop(usernames);
+        self.write(&[Write::Username(name, actor)])
+    }
+
+    /// Resolve a handle to an account. Exact match only — there is deliberately no search.
+    ///
+    /// Rate limited per actor, because exact-match resolution stops an attacker *listing*
+    /// accounts but not *guessing* them, and an unbounded lookup path rebuilds the roster
+    /// that withholding search was meant to protect.
+    pub fn lookup_username(
+        &self,
+        actor: UserId,
+        name: &Username,
+        now_ms: i64,
+    ) -> Result<UserId, ServerError> {
+        {
+            let mut limiter = self.lookup_limiter.lock().expect("lookup limiter poisoned");
+            let recent = limiter.entry(actor).or_default();
+            while recent.front().is_some_and(|at| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS) {
+                recent.pop_front();
+            }
+            if recent.len() >= MAX_LOOKUPS_TOTAL {
+                return Err(ServerError::RateLimited);
+            }
+            // Recorded before the answer is known, so a miss costs the same as a hit. A
+            // limiter that only counted successes would let an attacker guess for free.
+            recent.push_back(now_ms);
+        }
+
+        self.usernames
+            .lock()
+            .expect("usernames mutex poisoned")
+            .get(name)
+            .copied()
+            .ok_or(ServerError::NoSuchUsername)
+    }
+
+    /// The handle for an account, if it has claimed one.
+    pub fn username_of(&self, user: UserId) -> Option<Username> {
+        self.usernames
+            .lock()
+            .expect("usernames mutex poisoned")
+            .iter()
+            .find(|(_, u)| **u == user)
+            .map(|(n, _)| n.clone())
+    }
+
     pub fn room_seal(&self, room: RoomId) -> Option<RoomSeal> {
         self.rooms.lock().expect("rooms mutex poisoned").get(&room).map(|r| r.seal)
     }
@@ -911,7 +1337,7 @@ impl Instance {
     /// modified clients exist, so the server cannot rely on a client having enforced the
     /// tier — it re-checks. A client that tries to put plaintext into an encrypted room
     /// is rejected here.
-    pub fn accept(&self, envelope: Envelope) -> Result<StoredMessage, ServerError> {
+    pub fn accept(&self, envelope: Envelope, now_ms: i64) -> Result<StoredMessage, ServerError> {
         // Before anything else: is this actually from who it says it is? Everything
         // downstream — the franking tag especially — attributes the message to
         // `envelope.sender`, so that attribution must be earned first.
@@ -927,6 +1353,16 @@ impl Instance {
         }
 
         envelope.validate_for_tier(room.seal.tier())?;
+
+        // After authentication and membership, so neither an impostor nor an outsider can
+        // spend a member's budget, and before the sequence number moves, so a refused
+        // message leaves no gap in the room's franking chain.
+        self.send_budget.lock().expect("send budget poisoned").admit(
+            envelope.sender,
+            1,
+            MAX_MESSAGES_PER_WINDOW,
+            now_ms,
+        )?;
 
         room.next_seq += 1;
         let server_seq = room.next_seq;
@@ -973,6 +1409,7 @@ impl Instance {
         room: RoomId,
         actor: UserId,
         after: u64,
+        now_ms: i64,
     ) -> Result<Vec<StoredMessage>, ServerError> {
         {
             let rooms = self.rooms.lock().expect("rooms mutex poisoned");
@@ -980,6 +1417,11 @@ impl Instance {
             if !r.has_member(actor) {
                 return Err(ServerError::NotAMember);
             }
+        }
+        // Purge before reading, so an expired message is gone from storage rather than
+        // merely hidden from this caller.
+        if let Some(ttl) = self.room_ttl(room) {
+            self.purge_expired(room, ttl, now_ms)?;
         }
         // Read from storage rather than memory: the log is the one thing that grows
         // without bound, and it is where attachment bytes will land.
@@ -1090,7 +1532,7 @@ pub(crate) mod tests {
         let sender = TestSender::registered(&inst);
         let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e = sender.envelope(room, EnvelopePayload::Plaintext { body: "sneaky".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::Rejected(_))));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::Rejected(_))));
     }
 
     #[test]
@@ -1100,7 +1542,7 @@ pub(crate) mod tests {
         let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e =
             sender.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1, 2, 3] });
-        assert!(inst.accept(e).is_ok());
+        assert!(inst.accept(e, 0).is_ok());
     }
 
     #[test]
@@ -1111,7 +1553,7 @@ pub(crate) mod tests {
         let mut last = 0;
         for i in 0..5 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-            let stored = inst.accept(e).unwrap();
+            let stored = inst.accept(e, 0).unwrap();
             assert!(stored.server_seq > last);
             last = stored.server_seq;
         }
@@ -1122,7 +1564,7 @@ pub(crate) mod tests {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
         let e = sender.envelope(RoomId::new(), EnvelopePayload::Plaintext { body: "x".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::NoSuchRoom)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::NoSuchRoom)));
     }
 
     #[test]
@@ -1135,7 +1577,7 @@ pub(crate) mod tests {
         let e = sender
             .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
             .with_franking_commitment(commitment.to_hex());
-        let stored = inst.accept(sender.sign(e)).unwrap();
+        let stored = inst.accept(sender.sign(e), 0).unwrap();
 
         let tag = stored.franking_tag.expect("a franked message must carry a tag");
         let ctx = FrankingContext {
@@ -1157,10 +1599,10 @@ pub(crate) mod tests {
         let e = sender
             .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
             .with_franking_commitment("not-hex");
-        assert!(matches!(inst.accept(sender.sign(e)), Err(ServerError::BadCommitment)));
+        assert!(matches!(inst.accept(sender.sign(e), 0), Err(ServerError::BadCommitment)));
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    pub(crate) fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("cairn-state-{}-{}", name, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1231,7 +1673,7 @@ pub(crate) mod tests {
         storage.commits.lock().unwrap().clear();
         for i in 0..200 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-            inst.accept(e).unwrap();
+            inst.accept(e, 0).unwrap();
         }
 
         let costs = storage.commits.lock().unwrap().clone();
@@ -1311,7 +1753,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let signature = owner_key.sign(&e.signing_bytes()).unwrap();
-            inst.accept(e.with_signature(hex::encode(signature))).unwrap();
+            inst.accept(e.with_signature(hex::encode(signature)), 0).unwrap();
 
             let used_by = inst
                 .invites
@@ -1359,7 +1801,7 @@ pub(crate) mod tests {
             "published key packages must survive"
         );
         assert_eq!(
-            restarted.messages_since(room, owner, 0).unwrap().len(),
+            restarted.messages_since(room, owner, 0, 0).unwrap().len(),
             1,
             "the message log must survive"
         );
@@ -1385,7 +1827,7 @@ pub(crate) mod tests {
             let e = sender
                 .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
                 .with_franking_commitment(commitment.to_hex());
-            let stored = inst.accept(sender.sign(e)).unwrap();
+            let stored = inst.accept(sender.sign(e), 0).unwrap();
             (
                 room,
                 stored.envelope.sender,
@@ -1435,14 +1877,14 @@ pub(crate) mod tests {
             let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
             for i in 0..3 {
                 let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-                inst.accept(e).unwrap();
+                inst.accept(e, 0).unwrap();
             }
             (room, sender.user, sender.device, sender.session.public_key().to_vec())
         };
 
         let restarted = Instance::open(storage).unwrap();
         assert_eq!(restarted.room_seal(room).unwrap().tier(), Tier::PublicCommunity);
-        assert_eq!(restarted.messages_since(room, user, 0).unwrap().len(), 3);
+        assert_eq!(restarted.messages_since(room, user, 0, 0).unwrap().len(), 3);
 
         // Device registrations must survive too, or every client is locked out after a
         // restart. Re-registering the same device must be refused, which proves the
@@ -1458,7 +1900,7 @@ pub(crate) mod tests {
         let sender2 = TestSender::registered(&restarted);
         restarted.join_room(room, sender2.user).unwrap();
         let e = sender2.envelope(room, EnvelopePayload::Plaintext { body: "after".into() });
-        assert_eq!(restarted.accept(e).unwrap().server_seq, 4);
+        assert_eq!(restarted.accept(e, 0).unwrap().server_seq, 4);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1469,7 +1911,7 @@ pub(crate) mod tests {
         let sender = TestSender::registered(&inst);
         let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         let e = sender.unsigned(room, EnvelopePayload::Plaintext { body: "hi".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::Unsigned)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::Unsigned)));
     }
 
     #[test]
@@ -1483,7 +1925,7 @@ pub(crate) mod tests {
             device: DeviceId::new(),
         };
         let e = stranger.envelope(room, EnvelopePayload::Plaintext { body: "hi".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::UnknownDevice)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::UnknownDevice)));
     }
 
     #[test]
@@ -1502,7 +1944,7 @@ pub(crate) mod tests {
         e.sender = alice.user; // claim Alice's account
         let e = mallory.sign(e); // …but sign with Mallory's own key, correctly
 
-        assert!(matches!(inst.accept(e), Err(ServerError::DeviceUserMismatch)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::DeviceUserMismatch)));
     }
 
     #[test]
@@ -1515,7 +1957,7 @@ pub(crate) mod tests {
 
         let mut e = sender.envelope(room, EnvelopePayload::Plaintext { body: "original".into() });
         e.payload = EnvelopePayload::Plaintext { body: "rewritten in transit".into() };
-        assert!(matches!(inst.accept(e), Err(ServerError::BadSignature)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::BadSignature)));
     }
 
     #[test]
@@ -1534,7 +1976,7 @@ pub(crate) mod tests {
         let sig = mallory.session.sign(&e.signing_bytes()).unwrap();
         let e = e.with_signature(hex::encode(sig));
 
-        assert!(matches!(inst.accept(e), Err(ServerError::BadSignature)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::BadSignature)));
     }
 
     #[test]
@@ -1570,7 +2012,7 @@ pub(crate) mod tests {
             let e = sender
                 .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
                 .with_franking_commitment(commitment.to_hex());
-            let stored = inst.accept(sender.sign(e)).unwrap();
+            let stored = inst.accept(sender.sign(e), 0).unwrap();
 
             reported.push(ReportedMessage {
                 plaintext: text.to_vec(),
@@ -1610,17 +2052,18 @@ pub(crate) mod tests {
         let e = sender
             .unsigned(room, EnvelopePayload::Plaintext { body: "one".into() })
             .with_franking_commitment(c1.to_hex());
-        inst.accept(sender.sign(e)).unwrap();
+        let signature = sender.session.sign(&e.signing_bytes()).unwrap();
+        inst.accept(e.with_signature(hex::encode(signature)), 0).unwrap();
 
         // An unfranked message in between.
-        inst.accept(sender.envelope(room, EnvelopePayload::Plaintext { body: "plain".into() }))
+        inst.accept(sender.envelope(room, EnvelopePayload::Plaintext { body: "plain".into() }), 0)
             .unwrap();
 
         let (c2, o2) = cairn_crypto::commit(b"two");
         let e = sender
             .unsigned(room, EnvelopePayload::Plaintext { body: "two".into() })
             .with_franking_commitment(c2.to_hex());
-        let stored = inst.accept(sender.sign(e)).unwrap();
+        let stored = inst.accept(sender.sign(e), 0).unwrap();
 
         // The second franked message must chain to the first, not to the unfranked one.
         let ctx = FrankingContext {
@@ -1645,11 +2088,11 @@ pub(crate) mod tests {
         let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         for i in 0..3 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-            inst.accept(e).unwrap();
+            inst.accept(e, 0).unwrap();
         }
-        assert_eq!(inst.messages_since(room, sender.user, 0).unwrap().len(), 3);
-        assert_eq!(inst.messages_since(room, sender.user, 2).unwrap().len(), 1);
-        assert_eq!(inst.messages_since(room, sender.user, 99).unwrap().len(), 0);
+        assert_eq!(inst.messages_since(room, sender.user, 0, 0).unwrap().len(), 3);
+        assert_eq!(inst.messages_since(room, sender.user, 2, 0).unwrap().len(), 1);
+        assert_eq!(inst.messages_since(room, sender.user, 99, 0).unwrap().len(), 0);
     }
 }
 
@@ -1725,7 +2168,7 @@ mod accounts {
 
         // And with no registered device, she cannot send as Alice at all.
         let e = signed_as(&mallory_key, alice.user, mallory_device, room, "not alice");
-        assert!(matches!(inst.accept(e), Err(ServerError::UnknownDevice)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::UnknownDevice)));
     }
 
     #[test]
@@ -1748,7 +2191,7 @@ mod accounts {
         inst.link_device(alice.user, laptop_id, laptop.public_key(), alice.device, &auth).unwrap();
 
         let e = signed_as(&laptop, alice.user, laptop_id, room, "from my laptop");
-        assert!(inst.accept(e).is_ok());
+        assert!(inst.accept(e, 0).is_ok());
     }
 
     #[test]
@@ -1934,7 +2377,7 @@ mod membership {
         let room = private_room(&inst, alice.user);
 
         let e = mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] });
-        assert!(matches!(inst.accept(e), Err(ServerError::NotAMember)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::NotAMember)));
     }
 
     /// The read half of the same vulnerability, and the worse one.
@@ -1950,12 +2393,18 @@ mod membership {
         let mallory = TestSender::registered(&inst);
         let room = private_room(&inst, alice.user);
 
-        inst.accept(alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }))
-            .unwrap();
+        inst.accept(
+            alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+            0,
+        )
+        .unwrap();
 
-        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+        assert!(matches!(
+            inst.messages_since(room, mallory.user, 0, 0),
+            Err(ServerError::NotAMember)
+        ));
         // The member still can, so the check is not simply refusing everyone.
-        assert_eq!(inst.messages_since(room, alice.user, 0).unwrap().len(), 1);
+        assert_eq!(inst.messages_since(room, alice.user, 0, 0).unwrap().len(), 1);
     }
 
     #[test]
@@ -1987,7 +2436,7 @@ mod membership {
         // Alice, a member, can add Bob — and then Bob can speak.
         inst.add_room_member(room, alice.user, bob.user).unwrap();
         assert!(inst
-            .accept(bob.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }))
+            .accept(bob.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }), 0)
             .is_ok());
     }
 
@@ -2000,7 +2449,7 @@ mod membership {
 
         inst.join_room(room, newcomer.user).unwrap();
         assert!(inst
-            .accept(newcomer.envelope(room, EnvelopePayload::Plaintext { body: "hello".into() }))
+            .accept(newcomer.envelope(room, EnvelopePayload::Plaintext { body: "hello".into() }), 0)
             .is_ok());
     }
 
@@ -2105,10 +2554,10 @@ mod membership {
 
         let restarted = Instance::open(storage).unwrap();
         // A member must not be locked out by a restart…
-        assert!(restarted.messages_since(room, member, 0).is_ok());
+        assert!(restarted.messages_since(room, member, 0, 0).is_ok());
         // …and an outsider must not be let in by one.
         assert!(matches!(
-            restarted.messages_since(room, outsider, 0),
+            restarted.messages_since(room, outsider, 0, 0),
             Err(ServerError::NotAMember)
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -2167,6 +2616,7 @@ mod roles {
 
         inst.accept(
             mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+            0,
         )
         .unwrap();
 
@@ -2174,11 +2624,15 @@ mod roles {
 
         assert!(matches!(
             inst.accept(
-                mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] })
+                mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }),
+                0
             ),
             Err(ServerError::NotAMember)
         ));
-        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+        assert!(matches!(
+            inst.messages_since(room, mallory.user, 0, 0),
+            Err(ServerError::NotAMember)
+        ));
     }
 
     #[test]
@@ -2192,12 +2646,13 @@ mod roles {
         inst.add_room_member(room, alice.user, mallory.user).unwrap();
         inst.accept(
             mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+            0,
         )
         .unwrap();
 
         inst.remove_room_member(room, alice.user, mallory.user).unwrap();
 
-        let log = inst.messages_since(room, alice.user, 0).unwrap();
+        let log = inst.messages_since(room, alice.user, 0, 0).unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].envelope.sender, mallory.user);
     }
@@ -2410,5 +2865,679 @@ mod claim_limits {
             inst.claim_key_packages(me.user, me.user, 0),
             Err(ServerError::RateLimited)
         ));
+    }
+}
+
+#[cfg(test)]
+/// What one authenticated account can make an instance hold or do.
+///
+/// Distinct from `claim_limits`, which bounds what an account can do *to another account*.
+/// These bound what it can do to the **operator** — the person paying for the disk.
+#[cfg(test)]
+mod resource_limits {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn room_with(inst: &Instance, owner: UserId) -> RoomId {
+        inst.create_room(
+            RoomShape { is_direct: false, is_publicly_discoverable: false, member_ceiling: 16 },
+            owner,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn one_account_cannot_fill_the_operators_disk() {
+        // Regression test for a hole found by probing. `MAX_BLOB_BYTES` capped a single
+        // upload and nothing capped the total, so one authenticated account stored
+        //
+        //     RESULT: one account stored 300 MiB with NO refusal; database file is 520 MiB
+        //
+        // and stopped only because the probe stopped. On a Raspberry Pi in a spare room —
+        // the deployment `11-self-hosting.md` §7 describes — that is the disk gone.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        let chunk = vec![0u8; 8 * 1024 * 1024];
+        let mut stored = 0usize;
+        for _ in 0..64 {
+            match inst.store_blob(alice.user, room, chunk.clone(), 0) {
+                Ok(_) => stored += chunk.len(),
+                Err(ServerError::RateLimited) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            stored <= MAX_UPLOAD_BYTES_PER_WINDOW,
+            "an account stored {stored} bytes against a {MAX_UPLOAD_BYTES_PER_WINDOW} cap"
+        );
+        assert!(stored > 0, "and the cap must not refuse the first upload either");
+    }
+
+    #[test]
+    fn a_normal_attachment_is_not_refused() {
+        // Counterfactual: a quota that refused everything would satisfy the test above while
+        // making attachments useless.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        assert!(inst.store_blob(alice.user, room, vec![7u8; 2 * 1024 * 1024], 0).is_ok());
+    }
+
+    #[test]
+    fn a_non_member_cannot_spend_a_members_upload_budget() {
+        // The budget is charged after the membership check, so an outsider cannot exhaust
+        // someone else's allowance by uploading into a room they are not in.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let outsider = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        for _ in 0..20 {
+            assert!(matches!(
+                inst.store_blob(outsider.user, room, vec![0u8; 8 * 1024 * 1024], 0),
+                Err(ServerError::NotAMember)
+            ));
+        }
+        // Alice's own budget is untouched by all of that.
+        assert!(inst.store_blob(alice.user, room, vec![1u8; 8 * 1024 * 1024], 0).is_ok());
+    }
+
+    #[test]
+    fn one_account_cannot_flood_a_room_without_bound() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        let mut sent = 0usize;
+        for _ in 0..(MAX_MESSAGES_PER_WINDOW + 50) {
+            let envelope =
+                alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+            match inst.accept(envelope, 0) {
+                Ok(_) => sent += 1,
+                Err(ServerError::RateLimited) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(sent, MAX_MESSAGES_PER_WINDOW, "flooding must be capped, not merely slowed");
+    }
+
+    #[test]
+    fn a_refused_message_does_not_leave_a_gap_in_the_franking_chain() {
+        // The send budget is charged before `next_seq` moves. If it were charged after, a
+        // refused message would still have consumed a sequence number, and a transcript
+        // report covering that room would show a hole its verifier could not explain.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        for _ in 0..MAX_MESSAGES_PER_WINDOW {
+            let envelope =
+                alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+            inst.accept(envelope, 0).unwrap();
+        }
+        let refused = alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+        assert!(matches!(inst.accept(refused, 0), Err(ServerError::RateLimited)));
+
+        // The window rolls over, and the next message continues the sequence rather than
+        // skipping the one that was refused.
+        let next = alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+        let stored = inst.accept(next, CLAIM_WINDOW_MS).unwrap();
+        assert_eq!(
+            stored.server_seq,
+            MAX_MESSAGES_PER_WINDOW as u64 + 1,
+            "a refused message must not consume a sequence number"
+        );
+    }
+
+    #[test]
+    fn the_upload_budget_returns_after_the_window() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        // Exhausted in `MAX_BLOB_BYTES` steps: a single upload of the whole window would be
+        // refused by the per-upload ceiling instead, and the test would pass without ever
+        // exercising the budget.
+        let chunk = vec![0u8; MAX_BLOB_BYTES];
+        for _ in 0..(MAX_UPLOAD_BYTES_PER_WINDOW / MAX_BLOB_BYTES) {
+            inst.store_blob(alice.user, room, chunk.clone(), 0).unwrap();
+        }
+        assert!(matches!(
+            inst.store_blob(alice.user, room, vec![1u8; 1024], 0),
+            Err(ServerError::RateLimited)
+        ));
+        assert!(
+            inst.store_blob(alice.user, room, vec![1u8; 1024], CLAIM_WINDOW_MS).is_ok(),
+            "the budget must recover, or one heavy hour bans an account forever"
+        );
+    }
+}
+
+#[cfg(test)]
+mod username_rules {
+    use super::tests::*;
+    use super::*;
+
+    fn name(s: &str) -> Username {
+        Username::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_handle_cannot_be_claimed_twice() {
+        // The impersonation this guards: if a handle could be re-registered, someone who
+        // remembers "@alice" reaches whoever holds it now, with no signal it changed hands.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+
+        inst.claim_username(alice.user, name("alice")).unwrap();
+        assert!(matches!(
+            inst.claim_username(mallory.user, name("alice")),
+            Err(ServerError::UsernameTaken)
+        ));
+        // And not by a different spelling of the same thing.
+        assert!(matches!(
+            inst.claim_username(mallory.user, name("ALICE")),
+            Err(ServerError::UsernameTaken)
+        ));
+    }
+
+    #[test]
+    fn an_unregistered_account_cannot_reserve_a_handle() {
+        // Registration is what costs an invite. A handle with no account behind it is
+        // squatting, and on an invite-only instance it would be free squatting.
+        let inst = Instance::in_memory();
+        assert!(matches!(
+            inst.claim_username(UserId::new(), name("ghost")),
+            Err(ServerError::NoSuchAccount)
+        ));
+    }
+
+    #[test]
+    fn one_account_gets_one_handle() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        inst.claim_username(alice.user, name("alice")).unwrap();
+        assert!(matches!(
+            inst.claim_username(alice.user, name("alice2")),
+            Err(ServerError::UsernameAlreadySet)
+        ));
+    }
+
+    #[test]
+    fn a_handle_resolves_to_its_account_and_nothing_else_does() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        inst.claim_username(alice.user, name("alice")).unwrap();
+
+        assert_eq!(inst.lookup_username(bob.user, &name("alice"), 0).unwrap(), alice.user);
+        // Case-insensitively, since Username normalises before it ever reaches the map.
+        assert_eq!(inst.lookup_username(bob.user, &name("Alice"), 0).unwrap(), alice.user);
+        assert!(matches!(
+            inst.lookup_username(bob.user, &name("alicia"), 0),
+            Err(ServerError::NoSuchUsername)
+        ));
+    }
+
+    #[test]
+    fn guessing_handles_is_bounded_even_though_listing_is_impossible() {
+        // Exact-match resolution stops an attacker *listing* accounts. It does not stop
+        // them *guessing*, and a dictionary of common handles is cheap — so without this
+        // ceiling the roster that withholding search protects is rebuilt anyway.
+        let inst = Instance::in_memory();
+        let attacker = TestSender::registered(&inst);
+
+        let mut answered = 0;
+        for i in 0..MAX_LOOKUPS_TOTAL * 2 {
+            match inst.lookup_username(attacker.user, &name(&format!("guess{i}")), 0) {
+                Err(ServerError::RateLimited) => break,
+                _ => answered += 1,
+            }
+        }
+        assert_eq!(answered, MAX_LOOKUPS_TOTAL, "guessing must be capped, not merely slowed");
+    }
+
+    #[test]
+    fn a_missed_guess_costs_the_same_as_a_hit() {
+        // A limiter that only counted successes would let an attacker probe for free, which
+        // is precisely the direction an attacker probes in.
+        let inst = Instance::in_memory();
+        let attacker = TestSender::registered(&inst);
+
+        for i in 0..MAX_LOOKUPS_TOTAL {
+            let _ = inst.lookup_username(attacker.user, &name(&format!("miss{i}")), 0);
+        }
+        assert!(matches!(
+            inst.lookup_username(attacker.user, &name("miss0"), 0),
+            Err(ServerError::RateLimited)
+        ));
+    }
+
+    #[test]
+    fn handles_survive_a_restart() {
+        let dir = temp_dir("usernames");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let user = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let alice = TestSender::registered(&inst);
+            inst.claim_username(alice.user, name("alice")).unwrap();
+            alice.user
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.username_of(user), Some(name("alice")));
+        // And it is still taken, which is what stops a restart handing it to someone else.
+        let mallory = TestSender::registered(&restarted);
+        assert!(matches!(
+            restarted.claim_username(mallory.user, name("alice")),
+            Err(ServerError::UsernameTaken)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A fresh invite token: 32 random bytes, hex.
+///
+/// Random rather than derived from the room, so a token discloses nothing about what it
+/// opens until it is redeemed, and so two invites to the same room are unlinkable to anyone
+/// holding both.
+fn mint_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Hash a token for storage and lookup.
+///
+/// The map is keyed by this, so the lookup itself is a hash comparison rather than a
+/// string comparison against a stored secret — there is no stored secret to compare
+/// against. Hashing is what makes a leaked database a list of hashes rather than a set of
+/// working invitations.
+fn hash_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Domain-separated, so a token hash can never collide with any other hash this project
+    // computes over user-supplied bytes.
+    hasher.update(b"cairn room invite v1\x00");
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod room_invites {
+    use super::tests::*;
+    use super::*;
+
+    fn room_with_owner(inst: &Instance) -> (RoomId, TestSender) {
+        let owner = TestSender::registered(inst);
+        let (room, _) = inst.create_room(public_shape(), owner.user).unwrap();
+        (room, owner)
+    }
+
+    #[test]
+    fn an_invite_admits_its_holder_and_then_is_spent() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+        assert_eq!(inst.redeem_room_invite(bob.user, &token, 0).unwrap(), room);
+        assert_eq!(inst.room_role(room, bob.user), Some(RoomRole::Member));
+
+        assert!(
+            matches!(
+                inst.redeem_room_invite(carol.user, &token, 0),
+                Err(ServerError::RoomInviteInvalid)
+            ),
+            "a single-use invite must not admit a second person"
+        );
+        assert_eq!(inst.room_role(room, carol.user), None);
+    }
+
+    #[test]
+    fn an_expired_invite_is_refused() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 5, Some(1_000)).unwrap();
+        assert!(inst.redeem_room_invite(bob.user, &token, 999).is_ok());
+
+        let carol = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.redeem_room_invite(carol.user, &token, 1_000),
+            Err(ServerError::RoomInviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn a_revoked_invite_stops_working_immediately() {
+        // The reason revocation exists: a link that has escaped is otherwise live until it
+        // is spent or expires, and neither may happen soon enough.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 10, None).unwrap();
+        inst.revoke_room_invite(owner.user, &token).unwrap();
+
+        assert!(matches!(
+            inst.redeem_room_invite(bob.user, &token, 0),
+            Err(ServerError::RoomInviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_member_cannot_mint_or_revoke_an_invite() {
+        // An invite is a deferred add, so it must need the same authority as adding someone
+        // directly. Otherwise the role check on `add_room_member` is bypassed by anyone
+        // willing to route around it.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, bob.user).unwrap();
+
+        assert!(matches!(
+            inst.create_room_invite(bob.user, room, 1, None),
+            Err(ServerError::InsufficientRole)
+        ));
+
+        let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+        assert!(matches!(
+            inst.revoke_room_invite(bob.user, &token),
+            Err(ServerError::InsufficientRole)
+        ));
+    }
+
+    #[test]
+    fn a_non_member_cannot_mint_an_invite_to_a_room() {
+        let inst = Instance::in_memory();
+        let (room, _owner) = room_with_owner(&inst);
+        let outsider = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.create_room_invite(outsider.user, room, 1, None),
+            Err(ServerError::NotAMember)
+        ));
+    }
+
+    #[test]
+    fn an_unlimited_invite_cannot_be_minted() {
+        // The tier rule, enforced rather than documented. An uncapped link is a public
+        // invite in all but name, and `may_mint_public_invite` forbids one for T1/T2
+        // because discoverability feeds `derive_tier` and the tier cannot change.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        assert!(matches!(
+            inst.create_room_invite(owner.user, room, u32::MAX, None),
+            Err(ServerError::InviteUsesTooHigh)
+        ));
+        assert!(matches!(
+            inst.create_room_invite(owner.user, room, 0, None),
+            Err(ServerError::InviteUsesTooHigh)
+        ));
+        assert!(inst.create_room_invite(owner.user, room, MAX_INVITE_USES, None).is_ok());
+    }
+
+    #[test]
+    fn redeeming_twice_as_the_same_person_does_not_burn_a_use() {
+        // A shared link that someone opens twice must not cost the group a slot.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 2, None).unwrap();
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+
+        assert!(
+            inst.redeem_room_invite(carol.user, &token, 0).is_ok(),
+            "the second use must still be available to someone new"
+        );
+    }
+
+    #[test]
+    fn an_invite_does_not_let_a_room_exceed_its_ceiling() {
+        // The ceiling is what `derive_tier` was computed from, so an invite that could
+        // exceed it would let a room outgrow the shape its tier was assigned for.
+        let inst = Instance::in_memory();
+        let owner = TestSender::registered(&inst);
+        let shape =
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 };
+        let (room, _) = inst.create_room(shape, owner.user).unwrap();
+
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+        let token = inst.create_room_invite(owner.user, room, 5, None).unwrap();
+
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+        assert!(matches!(
+            inst.redeem_room_invite(carol.user, &token, 0),
+            Err(ServerError::RoomFull)
+        ));
+    }
+
+    #[test]
+    fn the_token_is_not_stored_anywhere() {
+        // A database that held working invitations would turn any read access — an operator,
+        // a backup, an exfiltration — into admission to every private room with a live link.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+
+        let invites = inst.room_invites.lock().unwrap();
+        assert!(!invites.contains_key(&token), "the raw token must never be a key");
+        assert!(
+            invites.keys().all(|k| *k != token),
+            "the raw token must not appear in storage in any form"
+        );
+    }
+
+    #[test]
+    fn invites_survive_a_restart() {
+        let dir = temp_dir("roominvites");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let (room, token) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, owner) = room_with_owner(&inst);
+            let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+            (room, token)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        let bob = TestSender::registered(&restarted);
+        assert_eq!(restarted.redeem_room_invite(bob.user, &token, 0).unwrap(), room);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_spent_invite_stays_spent_across_a_restart() {
+        // The one that matters most: if a restart reset the counter, every link ever issued
+        // would silently become live again.
+        let dir = temp_dir("spentinvite");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let token = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, owner) = room_with_owner(&inst);
+            let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+            let bob = TestSender::registered(&inst);
+            inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+            token
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        let mallory = TestSender::registered(&restarted);
+        assert!(
+            matches!(
+                restarted.redeem_room_invite(mallory.user, &token, 0),
+                Err(ServerError::RoomInviteInvalid)
+            ),
+            "a restart must not resurrect a spent invite"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod add_after_invite {
+    use super::tests::*;
+    use super::*;
+
+    #[test]
+    fn adding_someone_who_joined_by_invite_is_not_room_full() {
+        // The regression this defends. After redeeming an invite the joiner is already a
+        // server-side member, so a DM at its ceiling of 2 is full — and the ceiling check
+        // ran first, so the member's own client could never complete the MLS add. Invites
+        // were useless for the case they exist for, and every unit test passed.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let shape =
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 };
+        let (room, _) = inst.create_room(shape, alice.user).unwrap();
+
+        let token = inst.create_room_invite(alice.user, room, 1, None).unwrap();
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+
+        assert!(
+            inst.add_room_member(room, alice.user, bob.user).is_ok(),
+            "re-adding an existing member of a full room must be a no-op, not RoomFull"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_still_refuses_a_genuinely_new_member() {
+        // The counterfactual: the fix must not turn the ceiling off.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+        let shape =
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 };
+        let (room, _) = inst.create_room(shape, alice.user).unwrap();
+
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+        assert!(matches!(
+            inst.add_room_member(room, alice.user, carol.user),
+            Err(ServerError::RoomFull)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod disappearing {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::{EnvelopePayload, Tier};
+
+    fn room_with_message(inst: &Instance, sent_at: i64) -> (RoomId, TestSender) {
+        let sender = TestSender::registered(inst);
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
+        let e = cairn_proto::Envelope::new(
+            Tier::PublicCommunity,
+            room,
+            sender.user,
+            sender.device,
+            sent_at,
+            EnvelopePayload::Plaintext { body: "ephemeral".into() },
+        )
+        .unwrap();
+        let signature = sender.session.sign(&e.signing_bytes()).unwrap();
+        inst.accept(e.with_signature(hex::encode(signature)), 0).unwrap();
+        (room, sender)
+    }
+
+    #[test]
+    fn an_expired_message_leaves_storage_rather_than_being_hidden() {
+        // The property the whole feature rests on. Filtering on read would make the client
+        // *look* right while the instance still held everything — and what the instance can
+        // hand over is the entire point.
+        let inst = Instance::in_memory();
+        let (room, sender) = room_with_message(&inst, 0);
+        inst.set_room_ttl(room, sender.user, Some(1_000)).unwrap();
+
+        // Before expiry it is there.
+        assert_eq!(inst.messages_since(room, sender.user, 0, 500).unwrap().len(), 1);
+
+        // After expiry, gone from the caller's view...
+        assert!(inst.messages_since(room, sender.user, 0, 1_001).unwrap().is_empty());
+        // ...and gone from storage, which is the part that matters.
+        assert!(
+            inst.storage.messages_since(room, 0).unwrap().is_empty(),
+            "an expired message must be deleted, not filtered"
+        );
+    }
+
+    #[test]
+    fn a_room_without_a_timer_keeps_everything() {
+        // The counterfactual: without it, a purge bug that deleted unconditionally would
+        // still pass the test above.
+        let inst = Instance::in_memory();
+        let (room, sender) = room_with_message(&inst, 0);
+        assert_eq!(
+            inst.messages_since(room, sender.user, 0, 10_000_000).unwrap().len(),
+            1,
+            "no timer means no expiry"
+        );
+    }
+
+    #[test]
+    fn the_timer_applies_to_future_messages_not_past_expectations() {
+        // Setting a timer must not retroactively shorten the life of messages people
+        // already sent — but it does apply to everything in the room from then on, which is
+        // what users of every other product expect. The line being drawn is that turning it
+        // *on* is a room-wide decision, not that old messages are exempt forever.
+        let inst = Instance::in_memory();
+        let (room, sender) = room_with_message(&inst, 0);
+        inst.set_room_ttl(room, sender.user, Some(1_000)).unwrap();
+        assert!(inst.messages_since(room, sender.user, 0, 2_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn any_member_may_set_it_but_a_stranger_may_not() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_message(&inst, 0);
+        let bob = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, bob.user).unwrap();
+
+        assert!(inst.set_room_ttl(room, bob.user, Some(5_000)).is_ok(), "a member may set it");
+        assert_eq!(inst.room_ttl(room), Some(5_000));
+
+        let outsider = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.set_room_ttl(room, outsider.user, Some(1)),
+            Err(ServerError::NotAMember)
+        ));
+    }
+
+    #[test]
+    fn a_nonsense_timer_is_refused() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_message(&inst, 0);
+        assert!(matches!(inst.set_room_ttl(room, owner.user, Some(0)), Err(ServerError::BadTtl)));
+        assert!(matches!(inst.set_room_ttl(room, owner.user, Some(-1)), Err(ServerError::BadTtl)));
+        assert!(inst.set_room_ttl(room, owner.user, None).is_ok(), "clearing must be allowed");
+    }
+
+    #[test]
+    fn a_timer_survives_a_restart() {
+        // Otherwise a restart quietly turns disappearing messages off, and nobody is told.
+        let dir = temp_dir("ttl");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let room = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, owner) = room_with_message(&inst, 0);
+            inst.set_room_ttl(room, owner.user, Some(60_000)).unwrap();
+            room
+        };
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.room_ttl(room), Some(60_000));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

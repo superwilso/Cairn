@@ -78,6 +78,27 @@ struct CreateRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct RoomMemberEntryResponse {
+    user: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct MintedInviteResponse {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct RedeemedInviteResponse {
+    room: String,
+}
+
+#[derive(Deserialize)]
+struct ResolvedUserResponse {
+    user: String,
+}
+
+#[derive(Deserialize)]
 struct UploadedBlobResponse {
     blob: String,
 }
@@ -87,6 +108,8 @@ struct CreatedRoomResponse {
     room: RoomId,
     tier: String,
     e2ee: bool,
+    #[serde(default)]
+    ttl_ms: Option<i64>,
 }
 
 /// A room this client just created.
@@ -214,6 +237,109 @@ impl<T: Transport> Client<T> {
         body: Option<crate::transport::RequestBody<'_>>,
     ) -> Result<Response, ClientError> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
+    }
+
+    /// The room's disappearing-message timer, as the instance holds it.
+    ///
+    /// A client applies the same value to its own stored transcript, so a message the
+    /// server has dropped does not live on in local history — the timer would otherwise be
+    /// true of the instance and false of the one device its user actually controls.
+    pub fn room_ttl(&self, room: RoomId) -> Result<Option<i64>, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/rooms/{}", room.as_uuid()),
+            &self.auth("describe", Some(room.into()))?,
+            None,
+        )?;
+        let parsed: CreatedRoomResponse = serde_json::from_slice(&response.body)?;
+        Ok(parsed.ttl_ms)
+    }
+
+    /// Set or clear the room's disappearing-message timer. Any member may.
+    pub fn set_room_ttl(&self, room: RoomId, ttl_ms: Option<i64>) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "ttl_ms": ttl_ms }).to_string();
+        self.call(
+            "POST",
+            &format!("/v1/rooms/{}/ttl", room.as_uuid()),
+            &self.auth("set_room_ttl", Some(room.into()))?,
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
+    /// The room's server-side membership.
+    ///
+    /// **Not the MLS roster.** The two diverge whenever someone joins by invite: the server
+    /// admits them at once, and the encrypted group gains them only when a member commits an
+    /// Add. A caller that conflated the two would show a user as present in a conversation
+    /// they cannot actually read.
+    pub fn room_members(&self, room: RoomId) -> Result<Vec<(UserId, String)>, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/rooms/{}/members", room.as_uuid()),
+            &self.auth("list_room_members", Some(room.into()))?,
+            None,
+        )?;
+        let parsed: Vec<RoomMemberEntryResponse> = serde_json::from_slice(&response.body)?;
+        parsed
+            .into_iter()
+            .map(|m| {
+                m.user.parse().map(|u| (u, m.role)).map_err(|_| ClientError::Malformed("user id"))
+            })
+            .collect()
+    }
+
+    /// Mint an invite for a room. The token comes back once and is not recoverable.
+    pub fn create_room_invite(
+        &self,
+        room: RoomId,
+        uses: u32,
+        expires_at_ms: Option<i64>,
+    ) -> Result<String, ClientError> {
+        let body = serde_json::json!({ "uses": uses, "expires_at_ms": expires_at_ms }).to_string();
+        let response = self.call(
+            "POST",
+            &format!("/v1/rooms/{}/invites", room.as_uuid()),
+            &self.auth("create_room_invite", Some(room.into()))?,
+            Some(&body),
+        )?;
+        let parsed: MintedInviteResponse = serde_json::from_slice(&response.body)?;
+        Ok(parsed.token)
+    }
+
+    /// Redeem an invite, joining this account to the room it names.
+    pub fn redeem_room_invite(&self, token: &str) -> Result<RoomId, ClientError> {
+        let body = serde_json::json!({ "token": token }).to_string();
+        let response = self.call(
+            "POST",
+            "/v1/invites/redeem",
+            &self.auth("redeem_room_invite", None)?,
+            Some(&body),
+        )?;
+        let parsed: RedeemedInviteResponse = serde_json::from_slice(&response.body)?;
+        parsed.room.parse().map_err(|_| ClientError::Malformed("room id"))
+    }
+
+    /// Claim a handle for this account. One per account, and not reassignable.
+    pub fn claim_username(&self, name: &cairn_proto::Username) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "username": name.as_str() }).to_string();
+        self.call("POST", "/v1/usernames", &self.auth("claim_username", None)?, Some(&body))?;
+        Ok(())
+    }
+
+    /// Resolve a handle to an account id.
+    ///
+    /// Exact match: the instance offers no search, so a typo is a miss rather than a list of
+    /// near-matches. That is the point — see `docs/10-roadmap.md`.
+    pub fn lookup_username(&self, name: &cairn_proto::Username) -> Result<UserId, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/usernames/{}", name.as_str()),
+            &self.auth("lookup_username", None)?,
+            None,
+        )?;
+        let parsed: ResolvedUserResponse = serde_json::from_slice(&response.body)?;
+        parsed.user.parse().map_err(|_| ClientError::Malformed("user id"))
     }
 
     /// Upload an already-sealed attachment to a room, returning the id to reference it by.

@@ -37,6 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cairn_client_core::client::{Client, CreatedRoom};
 use cairn_client_core::embed::{self, Card};
+use cairn_client_core::history::{Entry as HistoryEntry, History};
 use cairn_client_core::transport::HttpTransport;
 use cairn_client_core::{
     accept_welcome, ContactStore, Conversation, ConversationIndex, TimelineEvent,
@@ -96,11 +97,14 @@ struct App {
     session: Arc<Session>,
     index: ConversationIndex,
     contacts: ContactStore,
+    history: History,
     /// The open conversation, if any. One at a time keeps the prompt honest: a badge can
     /// only describe the room it is next to.
     open: Option<Open>,
     identity: Vec<u8>,
     tls: bool,
+    /// Where this client keeps its state; attachments land under it.
+    dir: std::path::PathBuf,
 }
 
 struct Open {
@@ -127,9 +131,11 @@ pub fn run(options: Options) -> Fallible<()> {
         session,
         index: ConversationIndex::open(&options.dir)?,
         contacts: ContactStore::open(&options.dir)?,
+        history: History::open(&options.dir)?,
         open: None,
         identity,
         tls,
+        dir: options.dir.clone(),
     };
 
     // Claim exactly once, ever, and record it locally.
@@ -230,11 +236,19 @@ fn mark_claimed(dir: &std::path::Path, user: UserId, device: DeviceId) -> Fallib
 
 fn help() {
     println!("Commands:");
-    println!("  /dm <user-id>        start a direct message with someone");
+    println!("  /dm <@name|user-id>  start a direct message with someone");
     println!("  /new                 create an empty direct (T1) room");
     println!("  /rooms               list rooms this device knows");
     println!("  /open <room-id>      open a room already joined");
-    println!("  /add <user-id>       add someone to the open room");
+    println!(
+        "  /add <@name|user-id> add someone to the open room
+  /username <name>     claim your handle, so people can find you without a uuid
+  /roster              server-side membership (who joined by invite, awaiting /add)
+  /ttl <secs|off>      make messages in this room disappear after a while
+  /send <path>         send a file, encrypted on this device before upload
+  /invite [uses] [hrs] mint an invite link for the open room (default 1 use, 24h)
+  /join <token>        redeem an invite"
+    );
     println!("  /members             who is in the open room, and their verification state");
     println!("  /safety              safety numbers to compare out of band");
     println!("  /verify <n>          mark member n verified, having compared in person");
@@ -296,16 +310,218 @@ impl App {
                 println!("  published {count}; the instance now holds {remaining} for you");
             }
             "/new" => self.new_room()?,
-            "/dm" => self.direct_message(rest.parse()?)?,
+            "/dm" => {
+                let user = self.resolve(rest)?;
+                self.direct_message(user)?
+            }
             "/rooms" => self.list_rooms(),
             "/open" => self.open_room(rest.parse()?)?,
-            "/add" => self.add_member(rest.parse()?)?,
+            "/add" => {
+                let user = self.resolve(rest)?;
+                self.add_member(user)?
+            }
+            "/username" => self.claim_username(rest)?,
+            "/roster" => self.show_roster()?,
+            "/ttl" => self.set_ttl(rest)?,
+            "/send" => self.send_file(rest)?,
+            "/invite" => self.create_invite(rest)?,
+            "/join" => self.join_by_invite(rest)?,
             "/members" => self.list_members(),
             "/safety" => self.show_safety_numbers(),
             "/verify" => self.verify(rest.parse()?)?,
             other => println!("  ! unknown command {other}"),
         }
         Ok(false)
+    }
+
+    /// Accept either a raw user id or an `@handle`, so a person can be named the way they
+    /// actually gave their details out.
+    ///
+    /// A handle is resolved against the instance, which means the instance decides who
+    /// `@alice` is. That is not a new trust: it already holds every account and could
+    /// substitute a key just as easily. It *is* a reason the safety-number check matters
+    /// more once handles exist, because a handle is easier to mistype than a uuid and the
+    /// user has less to compare against — so this prints what it resolved to.
+    fn resolve(&self, input: &str) -> Fallible<cairn_proto::UserId> {
+        let input = input.trim();
+        if !input.starts_with('@') && input.starts_with("usr_") {
+            return Ok(input.parse()?);
+        }
+        let name = cairn_proto::Username::parse(input)?;
+        let user = self.client.lookup_username(&name)?;
+        println!("  {name} is {user}");
+        Ok(user)
+    }
+
+    /// Remember a message this device sent.
+    ///
+    /// MLS will not decrypt our own application messages back to us, so without this the
+    /// stored transcript is half a conversation — every reply and none of the prompts.
+    fn remember_own(
+        &self,
+        room: cairn_proto::RoomId,
+        envelope: &cairn_proto::Envelope,
+        body: &[u8],
+        attachment_name: Option<String>,
+    ) {
+        let _ = self.history.append(
+            room,
+            &HistoryEntry {
+                sender: envelope.sender,
+                sent_at_ms: envelope.sent_at_ms,
+                body: body.to_vec(),
+                attachment_name,
+            },
+        );
+    }
+
+    /// Print what this device remembers of a room, before any new messages arrive.
+    ///
+    /// Failure here is reported and then ignored. A transcript that cannot be read is worth
+    /// saying out loud — it may be corruption — but it must not stop someone opening a room
+    /// they can still use.
+    fn replay_history(&self, room: cairn_proto::RoomId) {
+        // The room's own timer governs the local copy too, so a disappearing message is not
+        // quietly immortal on the one device its user controls.
+        let ttl = self.client.room_ttl(room).unwrap_or(None);
+        match self.history.replay(room, ttl, now_ms()) {
+            Ok(entries) if entries.is_empty() => {}
+            Ok(entries) => {
+                println!("  --- {} remembered message(s) ---", entries.len());
+                for entry in entries {
+                    let body = String::from_utf8_lossy(&entry.body);
+                    match entry.attachment_name {
+                        Some(name) => println!(
+                            "  [old] {}: {body} (attachment {name:?})",
+                            short(&entry.sender.as_uuid().to_string())
+                        ),
+                        None => println!(
+                            "  [old] {}: {body}",
+                            short(&entry.sender.as_uuid().to_string())
+                        ),
+                    }
+                }
+                println!("  --- end of history ---");
+            }
+            Err(e) => println!("  ! stored history could not be read: {e}"),
+        }
+    }
+
+    /// Set the room's disappearing-message timer. `/ttl 60` for a minute, `/ttl off`.
+    fn set_ttl(&self, rest: &str) -> Fallible<()> {
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let rest = rest.trim();
+        let ttl = if rest.is_empty() || rest == "off" {
+            None
+        } else {
+            Some(rest.parse::<i64>().map_err(|_| "usage: /ttl <seconds|off>")? * 1_000)
+        };
+        self.client.set_room_ttl(room, ttl)?;
+        match ttl {
+            Some(ms) => {
+                println!("  messages in this room now disappear {}s after being sent", ms / 1_000);
+                println!("  the timer runs from send, not from when anyone reads it");
+            }
+            None => println!("  disappearing messages are off for this room"),
+        }
+        Ok(())
+    }
+
+    /// Send a file. Sealed on this device; the instance stores bytes it cannot read.
+    fn send_file(&mut self, rest: &str) -> Fallible<()> {
+        let path = std::path::Path::new(rest.trim());
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".into());
+
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let (key, sealed) = cairn_crypto::attachment::seal(&bytes);
+        let blob = self.client.upload_attachment(room, &sealed)?;
+
+        let attachment = cairn_client_core::conversation::Attachment {
+            blob,
+            key,
+            name: name.clone(),
+            size: bytes.len(),
+        };
+
+        let open = self.open.as_mut().expect("checked above");
+        let out = open.convo.send_with_attachment(name.as_bytes(), attachment, now_ms())?;
+        self.client.send(room, &out.envelope)?;
+        self.remember_own(room, &out.envelope, name.as_bytes(), Some(name.clone()));
+        println!("  sent {name} ({} bytes, encrypted before upload)", bytes.len());
+        Ok(())
+    }
+
+    /// The room's **server-side** membership, which is not the MLS roster.
+    ///
+    /// The two diverge the moment someone joins by invite: the server admits them, and the
+    /// encrypted group does not have them until a member runs `/add`. Listing them
+    /// separately is the honest presentation — `/members` shows who can actually read the
+    /// conversation, this shows who the instance will deliver to. Anyone here but not there
+    /// is waiting to be let into the group.
+    fn show_roster(&self) -> Fallible<()> {
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let members = self.client.room_members(room)?;
+        println!("  server-side membership of {room}:");
+        for (user, role) in &members {
+            println!("    {user} ({role})");
+        }
+        println!("  /members shows who is in the encrypted group — anyone listed here but");
+        println!("  not there joined by invite and still needs /add <user-id>");
+        Ok(())
+    }
+
+    /// Mint an invite for the open room. `/invite [uses] [hours]`, defaulting to one use
+    /// and a day — the terms that make a leaked link least useful.
+    fn create_invite(&self, rest: &str) -> Fallible<()> {
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let mut parts = rest.split_whitespace();
+        let uses: u32 = parts.next().unwrap_or("1").parse().unwrap_or(1);
+        let hours: i64 = parts.next().unwrap_or("24").parse().unwrap_or(24);
+
+        let expires = if hours > 0 { Some(now_ms() + hours * 3_600_000) } else { None };
+
+        let token = self.client.create_room_invite(room, uses, expires)?;
+        println!("  invite for {room}:");
+        println!("    {token}");
+        if hours > 0 {
+            println!(
+                "  admits {uses}, expires in {hours}h. Shown once — the server keeps only a hash."
+            );
+        } else {
+            println!("  admits {uses}, never expires. Shown once — the server keeps only a hash.");
+        }
+        println!("  they run: /join <token>");
+        Ok(())
+    }
+
+    /// Redeem an invite.
+    ///
+    /// Prints what redemption does *not* do, which matters more here than the success
+    /// message. Joining the room server-side is not the same as being in its MLS group: the
+    /// group's keys are held by its members, not the instance, so nobody can hand them out
+    /// on the strength of a token. Until an existing member commits an Add, the room is
+    /// visible and unreadable — and a client that implied otherwise would be claiming a
+    /// protection had already been extended when it had not.
+    fn join_by_invite(&self, rest: &str) -> Fallible<()> {
+        let room = self.client.redeem_room_invite(rest.trim())?;
+        println!("  joined {room}");
+        println!("  publish key packages with /keys 5 if you have not — a member must still");
+        println!("  add you to the encrypted group before you can read anything");
+        Ok(())
+    }
+
+    /// Claim a handle for this account.
+    fn claim_username(&self, input: &str) -> Fallible<()> {
+        let name = cairn_proto::Username::parse(input)?;
+        self.client.claim_username(&name)?;
+        println!("  you are now {name}");
+        println!("  it cannot be changed or released — tell people this, not your user id");
+        Ok(())
     }
 
     /// Start a DM: create the room and add the other person, in one step.
@@ -413,6 +629,7 @@ impl App {
         };
 
         println!("  opened {room} at tier {}", seal.tier().label());
+        self.replay_history(room);
         let cursor = self.index.cursor(&room);
         self.open = Some(Open { convo, seal, cursor });
         Ok(())
@@ -557,9 +774,11 @@ impl App {
         }
 
         let sent = open.convo.send_with_card(text.as_bytes(), card, now_ms())?;
-        let receipt = self.client.send(open.convo.room(), &sent.envelope)?;
+        let room = open.convo.room();
+        let receipt = self.client.send(room, &sent.envelope)?;
         open.cursor = open.cursor.max(receipt.server_seq);
-        self.index.advance(open.convo.room(), receipt.server_seq)?;
+        self.index.advance(room, receipt.server_seq)?;
+        self.remember_own(room, &sent.envelope, text.as_bytes(), None);
         Ok(())
     }
 
@@ -626,6 +845,27 @@ impl App {
                     );
                     if let Some(card) = &received.card {
                         print_card(card);
+                    }
+                    // Remembered before the attachment is fetched, so a failed download
+                    // does not also lose the message it arrived with.
+                    let _ = self.history.append(
+                        message.envelope.room,
+                        &HistoryEntry {
+                            sender: message.envelope.sender,
+                            sent_at_ms: message.envelope.sent_at_ms,
+                            body: received.body.clone(),
+                            attachment_name: received.attachment.as_ref().map(|a| a.name.clone()),
+                        },
+                    );
+                    if let Some(attachment) = &received.attachment {
+                        // Fetched and opened here rather than announced and left: the key
+                        // arrived inside this message and nothing else can open the blob, so
+                        // deferring would mean holding a decryption key for a file the user
+                        // may never ask for.
+                        match fetch_attachment(&self.client, &self.dir, attachment) {
+                            Ok(path) => println!("    attachment saved to {}", path.display()),
+                            Err(e) => println!("    ! attachment could not be fetched: {e}"),
+                        }
                     }
                 }
                 Ok(TimelineEvent::Membership { added, removed, committer }) => {
@@ -723,4 +963,30 @@ fn print_card(card: &Card) {
         println!("      │ ! {caveat}");
     }
     println!("      └─");
+}
+
+/// Download an attachment, open it, and write it under the client's directory.
+///
+/// The sender's filename is not used as a path. It is a label chosen by whoever sent the
+/// message, so treating it as a location is a directory traversal waiting to happen — the
+/// file lands under the blob id, and the claimed name is only printed.
+fn fetch_attachment(
+    client: &Client<HttpTransport>,
+    dir: &std::path::Path,
+    attachment: &cairn_client_core::conversation::Attachment,
+) -> Fallible<std::path::PathBuf> {
+    let sealed = client.download_attachment(attachment.blob)?;
+    let plaintext = cairn_crypto::attachment::open(&attachment.key, &sealed)?;
+
+    let downloads = dir.join("attachments");
+    std::fs::create_dir_all(&downloads)?;
+    let path = downloads.join(attachment.blob.as_uuid().to_string());
+    std::fs::write(&path, &plaintext)?;
+    println!(
+        "    {} ({} bytes, sender calls it {:?})",
+        attachment.blob,
+        plaintext.len(),
+        attachment.name
+    );
+    Ok(path)
 }
