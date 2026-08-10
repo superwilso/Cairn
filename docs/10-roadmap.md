@@ -76,6 +76,19 @@ needs a room id pasted to them out of band and must be added by user id, so "joi
 invite, without being told what to type" is not yet true. That belongs with M3's invite
 work, which the same exit condition depends on.
 
+### Decided, unimplemented
+
+Four calls made by the owner, so a session does not re-litigate them:
+
+- **Server storage → `redb`** ([ADR-007](adr/007-server-storage.md)). This is the next
+  item; it unblocks attachments, which unblock images in link previews and Instagram media.
+- **Attachment liability → sender responsible**, instance offers a removal path
+  (`05-embeds.md` §4).
+- **Client state at rest → platform keystores**, with the native clients. Blocks linked
+  social accounts until it lands (`11-self-hosting.md`).
+- **Room invites → single-use capability tokens**, which are not the public invite
+  `may_mint_public_invite` forbids. Design and probes recorded under M3 below.
+
 ## M3 — Friends test
 
 **Goal:** the owner runs an instance and a handful of people use it for real.

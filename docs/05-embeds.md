@@ -117,6 +117,29 @@ no embed at all, because users calibrate to the card.
 
 ### 4. Takedowns and liability
 
+**Decided (owner): the sender is responsible, and the instance offers a removal path.**
+
+The sender chose to re-host someone else's media, so the obligation follows the choice. The
+instance operator provides a documented way to have stored media removed on request, and
+nothing more — a self-hoster running Cairn for six friends must not inherit a moderation
+duty they cannot discharge.
+
+This is also the only option consistent with the rule that the flagship instance gets no
+protocol privileges a self-hosted one cannot have: an operator-responsibility model would
+oblige every self-hoster to run moderation, which in practice means only the flagship could.
+
+What it requires, and none of it exists yet:
+
+- A removal endpoint, and an operator-facing way to act on a request.
+- A written policy, in the repository, saying who to contact and what happens.
+- Retention rules — how long removed media is actually gone for.
+
+Note the limit honestly: in **T1 and T2 the server holds ciphertext it cannot read**, so
+"remove this image" means removing bytes identified from outside, not content the operator
+can find by looking. A takedown story that assumes the operator can search is a story for
+T3 only.
+
+
 The sender re-uploads someone else's media into the encrypted envelope. That is a copy, and
 copies attract takedown requests.
 

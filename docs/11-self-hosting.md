@@ -141,7 +141,12 @@ Honest list. Each of these is real and none is hypothetical.
   restart does not replay them — it cannot, because MLS discards each message key after
   use.
 - **Polling, not push.** The client fetches when you press enter.
-- **Client state is written unencrypted**, `0600` on Unix. Anyone with read access to the
+- **Client state is written unencrypted**, `0600` on Unix. **Decided (owner): platform
+  keystores** — Keychain, Android Keystore, DPAPI, libsecret — behind an FFI seam, landing
+  with the native clients. A passphrase-derived key was considered and rejected as a
+  stopgap: it prompts on every launch and protects nothing while the client runs. Until
+  keystores exist, **no linked social accounts**, because a session cookie is a credential
+  and this is where it would sit. Anyone with read access to the
   account's home directory has the group keys. This is consistent with
   `docs/01-threat-model.md` §3.4, which does not claim to defend a compromised device — but
   it is weaker than a platform keystore, which is what a finished client would use.
