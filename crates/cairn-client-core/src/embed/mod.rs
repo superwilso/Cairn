@@ -29,6 +29,8 @@
 //! per-message full-state rewrite to be fixed first. Text cards are a few hundred bytes and
 //! do not move that; thumbnails would. Images land with attachments (M6).
 
+pub mod instagram;
+
 use serde::{Deserialize, Serialize};
 
 /// A link preview, as assembled by the sender's device.
@@ -339,6 +341,58 @@ mod fetch {
         fetch_and_parse(url)
     }
 
+    /// Unfurl, falling back to a configured proxy for links the site itself will not serve.
+    ///
+    /// Only Instagram today, and only because Instagram shows a login wall to anonymous
+    /// visitors — the ordinary path returns a card with nothing in it. Everything else takes
+    /// the direct path unchanged.
+    ///
+    /// The proxy is tried **only after** the direct fetch has failed to produce anything
+    /// useful, so a link that works without one never reaches a third party. Order matters
+    /// here in a way it does not for an ordinary fallback: each attempt is a URL disclosed to
+    /// somebody.
+    ///
+    /// A card built this way carries [`CardSource::Proxy`], whose `caveat()` a client must
+    /// display. Returning a proxy-built card marked `Public` would be the specific lie
+    /// `docs/05-embeds.md` forbids.
+    pub fn unfurl_with_proxy(
+        url: &str,
+        policy: &super::instagram::ProxyPolicy,
+    ) -> Result<Card, UnfurlError> {
+        let direct = unfurl(url);
+        if let Ok(card) = &direct {
+            if card.is_useful() {
+                return direct;
+            }
+        }
+
+        // Not an Instagram post, or proxying is off: keep whatever the direct path said,
+        // including its error. Falling through to a proxy for arbitrary URLs would send
+        // links to a third party that the user never opted into sharing.
+        let Some(link) = super::instagram::parse(url) else { return direct };
+        if !policy.is_enabled() {
+            return direct;
+        }
+
+        for candidate in super::instagram::proxy_urls(&link, policy) {
+            if is_fetchable(&candidate).is_err() {
+                continue;
+            }
+            if let Ok(mut card) = fetch_and_parse(&candidate) {
+                if card.is_useful() {
+                    // The card describes the *original* link, not the proxy's URL. A
+                    // recipient evaluating where a message points must see where it really
+                    // points — the proxy is an implementation detail of how the preview was
+                    // obtained, and `source` is where that is disclosed.
+                    card.url = url.to_string();
+                    card.source = CardSource::Proxy;
+                    return Ok(card);
+                }
+            }
+        }
+        direct
+    }
+
     /// The transport half, with the address policy already applied.
     ///
     /// Split out so tests can drive the HTTP and parsing path against a loopback server,
@@ -382,7 +436,7 @@ mod fetch {
 }
 
 #[cfg(feature = "http")]
-pub use fetch::unfurl;
+pub use fetch::{unfurl, unfurl_with_proxy};
 
 #[cfg(test)]
 mod tests {
@@ -441,6 +495,46 @@ mod tests {
         };
         assert_eq!(card.claimed_source(), Some("Reuters"));
         assert_eq!(card.url, "https://evil.test/x", "the real URL stays inspectable");
+    }
+
+    #[test]
+    fn a_proxy_is_never_reached_for_a_link_that_is_not_instagram() {
+        // The rule that keeps this feature honest: a configured proxy exists for Instagram,
+        // not as a general fallback. Falling through for arbitrary URLs would send links to
+        // a third party that the user opted into sharing with nobody.
+        //
+        // Asserted at the level that decides it — `instagram::parse` returning `None` is
+        // what makes `unfurl_with_proxy` return the direct result untouched.
+        let policy = instagram::ProxyPolicy::with_hosts(["kkinstagram.com"]);
+        assert!(policy.is_enabled());
+        for other in [
+            "https://example.com/article",
+            "https://twitter.com/someone/status/1",
+            "https://instagram.com/someone/",
+        ] {
+            assert!(
+                instagram::parse(other).is_none(),
+                "{other} must not route through the Instagram proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proxied_card_describes_the_original_link_and_says_it_was_proxied() {
+        // Two properties a recipient depends on. The URL must be the one the sender actually
+        // shared — a card pointing at `kkinstagram.com` would misrepresent where the message
+        // leads — and the source must say a third party was involved, since `caveat()` is
+        // what a client displays.
+        let mut card = parse_metadata(
+            r#"<html><head><meta property="og:title" content="a post"></head></html>"#,
+            "https://kkinstagram.com/p/abc123",
+        );
+        card.url = "https://instagram.com/p/abc123/".to_string();
+        card.source = CardSource::Proxy;
+
+        assert_eq!(card.url, "https://instagram.com/p/abc123/");
+        assert!(!card.url.contains("kkinstagram"), "the proxy must not appear as the link");
+        assert!(card.source.caveat().is_some(), "a proxied card must carry its caveat");
     }
 
     #[test]
