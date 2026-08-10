@@ -96,6 +96,10 @@ pub enum ServerError {
     NoSuchUsername,
     #[error("not a usable username: {0}")]
     BadUsername(String),
+    #[error("this invite is unknown, spent, expired, or revoked")]
+    RoomInviteInvalid,
+    #[error("an invite may admit at most {MAX_INVITE_USES} people; an unlimited one would be a public invite")]
+    InviteUsesTooHigh,
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -128,6 +132,17 @@ pub const MAX_CLAIMS_PER_TARGET: usize = 3;
 /// ids, and user ids are on every message. This is the ceiling that makes enumeration cost
 /// something.
 pub const MAX_CLAIMS_TOTAL: usize = 30;
+
+/// The most people a single room invite may admit.
+///
+/// A ceiling rather than a preference, and the reason is the tier model rather than
+/// tidiness. `RoomSeal::may_mint_public_invite` forbids a *public* invite to a T1 or T2 room
+/// because discoverability is an input to `derive_tier` — a published invite would mean the
+/// room should have been T3, and the tier cannot change (ADR-001). A capability spent on
+/// redemption does not make a room discoverable, so a capped link is fine. An **uncapped**
+/// one is a public invite wearing a different name, which is why there is no "unlimited"
+/// option here and must never be one.
+pub const MAX_INVITE_USES: u32 = 100;
 
 /// How many username lookups one account may make per window.
 ///
@@ -238,6 +253,24 @@ pub struct StoredMessage {
     pub server_seq: u64,
     /// Present when the message carried a franking commitment.
     pub franking_tag: Option<Tag>,
+}
+
+/// A room invite, stored under the **hash** of its token.
+///
+/// The token itself is never stored. An operator reading the database, or an attacker who
+/// exfiltrates it, finds hashes rather than a set of working invitations — the same reason
+/// passwords are not stored in the clear, applied to a credential that admits someone to a
+/// private room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomInviteRecord {
+    pub room: RoomId,
+    pub created_by: UserId,
+    /// Counts down. Retained at zero rather than deleted, so a replayed invite is
+    /// distinguishable from one that never existed — an operator debugging "my friend says
+    /// the link does not work" needs to tell those apart.
+    pub uses_remaining: u32,
+    pub expires_at_ms: Option<i64>,
+    pub revoked: bool,
 }
 
 /// An attachment the server holds, minus its bytes.
@@ -361,6 +394,8 @@ pub struct Instance {
     /// Handle → account, both directions needed: one to resolve, one to refuse a second
     /// handle for an account that already has one.
     usernames: Mutex<HashMap<Username, UserId>>,
+    /// Keyed by token hash; see [`RoomInviteRecord`].
+    room_invites: Mutex<HashMap<String, RoomInviteRecord>>,
     /// Bounds username *guessing*, which exact-match resolution does not. Not persisted,
     /// for the same reason as [`ClaimLimiter`].
     lookup_limiter: Mutex<HashMap<UserId, VecDeque<i64>>>,
@@ -395,6 +430,7 @@ impl Instance {
             registration_policy: Mutex::new(directory.registration_policy),
             claim_limiter: Mutex::new(ClaimLimiter::default()),
             usernames: Mutex::new(directory.usernames.into_iter().collect()),
+            room_invites: Mutex::new(directory.room_invites.into_iter().collect()),
             lookup_limiter: Mutex::new(HashMap::new()),
             franking_key,
             storage,
@@ -925,6 +961,121 @@ impl Instance {
         }
 
         self.storage.blob_bytes(id)?.ok_or(ServerError::NoSuchBlob)
+    }
+
+    /// Mint a room invite. The creator chooses how many people it admits and for how long.
+    ///
+    /// Returns the token **once**. It is stored only as a hash, so an instance that loses
+    /// this value cannot recover it — which is the point.
+    pub fn create_room_invite(
+        &self,
+        actor: UserId,
+        room: RoomId,
+        uses: u32,
+        expires_at_ms: Option<i64>,
+    ) -> Result<String, ServerError> {
+        if uses == 0 || uses > MAX_INVITE_USES {
+            return Err(ServerError::InviteUsesTooHigh);
+        }
+
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            // Same authority as adding someone directly. An invite is a deferred add, so a
+            // member who cannot admit people must not be able to mint one that does it later.
+            if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Moderator {
+                return Err(ServerError::InsufficientRole);
+            }
+        }
+
+        let token = mint_token();
+        let record = RoomInviteRecord {
+            room,
+            created_by: actor,
+            uses_remaining: uses,
+            expires_at_ms,
+            revoked: false,
+        };
+        let hash = hash_token(&token);
+        self.room_invites
+            .lock()
+            .expect("room invites mutex poisoned")
+            .insert(hash.clone(), record.clone());
+        self.write(&[Write::RoomInvite(hash, record)])?;
+        Ok(token)
+    }
+
+    /// Redeem an invite, joining the acting account to its room.
+    ///
+    /// Every reason for refusal collapses into one error deliberately: telling a caller
+    /// *why* a token failed tells an attacker probing tokens whether they found a real one
+    /// that was merely spent.
+    pub fn redeem_room_invite(
+        &self,
+        actor: UserId,
+        token: &str,
+        now_ms: i64,
+    ) -> Result<RoomId, ServerError> {
+        let hash = hash_token(token);
+        let mut invites = self.room_invites.lock().expect("room invites mutex poisoned");
+        let record = invites.get_mut(&hash).ok_or(ServerError::RoomInviteInvalid)?;
+
+        if record.revoked
+            || record.uses_remaining == 0
+            || record.expires_at_ms.is_some_and(|exp| now_ms >= exp)
+        {
+            return Err(ServerError::RoomInviteInvalid);
+        }
+
+        let room_id = record.room;
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let room = rooms.get_mut(&room_id).ok_or(ServerError::RoomInviteInvalid)?;
+
+        // Already a member: succeed without spending a use. Otherwise a shared link burns a
+        // slot every time someone re-opens it.
+        if room.has_member(actor) {
+            return Ok(room_id);
+        }
+        // The ceiling still binds. An invite is not permission to exceed the room's shape,
+        // which is what `derive_tier` was computed from.
+        if room.members.len() as u32 >= room.seal.member_ceiling() {
+            return Err(ServerError::RoomFull);
+        }
+
+        room.members.push(RoomMember { user: actor, role: RoomRole::Member });
+        record.uses_remaining -= 1;
+
+        let updated_room = room.clone();
+        let updated_invite = record.clone();
+        drop(rooms);
+        drop(invites);
+
+        // One batch: a crash between them either admits someone without spending the use, or
+        // spends it without admitting them. Both are wrong, and the second locks out a
+        // person holding a legitimate invite.
+        self.write(&[Write::Room(room_id, updated_room), Write::RoomInvite(hash, updated_invite)])?;
+        Ok(room_id)
+    }
+
+    /// Revoke an invite, so a link that has escaped stops working.
+    pub fn revoke_room_invite(&self, actor: UserId, token: &str) -> Result<(), ServerError> {
+        let hash = hash_token(token);
+        let mut invites = self.room_invites.lock().expect("room invites mutex poisoned");
+        let record = invites.get_mut(&hash).ok_or(ServerError::RoomInviteInvalid)?;
+        let room = record.room;
+
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Moderator {
+                return Err(ServerError::InsufficientRole);
+            }
+        }
+
+        record.revoked = true;
+        let updated = record.clone();
+        drop(invites);
+        self.write(&[Write::RoomInvite(hash, updated)])
     }
 
     /// Claim a handle for the acting account.
@@ -2628,6 +2779,250 @@ mod username_rules {
             restarted.claim_username(mallory.user, name("alice")),
             Err(ServerError::UsernameTaken)
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// A fresh invite token: 32 random bytes, hex.
+///
+/// Random rather than derived from the room, so a token discloses nothing about what it
+/// opens until it is redeemed, and so two invites to the same room are unlinkable to anyone
+/// holding both.
+fn mint_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Hash a token for storage and lookup.
+///
+/// The map is keyed by this, so the lookup itself is a hash comparison rather than a
+/// string comparison against a stored secret — there is no stored secret to compare
+/// against. Hashing is what makes a leaked database a list of hashes rather than a set of
+/// working invitations.
+fn hash_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Domain-separated, so a token hash can never collide with any other hash this project
+    // computes over user-supplied bytes.
+    hasher.update(b"cairn room invite v1\x00");
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod room_invites {
+    use super::tests::*;
+    use super::*;
+
+    fn room_with_owner(inst: &Instance) -> (RoomId, TestSender) {
+        let owner = TestSender::registered(inst);
+        let (room, _) = inst.create_room(public_shape(), owner.user).unwrap();
+        (room, owner)
+    }
+
+    #[test]
+    fn an_invite_admits_its_holder_and_then_is_spent() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+        assert_eq!(inst.redeem_room_invite(bob.user, &token, 0).unwrap(), room);
+        assert_eq!(inst.room_role(room, bob.user), Some(RoomRole::Member));
+
+        assert!(
+            matches!(
+                inst.redeem_room_invite(carol.user, &token, 0),
+                Err(ServerError::RoomInviteInvalid)
+            ),
+            "a single-use invite must not admit a second person"
+        );
+        assert_eq!(inst.room_role(room, carol.user), None);
+    }
+
+    #[test]
+    fn an_expired_invite_is_refused() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 5, Some(1_000)).unwrap();
+        assert!(inst.redeem_room_invite(bob.user, &token, 999).is_ok());
+
+        let carol = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.redeem_room_invite(carol.user, &token, 1_000),
+            Err(ServerError::RoomInviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn a_revoked_invite_stops_working_immediately() {
+        // The reason revocation exists: a link that has escaped is otherwise live until it
+        // is spent or expires, and neither may happen soon enough.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 10, None).unwrap();
+        inst.revoke_room_invite(owner.user, &token).unwrap();
+
+        assert!(matches!(
+            inst.redeem_room_invite(bob.user, &token, 0),
+            Err(ServerError::RoomInviteInvalid)
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_member_cannot_mint_or_revoke_an_invite() {
+        // An invite is a deferred add, so it must need the same authority as adding someone
+        // directly. Otherwise the role check on `add_room_member` is bypassed by anyone
+        // willing to route around it.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, bob.user).unwrap();
+
+        assert!(matches!(
+            inst.create_room_invite(bob.user, room, 1, None),
+            Err(ServerError::InsufficientRole)
+        ));
+
+        let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+        assert!(matches!(
+            inst.revoke_room_invite(bob.user, &token),
+            Err(ServerError::InsufficientRole)
+        ));
+    }
+
+    #[test]
+    fn a_non_member_cannot_mint_an_invite_to_a_room() {
+        let inst = Instance::in_memory();
+        let (room, _owner) = room_with_owner(&inst);
+        let outsider = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.create_room_invite(outsider.user, room, 1, None),
+            Err(ServerError::NotAMember)
+        ));
+    }
+
+    #[test]
+    fn an_unlimited_invite_cannot_be_minted() {
+        // The tier rule, enforced rather than documented. An uncapped link is a public
+        // invite in all but name, and `may_mint_public_invite` forbids one for T1/T2
+        // because discoverability feeds `derive_tier` and the tier cannot change.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        assert!(matches!(
+            inst.create_room_invite(owner.user, room, u32::MAX, None),
+            Err(ServerError::InviteUsesTooHigh)
+        ));
+        assert!(matches!(
+            inst.create_room_invite(owner.user, room, 0, None),
+            Err(ServerError::InviteUsesTooHigh)
+        ));
+        assert!(inst.create_room_invite(owner.user, room, MAX_INVITE_USES, None).is_ok());
+    }
+
+    #[test]
+    fn redeeming_twice_as_the_same_person_does_not_burn_a_use() {
+        // A shared link that someone opens twice must not cost the group a slot.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+
+        let token = inst.create_room_invite(owner.user, room, 2, None).unwrap();
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+
+        assert!(
+            inst.redeem_room_invite(carol.user, &token, 0).is_ok(),
+            "the second use must still be available to someone new"
+        );
+    }
+
+    #[test]
+    fn an_invite_does_not_let_a_room_exceed_its_ceiling() {
+        // The ceiling is what `derive_tier` was computed from, so an invite that could
+        // exceed it would let a room outgrow the shape its tier was assigned for.
+        let inst = Instance::in_memory();
+        let owner = TestSender::registered(&inst);
+        let shape =
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 };
+        let (room, _) = inst.create_room(shape, owner.user).unwrap();
+
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+        let token = inst.create_room_invite(owner.user, room, 5, None).unwrap();
+
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+        assert!(matches!(
+            inst.redeem_room_invite(carol.user, &token, 0),
+            Err(ServerError::RoomFull)
+        ));
+    }
+
+    #[test]
+    fn the_token_is_not_stored_anywhere() {
+        // A database that held working invitations would turn any read access — an operator,
+        // a backup, an exfiltration — into admission to every private room with a live link.
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_owner(&inst);
+        let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+
+        let invites = inst.room_invites.lock().unwrap();
+        assert!(!invites.contains_key(&token), "the raw token must never be a key");
+        assert!(
+            invites.keys().all(|k| *k != token),
+            "the raw token must not appear in storage in any form"
+        );
+    }
+
+    #[test]
+    fn invites_survive_a_restart() {
+        let dir = temp_dir("roominvites");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let (room, token) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, owner) = room_with_owner(&inst);
+            let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+            (room, token)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        let bob = TestSender::registered(&restarted);
+        assert_eq!(restarted.redeem_room_invite(bob.user, &token, 0).unwrap(), room);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_spent_invite_stays_spent_across_a_restart() {
+        // The one that matters most: if a restart reset the counter, every link ever issued
+        // would silently become live again.
+        let dir = temp_dir("spentinvite");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let token = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, owner) = room_with_owner(&inst);
+            let token = inst.create_room_invite(owner.user, room, 1, None).unwrap();
+            let bob = TestSender::registered(&inst);
+            inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+            token
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        let mallory = TestSender::registered(&restarted);
+        assert!(
+            matches!(
+                restarted.redeem_room_invite(mallory.user, &token, 0),
+                Err(ServerError::RoomInviteInvalid)
+            ),
+            "a restart must not resurrect a spent invite"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

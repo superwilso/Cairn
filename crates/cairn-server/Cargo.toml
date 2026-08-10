@@ -23,6 +23,9 @@ tracing-subscriber.workspace = true
 hex.workspace = true
 uuid.workspace = true
 redb = "2.6"
+sha2.workspace = true
+subtle.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 cairn-client-core.workspace = true

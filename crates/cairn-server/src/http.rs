@@ -79,7 +79,11 @@ impl IntoResponse for ServerError {
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ServerError::NoSuchBlob | ServerError::NoSuchUsername => StatusCode::NOT_FOUND,
             ServerError::UsernameTaken | ServerError::UsernameAlreadySet => StatusCode::CONFLICT,
-            ServerError::BadUsername(_) => StatusCode::BAD_REQUEST,
+            ServerError::BadUsername(_) | ServerError::InviteUsesTooHigh => StatusCode::BAD_REQUEST,
+            // Deliberately the same 401 as any other bad credential, and deliberately not
+            // 404: distinguishing "no such invite" from "spent" would tell someone probing
+            // tokens when they had found a real one.
+            ServerError::RoomInviteInvalid => StatusCode::UNAUTHORIZED,
             // 413 rather than 400: the request was well-formed, the instance just will not
             // hold something this big. An operator raising the ceiling changes the answer.
             ServerError::BlobTooLarge => StatusCode::PAYLOAD_TOO_LARGE,

@@ -46,7 +46,8 @@ use cairn_crypto::franking::ServerFrankingKey;
 use cairn_proto::{BlobId, DeviceId, RoomId, UserId, Username};
 
 use crate::state::{
-    AccountRecord, BlobRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room, StoredMessage,
+    AccountRecord, BlobRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room,
+    RoomInviteRecord, StoredMessage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +93,8 @@ const KEY_PACKAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("key_pac
 /// Handle → account. Keyed by the *normalised* username, so the table cannot hold two rows
 /// that a user would read as the same name.
 const USERNAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("usernames");
+/// Room invites, keyed by the **hash** of the token. The token itself is never stored.
+const ROOM_INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("room_invites");
 /// Keyed by `(room id, server_seq)` so a room's messages are contiguous and a fetch after
 /// a cursor is a range scan rather than a filter over everything.
 const MESSAGES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("messages");
@@ -116,6 +119,7 @@ pub struct Directory {
     pub invites: Vec<(String, InviteRecord)>,
     pub key_packages: Vec<(DeviceId, VecDeque<String>)>,
     pub usernames: Vec<(Username, UserId)>,
+    pub room_invites: Vec<(String, RoomInviteRecord)>,
     pub registration_policy: RegistrationPolicy,
 }
 
@@ -133,6 +137,8 @@ pub enum Write {
     KeyPackages(DeviceId, VecDeque<String>),
     Policy(RegistrationPolicy),
     Username(Username, UserId),
+    /// Keyed by token hash, not the token.
+    RoomInvite(String, RoomInviteRecord),
     Message(RoomId, StoredMessage),
     /// Metadata and ciphertext together: a blob whose bytes landed without its metadata
     /// would be unreachable and unattributable, and one whose metadata landed without its
@@ -308,6 +314,11 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                 t.insert(name.as_str(), serde_json::to_vec(user)?.as_slice())
                     .map_err(RedbError::from)?;
             }
+            Write::RoomInvite(hash, record) => {
+                let mut t = tx.open_table(ROOM_INVITES).map_err(RedbError::from)?;
+                t.insert(hash.as_str(), serde_json::to_vec(record)?.as_slice())
+                    .map_err(RedbError::from)?;
+            }
             Write::Policy(policy) => {
                 let mut t = tx.open_table(META).map_err(RedbError::from)?;
                 t.insert("registration_policy", serde_json::to_vec(policy)?.as_slice())
@@ -396,6 +407,7 @@ impl Storage for DbStorage {
         read_all!(INVITES, dir.invites, |s: &str| Some(s.to_string()));
         read_all!(KEY_PACKAGES, dir.key_packages, |s: &str| s.parse::<DeviceId>().ok());
         read_all!(USERNAMES, dir.usernames, |s: &str| Username::parse(s).ok());
+        read_all!(ROOM_INVITES, dir.room_invites, |s: &str| Some(s.to_string()));
 
         if let Ok(meta) = tx.open_table(META) {
             if let Some(v) = meta.get("registration_policy").map_err(RedbError::from)? {
@@ -491,6 +503,7 @@ impl Storage for MemoryStorage {
             invites: inner.directory.invites.clone(),
             key_packages: inner.directory.key_packages.clone(),
             usernames: inner.directory.usernames.clone(),
+            room_invites: inner.directory.room_invites.clone(),
             registration_policy: inner.directory.registration_policy,
         })
     }
@@ -507,6 +520,9 @@ impl Storage for MemoryStorage {
                     upsert(&mut inner.directory.key_packages, *d, p.clone())
                 }
                 Write::Username(n, u) => upsert(&mut inner.directory.usernames, n.clone(), *u),
+                Write::RoomInvite(h, r) => {
+                    upsert(&mut inner.directory.room_invites, h.clone(), r.clone())
+                }
                 Write::Policy(p) => inner.directory.registration_policy = *p,
                 Write::Message(room, m) => inner.messages.push((*room, m.clone())),
                 Write::Blob(id, r, b) => inner.blobs.push((*id, r.clone(), b.clone())),
