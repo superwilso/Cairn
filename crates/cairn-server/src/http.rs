@@ -357,7 +357,7 @@ async fn upload_blob(
 ) -> Result<(StatusCode, Json<UploadedBlob>), ServerError> {
     let room = cairn_proto::RoomId::from_uuid(room);
     let actor = signed_actor(&instance, &headers, "upload_blob", Some(room.into()))?;
-    let id = instance.store_blob(actor, room, body.to_vec())?;
+    let id = instance.store_blob(actor, room, body.to_vec(), now_ms())?;
     Ok((StatusCode::CREATED, Json(UploadedBlob { blob: id.to_string() })))
 }
 
@@ -599,7 +599,7 @@ async fn send_message(
     Path(_room): Path<String>,
     Json(envelope): Json<Envelope>,
 ) -> Result<Json<SendResponse>, ServerError> {
-    let stored = instance.accept(envelope)?;
+    let stored = instance.accept(envelope, now_ms())?;
     Ok(Json(SendResponse {
         server_seq: stored.server_seq,
         franking_tag: stored.franking_tag.map(|t| hex::encode(t.0)),

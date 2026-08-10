@@ -154,7 +154,25 @@ pub const MAX_INVITE_USES: u32 = 100;
 /// lookup path is bounded too, generously enough that a person adding friends never notices.
 pub const MAX_LOOKUPS_TOTAL: usize = 60;
 
-/// The window both claim limits are measured over.
+/// How many bytes of attachment one account may upload per window.
+///
+/// `MAX_BLOB_BYTES` caps a single upload and nothing capped the total, which probing turned
+/// into a number: one authenticated account stored **300 MiB without a single refusal**, and
+/// the database file reached 520 MiB doing it — the loop stopped because the probe stopped,
+/// not because the instance objected. On the deployment `docs/11-self-hosting.md` §7
+/// describes, a Raspberry Pi in a spare room, that is somebody's disk gone in an afternoon.
+///
+/// Note the ratio while sizing a volume: 300 MiB of ciphertext cost 520 MiB on disk.
+pub const MAX_UPLOAD_BYTES_PER_WINDOW: usize = 100 * 1024 * 1024;
+
+/// How many messages one account may send per window, across all rooms.
+///
+/// Generous on purpose — this is the product, not an auxiliary path, and a limit that
+/// interrupts a real conversation is worse than no limit at all. Thirty a minute sustained
+/// for an hour is not a person typing.
+pub const MAX_MESSAGES_PER_WINDOW: usize = 1_800;
+
+/// The window the claim, upload, and send limits are all measured over.
 pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 /// How far outside the present a signed request's timestamp may be.
@@ -368,6 +386,43 @@ struct ClaimLimiter {
     events: HashMap<UserId, VecDeque<(i64, UserId)>>,
 }
 
+/// A rolling-window budget, in whatever unit the caller counts.
+///
+/// Used for bytes uploaded and messages sent. **It bounds the rate, not the total** — and
+/// for uploads that distinction is load-bearing, because nothing deletes a blob yet, so an
+/// account's lifetime footprint still grows without bound, just predictably. A genuine
+/// storage quota needs a deletion path first; saying otherwise here would be claiming a
+/// protection that does not hold.
+#[derive(Debug, Default)]
+struct WindowBudget {
+    events: HashMap<UserId, VecDeque<(i64, usize)>>,
+}
+
+impl WindowBudget {
+    /// Charge `cost` against `actor`'s budget, or refuse.
+    ///
+    /// Checks before recording, so a refused attempt does not consume budget and a client
+    /// that retries on a 429 can actually recover.
+    fn admit(
+        &mut self,
+        actor: UserId,
+        cost: usize,
+        cap: usize,
+        now_ms: i64,
+    ) -> Result<(), ServerError> {
+        let recent = self.events.entry(actor).or_default();
+        while recent.front().is_some_and(|(at, _)| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS) {
+            recent.pop_front();
+        }
+        let used: usize = recent.iter().map(|(_, c)| *c).sum();
+        if used.saturating_add(cost) > cap {
+            return Err(ServerError::RateLimited);
+        }
+        recent.push_back((now_ms, cost));
+        Ok(())
+    }
+}
+
 impl ClaimLimiter {
     /// Record a claim by `actor` against `target`, or refuse it.
     ///
@@ -416,6 +471,11 @@ pub struct Instance {
     /// Bounds username *guessing*, which exact-match resolution does not. Not persisted,
     /// for the same reason as [`ClaimLimiter`].
     lookup_limiter: Mutex<HashMap<UserId, VecDeque<i64>>>,
+    /// Bounds how fast one account can fill an operator's disk. Not persisted, as above.
+    upload_budget: Mutex<WindowBudget>,
+    /// Bounds message flooding. Sending is authenticated, so unlike registration this needs
+    /// no knowledge of the caller's address and lives entirely here with the other rules.
+    send_budget: Mutex<WindowBudget>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -449,6 +509,8 @@ impl Instance {
             usernames: Mutex::new(directory.usernames.into_iter().collect()),
             room_invites: Mutex::new(directory.room_invites.into_iter().collect()),
             lookup_limiter: Mutex::new(HashMap::new()),
+            upload_budget: Mutex::default(),
+            send_budget: Mutex::default(),
             franking_key,
             storage,
         })
@@ -1025,6 +1087,7 @@ impl Instance {
         actor: UserId,
         room: RoomId,
         bytes: Vec<u8>,
+        now_ms: i64,
     ) -> Result<BlobId, ServerError> {
         if bytes.is_empty() {
             return Err(ServerError::BlobEmpty);
@@ -1040,6 +1103,15 @@ impl Instance {
                 return Err(ServerError::NotAMember);
             }
         }
+
+        // Charged after membership, so a non-member cannot burn a member's budget, and
+        // before the write, so the bytes are refused rather than stored and regretted.
+        self.upload_budget.lock().expect("upload budget poisoned").admit(
+            actor,
+            bytes.len(),
+            MAX_UPLOAD_BYTES_PER_WINDOW,
+            now_ms,
+        )?;
 
         let id = BlobId::new();
         let record = BlobRecord { room, uploader: actor, size: bytes.len() };
@@ -1265,7 +1337,7 @@ impl Instance {
     /// modified clients exist, so the server cannot rely on a client having enforced the
     /// tier — it re-checks. A client that tries to put plaintext into an encrypted room
     /// is rejected here.
-    pub fn accept(&self, envelope: Envelope) -> Result<StoredMessage, ServerError> {
+    pub fn accept(&self, envelope: Envelope, now_ms: i64) -> Result<StoredMessage, ServerError> {
         // Before anything else: is this actually from who it says it is? Everything
         // downstream — the franking tag especially — attributes the message to
         // `envelope.sender`, so that attribution must be earned first.
@@ -1281,6 +1353,16 @@ impl Instance {
         }
 
         envelope.validate_for_tier(room.seal.tier())?;
+
+        // After authentication and membership, so neither an impostor nor an outsider can
+        // spend a member's budget, and before the sequence number moves, so a refused
+        // message leaves no gap in the room's franking chain.
+        self.send_budget.lock().expect("send budget poisoned").admit(
+            envelope.sender,
+            1,
+            MAX_MESSAGES_PER_WINDOW,
+            now_ms,
+        )?;
 
         room.next_seq += 1;
         let server_seq = room.next_seq;
@@ -1450,7 +1532,7 @@ pub(crate) mod tests {
         let sender = TestSender::registered(&inst);
         let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e = sender.envelope(room, EnvelopePayload::Plaintext { body: "sneaky".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::Rejected(_))));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::Rejected(_))));
     }
 
     #[test]
@@ -1460,7 +1542,7 @@ pub(crate) mod tests {
         let (room, _) = inst.create_room(dm_shape(), sender.user).unwrap();
         let e =
             sender.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1, 2, 3] });
-        assert!(inst.accept(e).is_ok());
+        assert!(inst.accept(e, 0).is_ok());
     }
 
     #[test]
@@ -1471,7 +1553,7 @@ pub(crate) mod tests {
         let mut last = 0;
         for i in 0..5 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-            let stored = inst.accept(e).unwrap();
+            let stored = inst.accept(e, 0).unwrap();
             assert!(stored.server_seq > last);
             last = stored.server_seq;
         }
@@ -1482,7 +1564,7 @@ pub(crate) mod tests {
         let inst = Instance::in_memory();
         let sender = TestSender::registered(&inst);
         let e = sender.envelope(RoomId::new(), EnvelopePayload::Plaintext { body: "x".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::NoSuchRoom)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::NoSuchRoom)));
     }
 
     #[test]
@@ -1495,7 +1577,7 @@ pub(crate) mod tests {
         let e = sender
             .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
             .with_franking_commitment(commitment.to_hex());
-        let stored = inst.accept(sender.sign(e)).unwrap();
+        let stored = inst.accept(sender.sign(e), 0).unwrap();
 
         let tag = stored.franking_tag.expect("a franked message must carry a tag");
         let ctx = FrankingContext {
@@ -1517,7 +1599,7 @@ pub(crate) mod tests {
         let e = sender
             .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] })
             .with_franking_commitment("not-hex");
-        assert!(matches!(inst.accept(sender.sign(e)), Err(ServerError::BadCommitment)));
+        assert!(matches!(inst.accept(sender.sign(e), 0), Err(ServerError::BadCommitment)));
     }
 
     pub(crate) fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -1591,7 +1673,7 @@ pub(crate) mod tests {
         storage.commits.lock().unwrap().clear();
         for i in 0..200 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-            inst.accept(e).unwrap();
+            inst.accept(e, 0).unwrap();
         }
 
         let costs = storage.commits.lock().unwrap().clone();
@@ -1671,7 +1753,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let signature = owner_key.sign(&e.signing_bytes()).unwrap();
-            inst.accept(e.with_signature(hex::encode(signature))).unwrap();
+            inst.accept(e.with_signature(hex::encode(signature)), 0).unwrap();
 
             let used_by = inst
                 .invites
@@ -1745,7 +1827,7 @@ pub(crate) mod tests {
             let e = sender
                 .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
                 .with_franking_commitment(commitment.to_hex());
-            let stored = inst.accept(sender.sign(e)).unwrap();
+            let stored = inst.accept(sender.sign(e), 0).unwrap();
             (
                 room,
                 stored.envelope.sender,
@@ -1795,7 +1877,7 @@ pub(crate) mod tests {
             let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
             for i in 0..3 {
                 let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-                inst.accept(e).unwrap();
+                inst.accept(e, 0).unwrap();
             }
             (room, sender.user, sender.device, sender.session.public_key().to_vec())
         };
@@ -1818,7 +1900,7 @@ pub(crate) mod tests {
         let sender2 = TestSender::registered(&restarted);
         restarted.join_room(room, sender2.user).unwrap();
         let e = sender2.envelope(room, EnvelopePayload::Plaintext { body: "after".into() });
-        assert_eq!(restarted.accept(e).unwrap().server_seq, 4);
+        assert_eq!(restarted.accept(e, 0).unwrap().server_seq, 4);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1829,7 +1911,7 @@ pub(crate) mod tests {
         let sender = TestSender::registered(&inst);
         let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         let e = sender.unsigned(room, EnvelopePayload::Plaintext { body: "hi".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::Unsigned)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::Unsigned)));
     }
 
     #[test]
@@ -1843,7 +1925,7 @@ pub(crate) mod tests {
             device: DeviceId::new(),
         };
         let e = stranger.envelope(room, EnvelopePayload::Plaintext { body: "hi".into() });
-        assert!(matches!(inst.accept(e), Err(ServerError::UnknownDevice)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::UnknownDevice)));
     }
 
     #[test]
@@ -1862,7 +1944,7 @@ pub(crate) mod tests {
         e.sender = alice.user; // claim Alice's account
         let e = mallory.sign(e); // …but sign with Mallory's own key, correctly
 
-        assert!(matches!(inst.accept(e), Err(ServerError::DeviceUserMismatch)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::DeviceUserMismatch)));
     }
 
     #[test]
@@ -1875,7 +1957,7 @@ pub(crate) mod tests {
 
         let mut e = sender.envelope(room, EnvelopePayload::Plaintext { body: "original".into() });
         e.payload = EnvelopePayload::Plaintext { body: "rewritten in transit".into() };
-        assert!(matches!(inst.accept(e), Err(ServerError::BadSignature)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::BadSignature)));
     }
 
     #[test]
@@ -1894,7 +1976,7 @@ pub(crate) mod tests {
         let sig = mallory.session.sign(&e.signing_bytes()).unwrap();
         let e = e.with_signature(hex::encode(sig));
 
-        assert!(matches!(inst.accept(e), Err(ServerError::BadSignature)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::BadSignature)));
     }
 
     #[test]
@@ -1930,7 +2012,7 @@ pub(crate) mod tests {
             let e = sender
                 .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
                 .with_franking_commitment(commitment.to_hex());
-            let stored = inst.accept(sender.sign(e)).unwrap();
+            let stored = inst.accept(sender.sign(e), 0).unwrap();
 
             reported.push(ReportedMessage {
                 plaintext: text.to_vec(),
@@ -1971,17 +2053,17 @@ pub(crate) mod tests {
             .unsigned(room, EnvelopePayload::Plaintext { body: "one".into() })
             .with_franking_commitment(c1.to_hex());
         let signature = sender.session.sign(&e.signing_bytes()).unwrap();
-        inst.accept(e.with_signature(hex::encode(signature))).unwrap();
+        inst.accept(e.with_signature(hex::encode(signature)), 0).unwrap();
 
         // An unfranked message in between.
-        inst.accept(sender.envelope(room, EnvelopePayload::Plaintext { body: "plain".into() }))
+        inst.accept(sender.envelope(room, EnvelopePayload::Plaintext { body: "plain".into() }), 0)
             .unwrap();
 
         let (c2, o2) = cairn_crypto::commit(b"two");
         let e = sender
             .unsigned(room, EnvelopePayload::Plaintext { body: "two".into() })
             .with_franking_commitment(c2.to_hex());
-        let stored = inst.accept(sender.sign(e)).unwrap();
+        let stored = inst.accept(sender.sign(e), 0).unwrap();
 
         // The second franked message must chain to the first, not to the unfranked one.
         let ctx = FrankingContext {
@@ -2006,7 +2088,7 @@ pub(crate) mod tests {
         let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
         for i in 0..3 {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
-            inst.accept(e).unwrap();
+            inst.accept(e, 0).unwrap();
         }
         assert_eq!(inst.messages_since(room, sender.user, 0, 0).unwrap().len(), 3);
         assert_eq!(inst.messages_since(room, sender.user, 2, 0).unwrap().len(), 1);
@@ -2086,7 +2168,7 @@ mod accounts {
 
         // And with no registered device, she cannot send as Alice at all.
         let e = signed_as(&mallory_key, alice.user, mallory_device, room, "not alice");
-        assert!(matches!(inst.accept(e), Err(ServerError::UnknownDevice)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::UnknownDevice)));
     }
 
     #[test]
@@ -2109,7 +2191,7 @@ mod accounts {
         inst.link_device(alice.user, laptop_id, laptop.public_key(), alice.device, &auth).unwrap();
 
         let e = signed_as(&laptop, alice.user, laptop_id, room, "from my laptop");
-        assert!(inst.accept(e).is_ok());
+        assert!(inst.accept(e, 0).is_ok());
     }
 
     #[test]
@@ -2295,7 +2377,7 @@ mod membership {
         let room = private_room(&inst, alice.user);
 
         let e = mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![9] });
-        assert!(matches!(inst.accept(e), Err(ServerError::NotAMember)));
+        assert!(matches!(inst.accept(e, 0), Err(ServerError::NotAMember)));
     }
 
     /// The read half of the same vulnerability, and the worse one.
@@ -2311,8 +2393,11 @@ mod membership {
         let mallory = TestSender::registered(&inst);
         let room = private_room(&inst, alice.user);
 
-        inst.accept(alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }))
-            .unwrap();
+        inst.accept(
+            alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+            0,
+        )
+        .unwrap();
 
         assert!(matches!(
             inst.messages_since(room, mallory.user, 0, 0),
@@ -2351,7 +2436,7 @@ mod membership {
         // Alice, a member, can add Bob — and then Bob can speak.
         inst.add_room_member(room, alice.user, bob.user).unwrap();
         assert!(inst
-            .accept(bob.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }))
+            .accept(bob.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }), 0)
             .is_ok());
     }
 
@@ -2364,7 +2449,7 @@ mod membership {
 
         inst.join_room(room, newcomer.user).unwrap();
         assert!(inst
-            .accept(newcomer.envelope(room, EnvelopePayload::Plaintext { body: "hello".into() }))
+            .accept(newcomer.envelope(room, EnvelopePayload::Plaintext { body: "hello".into() }), 0)
             .is_ok());
     }
 
@@ -2531,6 +2616,7 @@ mod roles {
 
         inst.accept(
             mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+            0,
         )
         .unwrap();
 
@@ -2538,7 +2624,8 @@ mod roles {
 
         assert!(matches!(
             inst.accept(
-                mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] })
+                mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![2] }),
+                0
             ),
             Err(ServerError::NotAMember)
         ));
@@ -2559,6 +2646,7 @@ mod roles {
         inst.add_room_member(room, alice.user, mallory.user).unwrap();
         inst.accept(
             mallory.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }),
+            0,
         )
         .unwrap();
 
@@ -2777,6 +2865,154 @@ mod claim_limits {
             inst.claim_key_packages(me.user, me.user, 0),
             Err(ServerError::RateLimited)
         ));
+    }
+}
+
+#[cfg(test)]
+/// What one authenticated account can make an instance hold or do.
+///
+/// Distinct from `claim_limits`, which bounds what an account can do *to another account*.
+/// These bound what it can do to the **operator** — the person paying for the disk.
+#[cfg(test)]
+mod resource_limits {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn room_with(inst: &Instance, owner: UserId) -> RoomId {
+        inst.create_room(
+            RoomShape { is_direct: false, is_publicly_discoverable: false, member_ceiling: 16 },
+            owner,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn one_account_cannot_fill_the_operators_disk() {
+        // Regression test for a hole found by probing. `MAX_BLOB_BYTES` capped a single
+        // upload and nothing capped the total, so one authenticated account stored
+        //
+        //     RESULT: one account stored 300 MiB with NO refusal; database file is 520 MiB
+        //
+        // and stopped only because the probe stopped. On a Raspberry Pi in a spare room —
+        // the deployment `11-self-hosting.md` §7 describes — that is the disk gone.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        let chunk = vec![0u8; 8 * 1024 * 1024];
+        let mut stored = 0usize;
+        for _ in 0..64 {
+            match inst.store_blob(alice.user, room, chunk.clone(), 0) {
+                Ok(_) => stored += chunk.len(),
+                Err(ServerError::RateLimited) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            stored <= MAX_UPLOAD_BYTES_PER_WINDOW,
+            "an account stored {stored} bytes against a {MAX_UPLOAD_BYTES_PER_WINDOW} cap"
+        );
+        assert!(stored > 0, "and the cap must not refuse the first upload either");
+    }
+
+    #[test]
+    fn a_normal_attachment_is_not_refused() {
+        // Counterfactual: a quota that refused everything would satisfy the test above while
+        // making attachments useless.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        assert!(inst.store_blob(alice.user, room, vec![7u8; 2 * 1024 * 1024], 0).is_ok());
+    }
+
+    #[test]
+    fn a_non_member_cannot_spend_a_members_upload_budget() {
+        // The budget is charged after the membership check, so an outsider cannot exhaust
+        // someone else's allowance by uploading into a room they are not in.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let outsider = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        for _ in 0..20 {
+            assert!(matches!(
+                inst.store_blob(outsider.user, room, vec![0u8; 8 * 1024 * 1024], 0),
+                Err(ServerError::NotAMember)
+            ));
+        }
+        // Alice's own budget is untouched by all of that.
+        assert!(inst.store_blob(alice.user, room, vec![1u8; 8 * 1024 * 1024], 0).is_ok());
+    }
+
+    #[test]
+    fn one_account_cannot_flood_a_room_without_bound() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        let mut sent = 0usize;
+        for _ in 0..(MAX_MESSAGES_PER_WINDOW + 50) {
+            let envelope =
+                alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+            match inst.accept(envelope, 0) {
+                Ok(_) => sent += 1,
+                Err(ServerError::RateLimited) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(sent, MAX_MESSAGES_PER_WINDOW, "flooding must be capped, not merely slowed");
+    }
+
+    #[test]
+    fn a_refused_message_does_not_leave_a_gap_in_the_franking_chain() {
+        // The send budget is charged before `next_seq` moves. If it were charged after, a
+        // refused message would still have consumed a sequence number, and a transcript
+        // report covering that room would show a hole its verifier could not explain.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+
+        for _ in 0..MAX_MESSAGES_PER_WINDOW {
+            let envelope =
+                alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+            inst.accept(envelope, 0).unwrap();
+        }
+        let refused = alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+        assert!(matches!(inst.accept(refused, 0), Err(ServerError::RateLimited)));
+
+        // The window rolls over, and the next message continues the sequence rather than
+        // skipping the one that was refused.
+        let next = alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] });
+        let stored = inst.accept(next, CLAIM_WINDOW_MS).unwrap();
+        assert_eq!(
+            stored.server_seq,
+            MAX_MESSAGES_PER_WINDOW as u64 + 1,
+            "a refused message must not consume a sequence number"
+        );
+    }
+
+    #[test]
+    fn the_upload_budget_returns_after_the_window() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let room = room_with(&inst, alice.user);
+        // Exhausted in `MAX_BLOB_BYTES` steps: a single upload of the whole window would be
+        // refused by the per-upload ceiling instead, and the test would pass without ever
+        // exercising the budget.
+        let chunk = vec![0u8; MAX_BLOB_BYTES];
+        for _ in 0..(MAX_UPLOAD_BYTES_PER_WINDOW / MAX_BLOB_BYTES) {
+            inst.store_blob(alice.user, room, chunk.clone(), 0).unwrap();
+        }
+        assert!(matches!(
+            inst.store_blob(alice.user, room, vec![1u8; 1024], 0),
+            Err(ServerError::RateLimited)
+        ));
+        assert!(
+            inst.store_blob(alice.user, room, vec![1u8; 1024], CLAIM_WINDOW_MS).is_ok(),
+            "the budget must recover, or one heavy hour bans an account forever"
+        );
     }
 }
 
@@ -3213,7 +3449,7 @@ mod disappearing {
         )
         .unwrap();
         let signature = sender.session.sign(&e.signing_bytes()).unwrap();
-        inst.accept(e.with_signature(hex::encode(signature))).unwrap();
+        inst.accept(e.with_signature(hex::encode(signature)), 0).unwrap();
         (room, sender)
     }
 
