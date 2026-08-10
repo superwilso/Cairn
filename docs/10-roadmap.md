@@ -69,8 +69,13 @@ window, not the native Windows client of ADR-006.
 - [x] Contact store persisting verification state, including a sticky
       `ChangedSinceVerified` warning that re-observation cannot clear.
 
-**Exit: met.** Invite links exist (`/invite`, `/join`), so a joiner is no longer told to
-paste a uuid, and usernames replace ids for addressing. Verified with two real clients:
+**Exit: met, and now without a manual step.** Invite links exist (`/invite`, `/join`), and
+`/admit` closes the loop: a member opening a room is told who joined by invite and cannot
+read yet, and one command lets them all in. No uuid is pasted anywhere in the flow.
+
+Deliberately one command rather than automatic — the waiting list comes from the instance, so
+admitting on its word alone would let a malicious one name an account and have a moderator's
+client hand it the group keys silently. What was removed is the uuid, not the decision. Verified with two real clients:
 alice mints an invite, bob redeems it, alice adds him to the encrypted group, and bob reads
 the message that follows.
 

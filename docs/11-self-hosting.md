@@ -116,8 +116,20 @@ encrypted group and the server's member list can be compared by eye.
 
 **Redeeming joins the room; it does not give you the keys.** The group's keys are held by
 its members, not the instance, so nobody can hand them out on the strength of a token. Until
-an existing member adds you to the encrypted group, the room is visible and unreadable. The
+an existing member admits you to the encrypted group, the room is visible and unreadable. The
 client says so rather than implying the door is fully open.
+
+**Admitting is now one word.** When a member opens a room, the client compares the instance's
+member list against the encrypted group's roster and names anyone who has joined but cannot
+read yet. `/admit` lets all of them in. Nobody pastes a uuid and nobody coordinates out of
+band — which is what M2's exit condition asked for.
+
+It is deliberately **not automatic**, and the reason is worth keeping: the list of who is
+waiting comes from the *instance*. Admitting on its word alone would let a malicious one name
+an account of its choosing and have a moderator's client hand it the group keys, silently.
+The server cannot add a leaf itself — it never sees group state — and automating this would
+give it that power back through the front door. So the friction removed is the uuid, not the
+decision.
 
 **Superseded note.** Room ids and user ids are passed by hand. That is the main
 piece of unfinished work between here and something you would hand to a non-technical
