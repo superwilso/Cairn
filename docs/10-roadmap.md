@@ -281,6 +281,22 @@ Four calls made by the owner, so a session does not re-litigate them:
       rule expressible only where it could not be tested. 429 verified over a socket.
       **Bounds the rate, not the total**: several accounts still drain between them, and the
       counter is in memory so a restart clears it.
+- [x] **MLS credentials name the account, not a display name.** Probing the old
+      `name@server` credential found a working impersonation: mallory joins a room first
+      presenting bob's label, every client displays her as bob, and MLS's duplicate-identity
+      rule then locks the real bob out of that room permanently.
+
+      The credential now carries the account and device ids. **Carrying them is not the
+      protection — the checks are**, because an MLS credential is self-asserted and anyone
+      can mint one naming anyone. Both ends compare it against an authenticated identity:
+      the instance refuses a key package whose credential does not name the device
+      publishing it, and a claiming client refuses one that does not name the account it
+      asked for. The server-side half is what stops the guarantee resting on every client
+      remembering to check.
+
+      Unblocks auto-adding invite joiners, since a client can finally map the MLS roster
+      onto the server's member list. **Breaking**: a client too old to name its account
+      cannot publish key packages or be added to a room.
 - [ ] Rate limiting on registration and sending. Both need the caller's address, which
       `state.rs` never sees — so unlike the claim limit, this one genuinely cannot live
       entirely where the other rules do, and that boundary needs designing rather than

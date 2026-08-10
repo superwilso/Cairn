@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use cairn_crypto::mls::Session;
 use cairn_crypto::TranscriptReport;
-use cairn_proto::{DeviceId, Envelope, ResourceRef, RoomId, RoomSeal, RoomShape, UserId};
+use cairn_proto::{
+    DeviceId, DeviceIdentity, Envelope, ResourceRef, RoomId, RoomSeal, RoomShape, UserId,
+};
 
 use crate::transport::{Response, Transport, TransportError};
 
@@ -30,6 +32,26 @@ pub enum ClientError {
     Mls(#[from] cairn_crypto::mls::MlsError),
     #[error("the instance has no key packages for {0}; it cannot be added yet")]
     NoKeyPackages(UserId),
+    /// The instance returned a key package for a different account than the one asked for.
+    ///
+    /// Refused rather than reported, because adding it would put that account into the group
+    /// under a leaf the adder believes belongs to someone else — which is the impersonation
+    /// the credential format exists to prevent.
+    #[error(
+        "asked the instance for {asked_for}'s key package and got one claiming {claims}; \
+         refusing to add it. Either the instance is substituting accounts or something is \
+         badly out of sync — adding it anyway would put the wrong person in the room"
+    )]
+    WrongAccountInKeyPackage { asked_for: UserId, claims: UserId },
+    /// A key package whose credential cannot be read at all.
+    ///
+    /// Includes the legacy `name@server` format, which is why upgrading a client is not
+    /// optional for anyone who wants to be added to a room by a current one.
+    #[error(
+        "the key package the instance returned for {0} does not carry a readable Cairn \
+         identity; it may have been published by a client too old to name its account"
+    )]
+    UnverifiableKeyPackage(UserId),
     #[error("this room cannot be created as specified: {0}")]
     Shape(#[from] cairn_proto::ShapeError),
     #[error(
@@ -434,13 +456,41 @@ impl<T: Transport> Client<T> {
             None,
         );
 
-        match response {
-            Ok(response) => Ok(serde_json::from_slice(&response.body)?),
+        let claimed: Vec<ClaimedKeyPackage> = match response {
+            Ok(response) => serde_json::from_slice(&response.body)?,
             Err(ClientError::Transport(TransportError::Status { status: 409, .. })) => {
-                Err(ClientError::NoKeyPackages(user))
+                return Err(ClientError::NoKeyPackages(user))
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+
+        // Every package must name the account we asked for.
+        //
+        // This is the check that gives the credential its meaning. Probing the old
+        // display-name credential found that a member could join a room presenting someone
+        // else's label — every client then showed her as them, and because MLS refuses
+        // duplicate identities, the real person could never join that room afterwards.
+        //
+        // Carrying the account id in the credential does not fix that by itself; **this
+        // comparison does**. Without it the id would be decoration nobody ever read.
+        for package in &claimed {
+            let bytes = hex::decode(&package.key_package)
+                .map_err(|_| ClientError::UnverifiableKeyPackage(user))?;
+            let message = cairn_crypto::mls::parse_message(&bytes)
+                .map_err(|_| ClientError::UnverifiableKeyPackage(user))?;
+            let credential = cairn_crypto::mls::key_package_credential(&message)
+                .ok_or(ClientError::UnverifiableKeyPackage(user))?;
+
+            let identity = DeviceIdentity::parse(&credential)
+                .map_err(|_| ClientError::UnverifiableKeyPackage(user))?;
+            if !identity.belongs_to(user) {
+                return Err(ClientError::WrongAccountInKeyPackage {
+                    asked_for: user,
+                    claims: identity.user(),
+                });
+            }
         }
+        Ok(claimed)
     }
 
     /// Create a room, and refuse it if the instance classified it differently.
@@ -540,6 +590,100 @@ impl<T: Transport> Client<T> {
 mod tests {
     use super::*;
     use crate::transport::Response;
+
+    /// An instance that hands back whichever key package it was told to.
+    ///
+    /// Stands in for both a substituting server and a stale directory — from the claiming
+    /// client's side those are indistinguishable, which is why the check is on the
+    /// credential rather than on trusting the endpoint.
+    #[derive(Debug)]
+    struct KeyPackageInstance {
+        package_hex: String,
+        device: DeviceId,
+    }
+
+    impl Transport for KeyPackageInstance {
+        fn send(
+            &self,
+            _method: &str,
+            _path: &str,
+            _headers: &[(&str, String)],
+            _body: Option<crate::transport::RequestBody<'_>>,
+        ) -> Result<Response, TransportError> {
+            Ok(Response {
+                status: 200,
+                body: format!(
+                    r#"[{{"device":"{}","key_package":"{}"}}]"#,
+                    self.device.as_uuid(),
+                    self.package_hex
+                )
+                .into_bytes(),
+            })
+        }
+    }
+
+    /// A session whose credential names `identity`, plus a published key package.
+    fn packaged(identity: &DeviceIdentity) -> String {
+        let session = Session::new(&identity.to_credential()).unwrap();
+        hex::encode(session.key_package().unwrap().to_bytes().unwrap())
+    }
+
+    fn claiming_client(package_hex: String, device: DeviceId) -> Client<KeyPackageInstance> {
+        Client::new(
+            KeyPackageInstance { package_hex, device },
+            Arc::new(Session::new(b"asker").unwrap()),
+            UserId::new(),
+            DeviceId::new(),
+        )
+    }
+
+    #[test]
+    fn a_key_package_naming_another_account_is_refused() {
+        // The regression test for what probing found. Under the old display-name credential,
+        // mallory could join a room presenting bob's label: every member's client showed her
+        // as bob, and because MLS refuses duplicate identities the real bob could then never
+        // join that room at all.
+        //
+        // The credential now carries the account id — but that alone is decoration. *This*
+        // comparison is the protection: the client asked for bob and must refuse a package
+        // that names anyone else.
+        let bob = UserId::new();
+        let mallory = DeviceIdentity::new(UserId::new(), DeviceId::new());
+        let client = claiming_client(packaged(&mallory), mallory.device());
+
+        match client.claim_key_packages(bob) {
+            Err(ClientError::WrongAccountInKeyPackage { asked_for, claims }) => {
+                assert_eq!(asked_for, bob);
+                assert_eq!(claims, mallory.user());
+            }
+            other => panic!("mallory's package must be refused when bob was asked for: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_right_accounts_key_package_is_accepted() {
+        // Counterfactual: a check that refused every package would pass the test above and
+        // make it impossible to add anyone to a room.
+        let bob = DeviceIdentity::new(UserId::new(), DeviceId::new());
+        let client = claiming_client(packaged(&bob), bob.device());
+        let claimed = client.claim_key_packages(bob.user()).expect("bob's own package");
+        assert_eq!(claimed.len(), 1);
+    }
+
+    #[test]
+    fn a_legacy_display_name_credential_is_refused_rather_than_trusted() {
+        // A client too old to name its account publishes `name@server`. There is no way to
+        // tell which account that belongs to, so it cannot be added — refusing names the
+        // problem, where guessing would put an unverified leaf in an encrypted room.
+        let legacy = Session::new(b"bob@instance").unwrap();
+        let package = hex::encode(legacy.key_package().unwrap().to_bytes().unwrap());
+        let client = claiming_client(package, DeviceId::new());
+
+        assert!(matches!(
+            client.claim_key_packages(UserId::new()),
+            Err(ClientError::UnverifiableKeyPackage(_))
+        ));
+    }
 
     /// A transport that answers room creation with whatever the test dictates.
     #[derive(Debug)]

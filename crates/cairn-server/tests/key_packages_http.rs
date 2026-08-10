@@ -10,7 +10,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
 use cairn_crypto::mls::Session;
-use cairn_proto::{DeviceId, ResourceRef, UserId};
+use cairn_proto::{DeviceId, DeviceIdentity, ResourceRef, UserId};
 use cairn_server::state::{Instance, RegistrationPolicy};
 
 /// A running instance, plus the handle to talk to it.
@@ -89,10 +89,13 @@ struct Account {
 
 impl Account {
     fn register(server: &Server) -> Self {
+        // Ids first: the MLS credential is built from them, and the instance refuses a key
+        // package whose credential names a different account than the one publishing it.
+        let (user, device) = (UserId::new(), DeviceId::new());
         let account = Self {
-            session: Session::new(b"tester").unwrap(),
-            user: UserId::new(),
-            device: DeviceId::new(),
+            session: Session::new(&DeviceIdentity::new(user, device).to_credential()).unwrap(),
+            user,
+            device,
         };
         server
             .instance
@@ -306,8 +309,12 @@ fn an_account_with_two_devices_yields_a_package_for_each() {
     let alice = Account::register(&server);
     let bob = Account::register(&server);
 
-    let second_session = Session::new(b"bob-laptop").unwrap();
+    // A second device on bob's account. Its credential names the same account and a
+    // *different* device — which is the case per-device leaves exist for, and the reason
+    // the credential carries both ids rather than only the account.
     let second_device = DeviceId::new();
+    let second_session =
+        Session::new(&DeviceIdentity::new(bob.user, second_device).to_credential()).unwrap();
     server
         .instance
         .link_device(

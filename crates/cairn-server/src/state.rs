@@ -78,6 +78,17 @@ pub enum ServerError {
     NoKeyPackages,
     #[error("key package is malformed")]
     BadKeyPackage,
+    /// The credential inside a key package names a different account or device than the
+    /// one publishing it.
+    ///
+    /// Refused at publish time so a package that could impersonate somebody never enters
+    /// the instance's store at all. An MLS credential is self-asserted, so this comparison
+    /// against an authenticated device is what gives it meaning.
+    #[error(
+        "this key package's credential does not name the account and device publishing it; \
+         a package that claims to be someone else must not be stored"
+    )]
+    KeyPackageIdentityMismatch,
     #[error("too many key packages; publish at most {MAX_KEY_PACKAGES_PER_DEVICE} per device")]
     TooManyKeyPackages,
     #[error("rate limited; retry later")]
@@ -986,6 +997,30 @@ impl Instance {
             }
         }
 
+        // A key package must name the account and device publishing it.
+        //
+        // An MLS credential is *self-asserted* — probing confirmed anyone can mint one
+        // naming anyone, since nothing signs it. So the account id inside it means something
+        // only where it is compared against an authenticated identity, and there are exactly
+        // two places that can: here, against the device that authenticated this request, and
+        // in the claiming client, against the account it asked for.
+        //
+        // The client-side check alone would leave the guarantee resting on every client
+        // remembering to perform it. This is the half that does not depend on the caller
+        // being careful, which is the reason it lives in `state.rs` rather than a handler.
+        for package in &packages {
+            let bytes = hex::decode(package).map_err(|_| ServerError::BadKeyPackage)?;
+            let message =
+                cairn_crypto::mls::parse_message(&bytes).map_err(|_| ServerError::BadKeyPackage)?;
+            let credential = cairn_crypto::mls::key_package_credential(&message)
+                .ok_or(ServerError::BadKeyPackage)?;
+            let identity = cairn_proto::DeviceIdentity::parse(&credential)
+                .map_err(|_| ServerError::KeyPackageIdentityMismatch)?;
+            if identity.user() != actor || identity.device() != device {
+                return Err(ServerError::KeyPackageIdentityMismatch);
+            }
+        }
+
         let mut store = self.key_packages.lock().expect("key packages mutex poisoned");
         let queue = store.entry(device).or_default();
         if queue.len() + packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
@@ -1481,14 +1516,29 @@ pub(crate) mod tests {
 
     impl TestSender {
         pub(crate) fn registered(inst: &Instance) -> Self {
-            let s = Self {
-                session: cairn_crypto::mls::Session::new(b"tester").unwrap(),
-                user: UserId::new(),
-                device: DeviceId::new(),
-            };
+            // Ids first, because the MLS credential is built from them. A session opened
+            // under a display name would publish key packages the instance now refuses —
+            // which is the point of the check, and was worth making the fixtures honest
+            // about rather than working around.
+            let (user, device) = (UserId::new(), DeviceId::new());
+            let identity = cairn_proto::DeviceIdentity::new(user, device).to_credential();
+            let s =
+                Self { session: cairn_crypto::mls::Session::new(&identity).unwrap(), user, device };
             inst.set_registration_policy(RegistrationPolicy::Open).unwrap();
             inst.claim_account(s.user, s.device, s.session.public_key(), None, 0).unwrap();
             s
+        }
+
+        /// `n` real key packages for this device.
+        ///
+        /// Real ones, not placeholder hex: the instance parses a package's credential on
+        /// publish, so a fixture of `"aa"` no longer stands in for one. Six tests were
+        /// passing against placeholders, which meant nothing in the suite had ever put a
+        /// genuine key package through the publish path.
+        pub(crate) fn key_packages(&self, n: usize) -> Vec<String> {
+            (0..n)
+                .map(|_| hex::encode(self.session.key_package().unwrap().to_bytes().unwrap()))
+                .collect()
         }
 
         pub(crate) fn envelope(&self, room: RoomId, payload: EnvelopePayload) -> Envelope {
@@ -1706,9 +1756,14 @@ pub(crate) mod tests {
             inst.set_registration_policy(RegistrationPolicy::InviteOnly).unwrap();
             inst.create_invite("tok-a", None).unwrap();
 
-            let owner_key = cairn_crypto::mls::Session::new(b"owner").unwrap();
+            // Built from the ids, so the key packages it publishes name the account that
+            // publishes them — which the instance now checks.
             let owner = UserId::new();
             let owner_device = DeviceId::new();
+            let owner_key = cairn_crypto::mls::Session::new(
+                &cairn_proto::DeviceIdentity::new(owner, owner_device).to_credential(),
+            )
+            .unwrap();
             inst.claim_account(owner, owner_device, owner_key.public_key(), Some("tok-a"), 0)
                 .unwrap();
 
@@ -1741,7 +1796,14 @@ pub(crate) mod tests {
             let (room, _) = inst.create_room(public_shape(), owner).unwrap();
             inst.add_room_member(room, owner, moderator).unwrap();
             inst.set_room_role(room, owner, moderator, RoomRole::Moderator).unwrap();
-            inst.publish_key_packages(owner, owner_device, vec!["aa".into(), "bb".into()]).unwrap();
+            inst.publish_key_packages(
+                owner,
+                owner_device,
+                (0..2)
+                    .map(|_| hex::encode(owner_key.key_package().unwrap().to_bytes().unwrap()))
+                    .collect(),
+            )
+            .unwrap();
 
             let e = cairn_proto::Envelope::new(
                 Tier::PublicCommunity,
@@ -2752,10 +2814,68 @@ mod claim_limits {
     use super::tests::*;
     use super::*;
 
+    #[test]
+    fn a_key_package_naming_another_account_is_refused_at_publish() {
+        // The server's half of the credential check. An MLS credential is self-asserted —
+        // probing confirmed anyone can mint one naming anyone — so the id inside it means
+        // something only where it is compared against an authenticated identity.
+        //
+        // The claiming client checks too, but that would leave the guarantee resting on
+        // every client remembering to. This is the half that does not depend on the caller
+        // being careful, which is why it lives here rather than in a handler.
+        let inst = Instance::in_memory();
+        let mallory = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+
+        // Mallory mints a package whose credential names bob, and tries to publish it under
+        // her own authenticated device.
+        let forged = cairn_crypto::mls::Session::new(
+            &cairn_proto::DeviceIdentity::new(bob.user, bob.device).to_credential(),
+        )
+        .unwrap();
+        let package = hex::encode(forged.key_package().unwrap().to_bytes().unwrap());
+
+        assert!(
+            matches!(
+                inst.publish_key_packages(mallory.user, mallory.device, vec![package]),
+                Err(ServerError::KeyPackageIdentityMismatch)
+            ),
+            "a package claiming another account must never enter the store"
+        );
+    }
+
+    #[test]
+    fn a_device_can_still_publish_its_own_key_packages() {
+        // Counterfactual: a check that refused everything would pass the test above and
+        // make it impossible for anyone to be added to a room at all.
+        let inst = Instance::in_memory();
+        let bob = TestSender::registered(&inst);
+        assert_eq!(
+            inst.publish_key_packages(bob.user, bob.device, bob.key_packages(2)).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_legacy_display_name_key_package_is_refused() {
+        // A client too old to name its account. Refusing at publish means the instance never
+        // holds a package nobody can attribute — better than discovering it at claim time,
+        // when someone is mid-way through adding a person to a room.
+        let inst = Instance::in_memory();
+        let bob = TestSender::registered(&inst);
+        let legacy = cairn_crypto::mls::Session::new(b"bob@instance").unwrap();
+        let package = hex::encode(legacy.key_package().unwrap().to_bytes().unwrap());
+
+        assert!(matches!(
+            inst.publish_key_packages(bob.user, bob.device, vec![package]),
+            Err(ServerError::KeyPackageIdentityMismatch)
+        ));
+    }
+
     /// Publish `n` packages for a freshly registered account.
     fn victim_with(inst: &Instance, n: usize) -> TestSender {
         let victim = TestSender::registered(inst);
-        inst.publish_key_packages(victim.user, victim.device, vec!["aa".into(); n]).unwrap();
+        inst.publish_key_packages(victim.user, victim.device, victim.key_packages(n)).unwrap();
         victim
     }
 

@@ -114,6 +114,9 @@ impl IntoResponse for ServerError {
             // bad request: the caller is authenticated, just not entitled.
             ServerError::NotYourDevice => StatusCode::FORBIDDEN,
             ServerError::BadKeyPackage => StatusCode::BAD_REQUEST,
+            // 403 rather than 400: the package parsed fine, the caller is simply not
+            // entitled to publish one naming that account.
+            ServerError::KeyPackageIdentityMismatch => StatusCode::FORBIDDEN,
             // 409, not 404. The account exists and may be addable later; a 404 would tell
             // the caller to stop trying, which is the wrong instruction.
             ServerError::NoKeyPackages | ServerError::TooManyKeyPackages => StatusCode::CONFLICT,

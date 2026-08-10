@@ -102,6 +102,18 @@ the server keeps only a hash, so it cannot be recovered or read out of a backup.
 unlimited link, deliberately: an uncapped one is a public invite in all but name, and a
 public invite to a T1 or T2 room would mean it should have been T3.
 
+**Every MLS leaf now names the account that holds it.** The credential used to be a display
+name the client chose for itself, which probing showed let one member present another's
+label: every client displayed the impostor as that person, and because MLS refuses duplicate
+identities, **the real person could then never join that room at all**. Credentials now carry
+the account and device ids the instance already authenticates, checked both when a key
+package is published and when one is claimed.
+
+Two consequences for an operator. A client too old to name its account **cannot publish key
+packages** to an upgraded instance and cannot be added to a room — everyone upgrades
+together. And `/members` now prints account ids matching what `/roster` shows, so the
+encrypted group and the server's member list can be compared by eye.
+
 **Redeeming joins the room; it does not give you the keys.** The group's keys are held by
 its members, not the instance, so nobody can hand them out on the strength of a token. Until
 an existing member adds you to the encrypted group, the room is visible and unreadable. The
@@ -273,8 +285,14 @@ Honest list. Each of these is real and none is hypothetical.
   **What the cap does not do:** it bounds the rate, not the total. Several accounts can
   still drain a victim between them, one account can drain slowly across windows, and the
   counter lives in memory, so restarting the server clears it. Keep your published supply
-  topped up (`/keys 10`) rather than treating this as solved. **Registration and message
-  sending are still unthrottled.**
+  topped up (`/keys 10`) rather than treating this as solved.
+
+  Message sending and attachment uploads are now capped per account over the same window,
+  which bounds how fast one account can fill your disk — probing found one account storing
+  300 MiB without a single refusal. **Registration is still unthrottled**, and it is the
+  hard one: behind Caddy every request arrives from the proxy, so limiting by address means
+  trusting `X-Forwarded-For`, which an attacker can set to evade their own limit or to forge
+  someone else's address into a ban.
 - **Message history is stored in the clear.** A restart now replays a room rather than
   losing it, which it could not do from the network — MLS discards each message key after
   use, so the server holds ciphertext your device can no longer open. The copy is written
@@ -289,6 +307,16 @@ Honest list. Each of these is real and none is hypothetical.
   instance around it: a media server's egress scales with the square of the participant
   count — five people on 720p video is roughly 30 Mbps out, sustained — so calls are the
   point where a self-hosted instance stops being bandwidth-negligible.
+- **Client state lives in the user's data directory** — `~/.local/share/cairn/<name>` on
+  Linux (honouring `XDG_DATA_HOME`), `~/Library/Application Support/cairn/<name>` on macOS,
+  `%APPDATA%\cairn\<name>` on Windows. Override with `CAIRN_HOME`.
+
+  It used to default to a **temporary directory**, which on most Linux systems is cleared on
+  reboot and is often `tmpfs` — RAM, never touching a disk. That meant a reboot destroyed
+  the device key, the MLS group state, the contacts and the whole message history: the
+  account and every conversation, gone. "History survives a restart" had been verified by
+  restarting *processes*, never the machine. If you ran an earlier build, the client now
+  prints where the old state is; move it across or delete it.
 - **Client state is written unencrypted**, `0600` on Unix. **Decided (owner): platform
   keystores** — Keychain, Android Keystore, DPAPI, libsecret — behind an FFI seam, landing
   with the native clients. A passphrase-derived key was considered and rejected as a
@@ -298,6 +326,13 @@ Honest list. Each of these is real and none is hypothetical.
   account's home directory has the group keys. This is consistent with
   `docs/01-threat-model.md` §3.4, which does not claim to defend a compromised device — but
   it is weaker than a platform keystore, which is what a finished client would use.
+
+  **On Windows there is no `0600`.** Every `restrict` in the tree is `#[cfg(unix)]` with a
+  no-op fallback, because setting an ACL explicitly means calling Win32 through `unsafe`,
+  which every crate here forbids. What protects the files instead is that they now sit under
+  `%APPDATA%`, inside the user's profile, whose ACL grants that user, SYSTEM and
+  Administrators and nobody else — inherited by everything beneath it. That is roughly
+  equivalent, and it is inheritance doing the work rather than anything this code does.
 
 - **Disappearing messages are purged lazily**, when someone next reads the room. An
   abandoned room keeps its messages until it is opened again, so the timer is an upper bound
