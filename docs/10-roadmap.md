@@ -96,7 +96,30 @@ work, which the same exit condition depends on.
       notices the account already exists — without that, a returning user is locked out of
       their own account.
 - [ ] **Room invite links** — a joiner is still handed a room id and a user id by hand.
-      **M2's exit condition depends on this**, not just M3's.
+      **M2's exit condition depends on this**, not just M3's. `/dm <user-id>` now does
+      create-and-add in one step, so what remains is removing the id-passing entirely.
+
+      **Design, settled so it is not re-derived:**
+
+      - A **single-use, server-generated, non-enumerable token** minted by a member with
+        role ≥ Moderator, redeemed once, which adds the bearer as a `Member`.
+      - **This is not the invite `RoomSeal::may_mint_public_invite` forbids**, and the
+        distinction is the whole design. That guard blocks a *publicly discoverable*
+        invite for an E2EE room, because discoverability is an input to `derive_tier` — a
+        published invite would mean the room should have been T3, and the tier cannot
+        change (ADR-001). A capability handed to one named person and spent on redemption
+        does not make the room discoverable, so it does not weaken the tier. Say so in the
+        code, or someone will later "fix" the inconsistency by loosening the guard.
+      - Store the token **hashed** (SHA-256) and compare in constant time via `subtle`,
+        matching the project's convention. The server can read its own state, so this is
+        damage-limitation on a state leak, not a secrecy claim.
+      - Redemption must still check the member ceiling, or a DM invite becomes a way past
+        the two-person bound that `membership_respects_the_room_ceiling` defends.
+      - Retain spent tokens rather than deleting them, as `InviteRecord` already does, so
+        a replay is distinguishable from an unknown token.
+      - **Probe before trusting it**: redeem twice, redeem after removal, redeem against a
+        full room, redeem a token minted for a different room, and mint as a non-moderator.
+        Membership is where this project's three shipped vulnerabilities lived.
 - [ ] Backup and restore, including **the franking key**: losing it invalidates every
       report the instance ever issued
 - [ ] Rate limiting on registration and sending
