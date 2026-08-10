@@ -56,6 +56,14 @@ native clients, because a terminal cannot capture a microphone. And unlike Disco
 will refuse a call rather than downgrade it to plaintext for a client that cannot do E2EE
 media — the badge is not allowed to lie.
 
+**Customisation is a differentiator, not a footnote.** Most of what Discord charges for
+under Nitro is artificial scarcity — a limit chosen in order to sell removing it — and on an
+instance you run yourself there is nothing to remove. Designed in
+[`13-customisation.md`](13-customisation.md), including the two places "free" is not free
+(uploads and streaming cost the operator real money) and the one that is genuinely different
+under E2EE: a custom emoji fetched at render time tells the server which emoji you used and
+when, leaking content it could not otherwise read.
+
 **Bots are not optional.** They are much of why Discord communities stay on Discord. A bot
 in an E2EE room is a group member holding keys — an A6 adversary with a friendly name
 (`01-threat-model.md` §5). The design must surface that to users, and it is an open
