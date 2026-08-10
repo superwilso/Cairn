@@ -214,6 +214,35 @@ search term, which is often more revealing than the message. Requirements: proxy
 through the instance where possible, never send the room or recipient, and treat the
 provider as untrusted (`01-threat-model.md` §8).
 
+## Status
+
+**Text cards ship; images do not.**
+
+Implemented in `cairn-client-core::embed` and wired into `cairn-cli chat`: the sender's
+client fetches the URL, parses OpenGraph/`<title>`, and the finished card travels inside the
+encrypted body. Verified over a real socket by
+`a_link_card_reaches_the_recipient_and_the_server_never_sees_the_url`, which asserts the
+serialized envelope contains neither the URL nor the title.
+
+**Images are deliberately not fetched.** `Card::image_url` records where an image was and
+nothing re-hosts it, because re-hosting means bytes in the envelope and the note below —
+that the server's per-message full-state rewrite closes first — still stands. A text card is
+a few hundred bytes and does not move that; a thumbnail would. Images land with attachments.
+
+Known gaps, recorded rather than implied away:
+
+- **The address check is host-based.** `is_fetchable` refuses loopback, RFC1918, link-local,
+  CGNAT and unique-local addresses, but it **does not resolve DNS**, so a hostname pointing
+  at a private address still passes, and **redirects are followed without re-checking**.
+  Closing both needs a resolver hook in the HTTP client.
+- **The fetch is not yet opt-in per platform.** §1 requires that, and today any pasted link
+  is fetched with the sender's IP. This is the leak the design accepts by construction; what
+  is missing is the consent step, not the mitigation.
+- **No authenticated fetch and no proxy step.** `CardSource` models all three rungs of the
+  fallback chain, but only `Public` is implemented. `Authenticated` needs per-platform
+  session storage; `Proxy` needs the explicit privacy notice §1 describes.
+- **No per-sender cache**, so the same link is refetched each time.
+
 ## Implementation notes
 
 - Rendering happens **locally**; never execute remote code to produce a card.

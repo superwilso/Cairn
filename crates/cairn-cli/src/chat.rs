@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cairn_client_core::client::{Client, CreatedRoom};
+use cairn_client_core::embed::{self, Card};
 use cairn_client_core::transport::HttpTransport;
 use cairn_client_core::{
     accept_welcome, ContactStore, Conversation, ConversationIndex, TimelineEvent,
@@ -481,7 +482,23 @@ impl App {
             return Err("this room has no MLS group yet".into());
         }
 
-        let sent = open.convo.send(text.as_bytes(), now_ms())?;
+        // The unfurl happens *here*, on the sender's device, and the finished card travels
+        // inside the encrypted body. The server never sees the URL and the recipient never
+        // contacts the site — see `docs/05-embeds.md`. A failure degrades to a bare link,
+        // which is the last step of the fallback chain.
+        let card = embed::first_url(text).and_then(|url| match embed::unfurl(url) {
+            Ok(card) if card.is_useful() => Some(card),
+            Ok(_) => None,
+            Err(e) => {
+                println!("  (no preview for {url}: {e})");
+                None
+            }
+        });
+        if let Some(card) = &card {
+            println!("  (preview attached: {})", card.title.as_deref().unwrap_or(&card.url));
+        }
+
+        let sent = open.convo.send_with_card(text.as_bytes(), card, now_ms())?;
         let receipt = self.client.send(open.convo.room(), &sent.envelope)?;
         open.cursor = open.cursor.max(receipt.server_seq);
         self.index.advance(open.convo.room(), receipt.server_seq)?;
@@ -549,6 +566,9 @@ impl App {
                         short(&message.envelope.sender.as_uuid().to_string()),
                         String::from_utf8_lossy(&received.body)
                     );
+                    if let Some(card) = &received.card {
+                        print_card(card);
+                    }
                 }
                 Ok(TimelineEvent::Membership { added, removed, committer }) => {
                     announce(&mut self.contacts, &added, &removed, committer);
@@ -617,3 +637,32 @@ fn short(id: &str) -> String {
 /// replaces the poll-before-prompt model.
 #[allow(dead_code)]
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Render a link card.
+///
+/// The framing is the security-relevant part, not the layout. `docs/05-embeds.md` §3: a
+/// card produced on the sender's device is entirely the sender's output, and a modified
+/// client can put a reputable outlet's name over any link. So:
+///
+/// - it is labelled as the *sender's* preview, with no language implying anyone checked it;
+/// - the claimed source is prefixed `claims:`, never rendered as an attribution;
+/// - **the real URL is always printed**, because it is the only part a recipient can judge;
+/// - nothing is fetched to draw it, and no indicator is derived from its contents.
+fn print_card(card: &Card) {
+    println!("      ┌─ preview supplied by the sender, not verified");
+    if let Some(title) = &card.title {
+        println!("      │ {title}");
+    }
+    if let Some(description) = &card.description {
+        println!("      │ {description}");
+    }
+    if let Some(source) = card.claimed_source() {
+        println!("      │ claims: {source}");
+    }
+    // Always last and always present: the one checkable fact in the card.
+    println!("      │ link: {}", card.url);
+    if let Some(caveat) = card.source.caveat() {
+        println!("      │ ! {caveat}");
+    }
+    println!("      └─");
+}

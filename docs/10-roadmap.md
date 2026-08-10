@@ -136,9 +136,12 @@ embeds, voice. The feature scorecard in `08-feature-parity.md` is the target.
       message, so this lands on a known scaling gap. Deserves its own ADR.
 - [ ] **Video sending.** Table stakes against every product in `08-feature-parity.md`.
       Blocked on attachments; unrelated to embeds despite sharing the word.
-- [ ] **Authenticated embeds**, per `05-embeds.md` — including multi-media cards
-      (Instagram carousels) and video, whose inline playback requires re-hosting because
-      Cairn cannot use an iframe player.
+- [ ] **Authenticated embeds**, per `05-embeds.md`. **Text cards already ship** —
+      sender-side unfurl, card inside the encrypted body, server never sees the URL. What
+      remains here is the authenticated rung of the fallback chain (per-platform sessions),
+      the proxy rung with its privacy notice, per-platform opt-in, a DNS-resolving address
+      check, multi-media cards (Instagram carousels), and video — whose inline playback
+      requires re-hosting because Cairn cannot use an iframe player.
 
 ---
 

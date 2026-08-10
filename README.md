@@ -73,7 +73,7 @@ the core is fully testable without a UI.
 ## Try it
 
 ```bash
-cargo test --workspace     # 176 tests
+cargo test --workspace     # 193 tests
 cargo run -p cairn-cli     # the vertical slice, in-process, end to end
 ```
 
@@ -109,6 +109,13 @@ The prompt carries the tier badge at all times, and says `plaintext-transport` o
 Members added to a room are announced in the timeline with their verification state, and
 `/safety` shows numbers derived from the MLS group's own roster, which is the only source
 that makes the comparison mean anything (`docs/01-threat-model.md` §4).
+
+Paste a link into a message and the sender's client fetches it, renders a preview card, and
+sends the card **inside the encrypted envelope** — the server never learns the URL and the
+recipient's device contacts nothing. The card is labelled as the sender's claim with the
+real link always visible, because a card rendered on the sender's device is exactly as
+trustworthy as the sender (`docs/05-embeds.md` §3). Text only for now; images wait on
+attachments.
 
 **Not yet an invite flow:** the room id and user id still have to be passed between people
 by hand. See M3 in [the roadmap](docs/10-roadmap.md).
