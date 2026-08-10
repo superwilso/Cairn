@@ -230,11 +230,14 @@ fn mark_claimed(dir: &std::path::Path, user: UserId, device: DeviceId) -> Fallib
 
 fn help() {
     println!("Commands:");
-    println!("  /dm <user-id>        start a direct message with someone");
+    println!("  /dm <@name|user-id>  start a direct message with someone");
     println!("  /new                 create an empty direct (T1) room");
     println!("  /rooms               list rooms this device knows");
     println!("  /open <room-id>      open a room already joined");
-    println!("  /add <user-id>       add someone to the open room");
+    println!(
+        "  /add <@name|user-id> add someone to the open room
+  /username <name>     claim your handle, so people can find you without a uuid"
+    );
     println!("  /members             who is in the open room, and their verification state");
     println!("  /safety              safety numbers to compare out of band");
     println!("  /verify <n>          mark member n verified, having compared in person");
@@ -296,16 +299,51 @@ impl App {
                 println!("  published {count}; the instance now holds {remaining} for you");
             }
             "/new" => self.new_room()?,
-            "/dm" => self.direct_message(rest.parse()?)?,
+            "/dm" => {
+                let user = self.resolve(rest)?;
+                self.direct_message(user)?
+            }
             "/rooms" => self.list_rooms(),
             "/open" => self.open_room(rest.parse()?)?,
-            "/add" => self.add_member(rest.parse()?)?,
+            "/add" => {
+                let user = self.resolve(rest)?;
+                self.add_member(user)?
+            }
+            "/username" => self.claim_username(rest)?,
             "/members" => self.list_members(),
             "/safety" => self.show_safety_numbers(),
             "/verify" => self.verify(rest.parse()?)?,
             other => println!("  ! unknown command {other}"),
         }
         Ok(false)
+    }
+
+    /// Accept either a raw user id or an `@handle`, so a person can be named the way they
+    /// actually gave their details out.
+    ///
+    /// A handle is resolved against the instance, which means the instance decides who
+    /// `@alice` is. That is not a new trust: it already holds every account and could
+    /// substitute a key just as easily. It *is* a reason the safety-number check matters
+    /// more once handles exist, because a handle is easier to mistype than a uuid and the
+    /// user has less to compare against — so this prints what it resolved to.
+    fn resolve(&self, input: &str) -> Fallible<cairn_proto::UserId> {
+        let input = input.trim();
+        if !input.starts_with('@') && input.starts_with("usr_") {
+            return Ok(input.parse()?);
+        }
+        let name = cairn_proto::Username::parse(input)?;
+        let user = self.client.lookup_username(&name)?;
+        println!("  {name} is {user}");
+        Ok(user)
+    }
+
+    /// Claim a handle for this account.
+    fn claim_username(&self, input: &str) -> Fallible<()> {
+        let name = cairn_proto::Username::parse(input)?;
+        self.client.claim_username(&name)?;
+        println!("  you are now {name}");
+        println!("  it cannot be changed or released — tell people this, not your user id");
+        Ok(())
     }
 
     /// Start a DM: create the room and add the other person, in one step.

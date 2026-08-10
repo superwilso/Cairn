@@ -78,6 +78,11 @@ struct CreateRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct ResolvedUserResponse {
+    user: String,
+}
+
+#[derive(Deserialize)]
 struct UploadedBlobResponse {
     blob: String,
 }
@@ -214,6 +219,28 @@ impl<T: Transport> Client<T> {
         body: Option<crate::transport::RequestBody<'_>>,
     ) -> Result<Response, ClientError> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
+    }
+
+    /// Claim a handle for this account. One per account, and not reassignable.
+    pub fn claim_username(&self, name: &cairn_proto::Username) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "username": name.as_str() }).to_string();
+        self.call("POST", "/v1/usernames", &self.auth("claim_username", None)?, Some(&body))?;
+        Ok(())
+    }
+
+    /// Resolve a handle to an account id.
+    ///
+    /// Exact match: the instance offers no search, so a typo is a miss rather than a list of
+    /// near-matches. That is the point — see `docs/10-roadmap.md`.
+    pub fn lookup_username(&self, name: &cairn_proto::Username) -> Result<UserId, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/usernames/{}", name.as_str()),
+            &self.auth("lookup_username", None)?,
+            None,
+        )?;
+        let parsed: ResolvedUserResponse = serde_json::from_slice(&response.body)?;
+        parsed.user.parse().map_err(|_| ClientError::Malformed("user id"))
     }
 
     /// Upload an already-sealed attachment to a room, returning the id to reference it by.

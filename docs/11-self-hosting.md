@@ -81,9 +81,10 @@ rejected even by its rightful owner.
 
 Then, to talk:
 
-1. Your friend runs `/keys 5` to publish key packages, and `/whoami` to get their user id.
-   **Without published key packages nobody can add them to a room.**
-2. You run `/dm usr_...` with their id. That creates the room and adds them in one step.
+1. Your friend runs `/username theirname` to claim a handle, then `/keys 5` to publish key
+   packages. **Without published key packages nobody can add them to a room.**
+2. You run `/dm @theirname`. That resolves the handle, creates the room, and adds them in one
+   step. Raw `usr_...` ids still work if you prefer.
 3. They run `/open rom_...` with the room id you were shown.
 4. Both of you run `/safety` and compare the numbers **out of band** — on a call, or in
    person. If they match, no key substitution happened. If they differ, stop.
