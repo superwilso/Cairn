@@ -101,6 +101,8 @@ struct App {
     open: Option<Open>,
     identity: Vec<u8>,
     tls: bool,
+    /// Where this client keeps its state; attachments land under it.
+    dir: std::path::PathBuf,
 }
 
 struct Open {
@@ -130,6 +132,7 @@ pub fn run(options: Options) -> Fallible<()> {
         open: None,
         identity,
         tls,
+        dir: options.dir.clone(),
     };
 
     // Claim exactly once, ever, and record it locally.
@@ -238,6 +241,8 @@ fn help() {
         "  /add <@name|user-id> add someone to the open room
   /username <name>     claim your handle, so people can find you without a uuid
   /roster              server-side membership (who joined by invite, awaiting /add)
+  /ttl <secs|off>      make messages in this room disappear after a while
+  /send <path>         send a file, encrypted on this device before upload
   /invite [uses] [hrs] mint an invite link for the open room (default 1 use, 24h)
   /join <token>        redeem an invite"
     );
@@ -314,6 +319,8 @@ impl App {
             }
             "/username" => self.claim_username(rest)?,
             "/roster" => self.show_roster()?,
+            "/ttl" => self.set_ttl(rest)?,
+            "/send" => self.send_file(rest)?,
             "/invite" => self.create_invite(rest)?,
             "/join" => self.join_by_invite(rest)?,
             "/members" => self.list_members(),
@@ -341,6 +348,54 @@ impl App {
         let user = self.client.lookup_username(&name)?;
         println!("  {name} is {user}");
         Ok(user)
+    }
+
+    /// Set the room's disappearing-message timer. `/ttl 60` for a minute, `/ttl off`.
+    fn set_ttl(&self, rest: &str) -> Fallible<()> {
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let rest = rest.trim();
+        let ttl = if rest.is_empty() || rest == "off" {
+            None
+        } else {
+            Some(rest.parse::<i64>().map_err(|_| "usage: /ttl <seconds|off>")? * 1_000)
+        };
+        self.client.set_room_ttl(room, ttl)?;
+        match ttl {
+            Some(ms) => {
+                println!("  messages in this room now disappear {}s after being sent", ms / 1_000);
+                println!("  the timer runs from send, not from when anyone reads it");
+            }
+            None => println!("  disappearing messages are off for this room"),
+        }
+        Ok(())
+    }
+
+    /// Send a file. Sealed on this device; the instance stores bytes it cannot read.
+    fn send_file(&mut self, rest: &str) -> Fallible<()> {
+        let path = std::path::Path::new(rest.trim());
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".into());
+
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let (key, sealed) = cairn_crypto::attachment::seal(&bytes);
+        let blob = self.client.upload_attachment(room, &sealed)?;
+
+        let attachment = cairn_client_core::conversation::Attachment {
+            blob,
+            key,
+            name: name.clone(),
+            size: bytes.len(),
+        };
+
+        let open = self.open.as_mut().expect("checked above");
+        let out = open.convo.send_with_attachment(name.as_bytes(), attachment, now_ms())?;
+        self.client.send(room, &out.envelope)?;
+        println!("  sent {name} ({} bytes, encrypted before upload)", bytes.len());
+        Ok(())
     }
 
     /// The room's **server-side** membership, which is not the MLS roster.
@@ -730,6 +785,16 @@ impl App {
                     if let Some(card) = &received.card {
                         print_card(card);
                     }
+                    if let Some(attachment) = &received.attachment {
+                        // Fetched and opened here rather than announced and left: the key
+                        // arrived inside this message and nothing else can open the blob, so
+                        // deferring would mean holding a decryption key for a file the user
+                        // may never ask for.
+                        match fetch_attachment(&self.client, &self.dir, attachment) {
+                            Ok(path) => println!("    attachment saved to {}", path.display()),
+                            Err(e) => println!("    ! attachment could not be fetched: {e}"),
+                        }
+                    }
                 }
                 Ok(TimelineEvent::Membership { added, removed, committer }) => {
                     announce(&mut self.contacts, &added, &removed, committer);
@@ -826,4 +891,30 @@ fn print_card(card: &Card) {
         println!("      │ ! {caveat}");
     }
     println!("      └─");
+}
+
+/// Download an attachment, open it, and write it under the client's directory.
+///
+/// The sender's filename is not used as a path. It is a label chosen by whoever sent the
+/// message, so treating it as a location is a directory traversal waiting to happen — the
+/// file lands under the blob id, and the claimed name is only printed.
+fn fetch_attachment(
+    client: &Client<HttpTransport>,
+    dir: &std::path::Path,
+    attachment: &cairn_client_core::conversation::Attachment,
+) -> Fallible<std::path::PathBuf> {
+    let sealed = client.download_attachment(attachment.blob)?;
+    let plaintext = cairn_crypto::attachment::open(&attachment.key, &sealed)?;
+
+    let downloads = dir.join("attachments");
+    std::fs::create_dir_all(&downloads)?;
+    let path = downloads.join(attachment.blob.as_uuid().to_string());
+    std::fs::write(&path, &plaintext)?;
+    println!(
+        "    {} ({} bytes, sender calls it {:?})",
+        attachment.blob,
+        plaintext.len(),
+        attachment.name
+    );
+    Ok(path)
 }

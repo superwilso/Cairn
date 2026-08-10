@@ -19,7 +19,7 @@ Legend: ✅ has it · ⚠️ partial or qualified · ❌ lacks it · 🎯 Cairn 
 | Threads / replies | ✅ | ⚠️ replies | ⚠️ replies | ⚠️ replies | ✅ | 🎯 v1 |
 | Reactions | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 | Edit / delete | ✅ | ✅ | ✅ | ⚠️ | ✅ | 🎯 v1 |
-| Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | 🎯 v2 |
+| Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ per-room, from send |
 | Read receipts (optional) | ⚠️ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Typing indicators | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | 🎯 tiered |
@@ -73,7 +73,7 @@ question in `01-threat-model.md` §10.
 
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
-| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ server side done |
+| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ end to end |
 | GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 | Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
 | Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |

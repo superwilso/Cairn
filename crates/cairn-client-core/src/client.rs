@@ -237,6 +237,18 @@ impl<T: Transport> Client<T> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
     }
 
+    /// Set or clear the room's disappearing-message timer. Any member may.
+    pub fn set_room_ttl(&self, room: RoomId, ttl_ms: Option<i64>) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "ttl_ms": ttl_ms }).to_string();
+        self.call(
+            "POST",
+            &format!("/v1/rooms/{}/ttl", room.as_uuid()),
+            &self.auth("set_room_ttl", Some(room.into()))?,
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
     /// The room's server-side membership.
     ///
     /// **Not the MLS roster.** The two diverge whenever someone joins by invite: the server

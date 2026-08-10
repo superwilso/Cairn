@@ -69,7 +69,13 @@ window, not the native Windows client of ADR-006.
 - [x] Contact store persisting verification state, including a sticky
       `ChangedSinceVerified` warning that re-observation cannot clear.
 
-**Exit: partly met.** The mechanics work end to end against a real server — verified by
+**Exit: met.** Invite links exist (`/invite`, `/join`), so a joiner is no longer told to
+paste a uuid, and usernames replace ids for addressing. Verified with two real clients:
+alice mints an invite, bob redeems it, alice adds him to the encrypted group, and bob reads
+the message that follows.
+
+Superseded assessment, kept because the reasoning still applies to what is *not* done: the
+mechanics worked end to end against a real server — verified by
 running two clients, not only by tests, which is how the message-truncation and
 cursor-replay bugs surfaced. **What is still owed is the invite flow**: a joiner currently
 needs a room id pasted to them out of band and must be added by user id, so "joins by
