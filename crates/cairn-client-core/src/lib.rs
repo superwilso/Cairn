@@ -19,6 +19,7 @@
 pub mod client;
 pub mod contacts;
 pub mod conversation;
+pub mod embed;
 pub mod store;
 pub mod transport;
 
@@ -28,6 +29,7 @@ pub use conversation::{
     accept_welcome, Conversation, ConversationError, OutboundMessage, ReceivedFranking,
     ReceivedMessage, TimelineEvent,
 };
+pub use embed::{Card, CardSource};
 pub use store::{ConversationIndex, ConversationRecord, IndexError};
 pub use transport::{Transport, TransportError};
 

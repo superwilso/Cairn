@@ -214,6 +214,22 @@ impl Conversation {
         plaintext: &[u8],
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with_card(plaintext, None, now_ms)
+    }
+
+    /// Send with a link card the caller already rendered.
+    ///
+    /// The card is **not** franked separately, and that is deliberate: the franking
+    /// commitment covers `plaintext`, which is what a report is about. A card is the
+    /// sender's own decoration of their own message — binding it into the commitment would
+    /// imply the server had attested something about it, which it cannot, since it never
+    /// saw the URL (`docs/05-embeds.md` §3).
+    pub fn send_with_card(
+        &mut self,
+        plaintext: &[u8],
+        card: Option<crate::embed::Card>,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
         let tier = self.seal.tier();
         if !tier.is_e2ee() {
             return Err(ConversationError::NotEncrypted);
@@ -226,7 +242,11 @@ impl Conversation {
         // cannot file a report without it, and the server must never see it — a server
         // holding openings could verify reports nobody chose to make, which would defeat
         // the point of franking.
-        let inner = InnerBody { body: plaintext.to_vec(), opening: opening.clone() };
+        let inner = InnerBody {
+            body: plaintext.to_vec(),
+            opening: opening.clone(),
+            card: card.map(crate::embed::Card::clamp),
+        };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
         let ciphertext = mls_message.to_bytes().map_err(MlsError::from)?;
@@ -311,6 +331,7 @@ impl Conversation {
             EnvelopePayload::Plaintext { body } => Ok(TimelineEvent::Message(ReceivedMessage {
                 body: body.clone().into_bytes(),
                 franking: None,
+                card: None,
             })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
@@ -344,6 +365,9 @@ impl Conversation {
                         opening: inner.opening,
                         commitment: claimed,
                     }),
+                    // Clamped again on receipt. These bytes came from the sender, so the
+                    // limits are a defence against a hostile one, not tidiness.
+                    card: inner.card.map(crate::embed::Card::clamp),
                 }))
             }
         }
@@ -376,6 +400,13 @@ pub fn accept_welcome(
 struct InnerBody {
     body: Vec<u8>,
     opening: Opening,
+    /// A link card the sender rendered on their own device.
+    ///
+    /// Inside the encrypted body, so the server never learns the URL — that is the whole
+    /// point of the design in `docs/05-embeds.md`. `default` so a message from a client
+    /// that predates cards still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    card: Option<crate::embed::Card>,
 }
 
 /// What an incoming envelope turned out to be.
@@ -421,6 +452,12 @@ impl TimelineEvent {
 #[derive(Debug)]
 pub struct ReceivedMessage {
     pub body: Vec<u8>,
+    /// The sender's link card, if they sent one.
+    ///
+    /// **Everything in it was chosen by the sender.** A client renders it as a claim, keeps
+    /// the URL visible, and derives no trust signal from its contents. It must not fetch
+    /// anything to display it — see [`crate::embed`].
+    pub card: Option<crate::embed::Card>,
     /// Present for E2EE messages. A recipient must retain this to file a report; without
     /// it the message is unreportable.
     pub franking: Option<ReceivedFranking>,

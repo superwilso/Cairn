@@ -282,3 +282,84 @@ fn a_removed_member_stops_being_able_to_read_and_everyone_is_told() {
         "post-compromise security must hold: a removed member cannot decrypt later messages"
     );
 }
+
+#[test]
+fn a_link_card_reaches_the_recipient_and_the_server_never_sees_the_url() {
+    // The whole claim of `docs/05-embeds.md`: the sender renders the card, it travels
+    // inside the encrypted body, the server relays bytes it cannot read, and the recipient
+    // displays it without contacting the site.
+    let server = start();
+    let alice = Peer::new(&server, "alice-embed");
+    let bob = Peer::new(&server, "bob-embed");
+    bob.client.publish_key_packages(2).unwrap();
+
+    let created = alice.client.create_room(shape()).unwrap();
+    let (seal, room) = (created.seal, created.room);
+    let mut alice_convo = alice.conversation(seal, room);
+
+    alice.client.add_room_member(room, bob.user).unwrap();
+    let claimed = alice.client.claim_key_packages(bob.user).unwrap();
+    let kp =
+        cairn_crypto::mls::parse_message(&hex::decode(&claimed[0].key_package).unwrap()).unwrap();
+    let output = alice_convo.group_mut().unwrap().add_member(kp).unwrap();
+    relay(&alice.client, &alice_convo, output);
+
+    let fetched = bob.client.fetch_since(room, 0).unwrap();
+    let group = fetched
+        .iter()
+        .find_map(|m| accept_welcome(&bob.session, &m.envelope).ok().flatten())
+        .expect("a welcome for bob");
+    let mut bob_convo =
+        Conversation::join_encrypted(seal, room, bob.user, bob.device, bob.session.clone(), group)
+            .unwrap();
+    let cursor = fetched.last().unwrap().server_seq;
+
+    const SECRET_URL: &str = "https://example.test/a-very-distinctive-path-99213";
+    let card = cairn_client_core::Card {
+        url: SECRET_URL.to_string(),
+        title: Some("A headline".into()),
+        description: Some("What the page says.".into()),
+        site_name: Some("Example News".into()),
+        ..cairn_client_core::Card::default()
+    };
+
+    let sent = alice_convo.send_with_card(b"look at this", Some(card), 5_000).unwrap();
+
+    // Nothing the server receives may contain the URL. Checked against the serialized
+    // envelope, which is exactly what goes over the wire and into its storage.
+    let on_the_wire = serde_json::to_string(&sent.envelope).unwrap();
+    assert!(
+        !on_the_wire.contains("example.test"),
+        "the server must never learn the URL — that is the entire point of a sender-side unfurl"
+    );
+    assert!(!on_the_wire.contains("A headline"));
+
+    alice.client.send(room, &sent.envelope).unwrap();
+
+    let received = bob
+        .client
+        .fetch_since(room, cursor)
+        .unwrap()
+        .iter()
+        .find_map(|m| bob_convo.receive(&m.envelope).ok().and_then(TimelineEvent::message))
+        .expect("bob receives the message");
+
+    assert_eq!(received.body, b"look at this");
+    let card = received.card.expect("the card travelled with it");
+    assert_eq!(card.url, SECRET_URL, "and the recipient can see the real link");
+    assert_eq!(card.claimed_source(), Some("Example News"));
+}
+
+#[test]
+fn a_hostile_card_is_clamped_before_a_recipient_renders_it() {
+    // Card fields are sender-controlled. A recipient must not accept a megabyte of title.
+    let card = cairn_client_core::Card {
+        url: "https://example.test/".into(),
+        title: Some("t".repeat(50_000)),
+        description: Some("d".repeat(50_000)),
+        ..cairn_client_core::Card::default()
+    }
+    .clamp();
+    assert!(card.title.unwrap().chars().count() <= 201);
+    assert!(card.description.unwrap().chars().count() <= 501);
+}
