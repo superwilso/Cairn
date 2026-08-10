@@ -49,7 +49,39 @@ macro_rules! opaque_id {
                 write!(f, "{}_{}", $prefix, self.0.simple())
             }
         }
+
+        /// Parse the [`fmt::Display`] form back, so an id a user copied off a screen can
+        /// be typed into a client.
+        ///
+        /// The prefix is **checked, not stripped optionally**: `usr_…` and `room_…` are
+        /// both uuids underneath, so accepting either wherever one is expected would let a
+        /// user paste a room id where an account is meant and get a confusing failure from
+        /// the server rather than an immediate one here. A bare uuid is accepted too,
+        /// since ids appear unprefixed in JSON.
+        impl std::str::FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let body = match s.split_once('_') {
+                    Some((prefix, rest)) if prefix == $prefix => rest,
+                    Some((prefix, _)) => {
+                        return Err(IdError::WrongKind { expected: $prefix, found: prefix.into() })
+                    }
+                    None => s,
+                };
+                Uuid::parse_str(body).map(Self).map_err(|_| IdError::NotAUuid)
+            }
+        }
     };
+}
+
+/// Why a written identifier could not be read back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IdError {
+    #[error("expected a {expected}_ identifier but found {found}_")]
+    WrongKind { expected: &'static str, found: String },
+    #[error("not a valid identifier")]
+    NotAUuid,
 }
 
 opaque_id!(UserId, "usr", "An account on an instance.");

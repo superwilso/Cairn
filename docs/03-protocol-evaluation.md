@@ -33,6 +33,32 @@ performance measurements. Those are still owed.
 
 ## Findings so far
 
+**From building a UI on top of the primitives (M2):**
+
+- **A safety number is only as good as where its keys came from.** `mls-rs` exposes the
+  group roster, but nothing in Cairn read it, so the only key a client could reach was the
+  one the server published. Both ends of a MITM'd conversation then display the *same*
+  number. The lesson generalises past safety numbers: **any value a UI presents as evidence
+  must be sourced from state the adversary cannot write**, and for anything about a group
+  that means the ratchet tree, never the account directory.
+- **`ReceivedMessage::Commit` is not enough to detect a membership change**, and the
+  roster diff is not enough either. `mls-rs` does not advance a group whose local client
+  was just removed, so a self-removal shows an unchanged roster; it has to be read from
+  `CommitEffect::Removed`. Two different mechanisms are needed for what looks like one
+  event, and only running a removal over HTTP revealed it.
+- **A read cursor is protocol state, not UI convenience.** MLS discards each message key
+  after use, so a client that restarts and re-reads a room from sequence 0 cannot decrypt
+  its own history — it emits `invalid generation` and `incorrect epoch` for traffic it
+  already consumed. The cursor must be persisted with the same care as the group index.
+- **A welcome can travel through the room it invites you to.** No separate channel or
+  endpoint is needed: the joiner is made a room member server-side first, then finds the
+  welcome among traffic it cannot read (`is_welcome` distinguishes it). This keeps the
+  server's single sequencing point covering handshakes and messages together, which is the
+  ordering MLS requires (ADR-002).
+- **Running it found bugs the tests could not.** Two clients against a live server surfaced
+  a message truncated at its first space and a replay storm on restart. Every test had sent
+  single-word messages and used fresh state, so both passed.
+
 **From building the scaffold (`crates/`):**
 
 - **A DM as a two-member MLS group works**, and the one-code-path approach holds up.

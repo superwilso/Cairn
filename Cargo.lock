@@ -183,6 +183,7 @@ dependencies = [
  "cairn-client-core",
  "cairn-crypto",
  "cairn-proto",
+ "hex",
  "serde_json",
 ]
 

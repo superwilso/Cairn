@@ -10,8 +10,22 @@
 //!
 //! The defence is for the two humans to compare a short value derived from both identity
 //! keys over a channel the server does not control: in person, over a phone call, on a
-//! video call. If the numbers match, no substitution happened. If they differ, something
-//! is wrong.
+//! video call.
+//!
+//! ## What the comparison is worth depends entirely on where the keys came from
+//!
+//! A matching safety number means "no substitution happened" **only if both fingerprints
+//! were computed over the keys the conversation actually uses.** Build one from the keys
+//! the server published in its account directory and the comparison certifies nothing: a
+//! server can hand Alice and Bob each other's real keys to display while a third leaf sits
+//! in the MLS group reading their messages. Both sides then see the same number, compare
+//! it, and are reassured — which is worse than showing no number at all.
+//!
+//! That is not hypothetical; it is what this code did before
+//! `a_safety_number_is_computed_from_the_group_not_the_directory` was written. So the
+//! primitives here take raw keys and stay honest about it, and the safe way to reach them
+//! is [`crate::mls::GroupHandle::safety_number_with`], which sources both fingerprints
+//! from the group's own roster.
 //!
 //! Until key transparency exists (still outstanding), this is the *only* protection
 //! against a malicious server, which is why it belongs in the same release as encryption

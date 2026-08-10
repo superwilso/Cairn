@@ -102,6 +102,27 @@ pub fn parse_message(bytes: &[u8]) -> Result<MlsMessage, MlsError> {
     Ok(MlsMessage::from_bytes(bytes)?)
 }
 
+/// The leaf behind a commit, when it was an ordinary member.
+///
+/// External senders and new-member proposals deliberately yield `None`: their index refers
+/// to a different table, so showing it as a member number would name the wrong person.
+fn sender_index(sender: &mls_rs::group::Sender) -> Option<u32> {
+    match sender {
+        mls_rs::group::Sender::Member(index) => Some(*index),
+        _ => None,
+    }
+}
+
+/// Whether a message is a welcome, and so an invitation to join rather than group traffic.
+///
+/// A client polling a room it has not joined needs to tell the two apart before trying:
+/// feeding a commit to [`Session::join`] fails, and treating every failure as "not a
+/// welcome" would swallow genuine errors — a corrupt welcome would look identical to an
+/// ordinary message and the user would simply never join.
+pub fn is_welcome(message: &MlsMessage) -> bool {
+    matches!(message.wire_format(), mls_rs::WireFormat::Welcome)
+}
+
 /// Generate a fresh signature keypair for the pinned ciphersuite.
 fn generate_signature_key(
 ) -> Result<(mls_rs::crypto::SignatureSecretKey, mls_rs::crypto::SignaturePublicKey), MlsError> {
@@ -273,6 +294,77 @@ impl Session {
     }
 }
 
+/// One member of a group, read from the group's own authenticated state.
+///
+/// **The source matters more than the contents.** These fields come from the MLS ratchet
+/// tree, which every member validates and which the server cannot alter without every
+/// member's client rejecting the commit. A member list assembled from the server's account
+/// directory would carry the same field names and mean nothing — see
+/// [`GroupHandle::members`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    /// Leaf index. Stable for the lifetime of this member's leaf, and what
+    /// [`GroupHandle::remove_member`] takes.
+    pub index: u32,
+    /// The credential bytes this member presented — in Cairn, the device-scoped identity.
+    ///
+    /// A `BasicCredential` proves nothing on its own: two devices can present identical
+    /// bytes. It is a label to show the user, never an authorization. What binds a
+    /// *specific key* to it is the out-of-band comparison in [`crate::verification`].
+    pub identity: Vec<u8>,
+    /// The signature public key this member's leaf actually holds.
+    pub signature_key: Vec<u8>,
+}
+
+impl GroupMember {
+    /// This member's fingerprint, over the key the group actually uses.
+    ///
+    /// This is the value a safety number must be built from. Computing one over a key the
+    /// server supplied instead lets a server hand both parties each other's real key for
+    /// display while a third leaf sits in the group — the numbers match and the group is
+    /// compromised. See `a_safety_number_is_computed_from_the_group_not_the_directory`.
+    pub fn fingerprint(&self) -> crate::verification::Fingerprint {
+        crate::verification::Fingerprint::compute(&self.signature_key, &self.identity)
+    }
+}
+
+/// What arrived when a group processed an incoming message.
+///
+/// A membership change is a distinct outcome rather than a silent state mutation because
+/// an unannounced added member is a wiretap (`docs/02-encryption-tiers.md` §4.6). When
+/// this was `Option<Vec<u8>>`, a commit that added a member was indistinguishable from any
+/// other handshake — a client could not have surfaced it even if it wanted to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupEvent {
+    /// An application message, decrypted.
+    Application(Vec<u8>),
+    /// The roster changed. Either list may be empty; both are empty for a commit that
+    /// changed only key material.
+    MembershipChanged {
+        added: Vec<GroupMember>,
+        removed: Vec<GroupMember>,
+        /// The leaf that committed the change, when the message named one.
+        committer: Option<u32>,
+    },
+    /// **This device was removed from the group.**
+    ///
+    /// A separate variant because the roster diff cannot see it: `mls-rs` does not advance
+    /// a group the local client was just ejected from, so before and after are identical
+    /// and [`GroupEvent::MembershipChanged`] would report nothing changed. Found by
+    /// running the removal over HTTP and printing what the removed member actually got —
+    /// `Membership { added: [], removed: [], committer: Some(0) }`.
+    ///
+    /// Left unreported, a client would keep showing a conversation it had been thrown out
+    /// of, and the user would learn about it only when a send failed for reasons the UI
+    /// could not explain.
+    Removed {
+        /// The member who did it, when the commit named one.
+        by: Option<u32>,
+    },
+    /// A proposal, or a handshake that did not alter the roster.
+    Other,
+}
+
 /// A joined MLS group.
 pub struct GroupHandle {
     group: Group<CairnConfig>,
@@ -349,17 +441,42 @@ impl GroupHandle {
         Ok(message)
     }
 
-    /// Process an incoming message, returning plaintext if it was an application message.
+    /// Process an incoming message.
     ///
-    /// Handshake messages return `Ok(None)` after being applied — the group state advances
-    /// as a side effect.
-    pub fn process(&mut self, message: MlsMessage) -> Result<Option<Vec<u8>>, MlsError> {
+    /// Membership changes come back as [`GroupEvent::MembershipChanged`] rather than being
+    /// applied silently, because a client cannot warn about a member it was never told
+    /// about. The change is detected by diffing the roster across the call rather than by
+    /// reading the commit's description: the roster is the state that actually decides who
+    /// can decrypt, so a discrepancy between the two would favour the wrong one.
+    pub fn process(&mut self, message: MlsMessage) -> Result<GroupEvent, MlsError> {
         use mls_rs::group::ReceivedMessage;
+
+        let before = self.members();
         let received = self.group.process_incoming_message(message)?;
         self.persist()?;
+
         match received {
-            ReceivedMessage::ApplicationMessage(app) => Ok(Some(app.data().to_vec())),
-            _ => Ok(None),
+            ReceivedMessage::ApplicationMessage(app) => {
+                Ok(GroupEvent::Application(app.data().to_vec()))
+            }
+            ReceivedMessage::Commit(commit) => {
+                if let mls_rs::group::CommitEffect::Removed { remover, .. } = &commit.effect {
+                    return Ok(GroupEvent::Removed { by: sender_index(remover) });
+                }
+                let after = self.members();
+                let added: Vec<_> = after.iter().filter(|m| !before.contains(m)).cloned().collect();
+                let removed: Vec<_> =
+                    before.iter().filter(|m| !after.contains(m)).cloned().collect();
+                Ok(GroupEvent::MembershipChanged {
+                    added,
+                    removed,
+                    // `None` for an external commit: the committer index in that case
+                    // refers to a leaf that was not in the group beforehand, so naming it
+                    // to the user would attribute the change to the wrong member.
+                    committer: (!commit.is_external).then_some(commit.committer),
+                })
+            }
+            _ => Ok(GroupEvent::Other),
         }
     }
 
@@ -368,16 +485,86 @@ impl GroupHandle {
         self.group.current_epoch()
     }
 
+    /// Everyone currently in the group, from the group's own state.
+    ///
+    /// This is the list a UI must show and the list safety numbers must be computed over.
+    /// The server never sees group state — in T1/T2 it holds only ciphertext — so it
+    /// cannot add a leaf here without every member's client rejecting the commit. That is
+    /// exactly the property an account-directory lookup does not have.
+    pub fn members(&self) -> Vec<GroupMember> {
+        self.group
+            .roster()
+            .members_iter()
+            .map(|m| GroupMember {
+                index: m.index,
+                identity: m
+                    .signing_identity
+                    .credential
+                    .as_basic()
+                    .map(|b| b.identifier().to_vec())
+                    .unwrap_or_default(),
+                signature_key: m.signing_identity.signature_key.as_ref().to_vec(),
+            })
+            .collect()
+    }
+
     /// Number of members currently in the group.
     pub fn member_count(&self) -> usize {
         self.group.roster().members_iter().count()
+    }
+
+    /// This client's own leaf, as the group records it.
+    ///
+    /// Taken from the roster rather than from [`Session::public_key`] so that both halves
+    /// of a safety number have the same provenance. They should never disagree; deriving
+    /// one from local state and the other from group state would mean a future divergence
+    /// went unnoticed in the half that matters.
+    pub fn own_member(&self) -> Result<GroupMember, MlsError> {
+        let index = self.group.current_member_index();
+        self.members()
+            .into_iter()
+            .find(|m| m.index == index)
+            .ok_or_else(|| MlsError::Crypto("this client is not in its own roster".into()))
+    }
+
+    /// The safety number to compare out of band with `peer`.
+    ///
+    /// Both fingerprints come from this group's roster, which is the point: a number
+    /// computed over keys the server supplied would match on both ends while an
+    /// attacker-controlled leaf sat in the group. See
+    /// `a_safety_number_is_computed_from_the_group_not_the_directory`.
+    ///
+    /// Pairwise, as in Signal — a group of *n* has *n-1* numbers to compare from any one
+    /// member's point of view, and there is no single value that certifies the whole
+    /// roster.
+    pub fn safety_number_with(
+        &self,
+        peer: &GroupMember,
+    ) -> Result<crate::verification::SafetyNumber, MlsError> {
+        Ok(crate::verification::SafetyNumber::between(
+            &self.own_member()?.fingerprint(),
+            &peer.fingerprint(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verification::{Fingerprint, SafetyNumber};
     use std::path::PathBuf;
+
+    /// The application payload of an event, for tests that only care about the message.
+    ///
+    /// Deliberately a test helper and not a method on [`GroupEvent`]: a public
+    /// `event.application()` would let production code go back to discarding membership
+    /// changes in one call, which is the behaviour this enum exists to prevent.
+    fn app(event: GroupEvent) -> Option<Vec<u8>> {
+        match event {
+            GroupEvent::Application(data) => Some(data),
+            _ => None,
+        }
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -406,7 +593,7 @@ mod tests {
             let mut bg = bob.join(&out.welcome.expect("welcome for new member")).unwrap();
 
             let ct = ag.encrypt(b"before restart").unwrap();
-            assert_eq!(bg.process(ct).unwrap().as_deref(), Some(&b"before restart"[..]));
+            assert_eq!(app(bg.process(ct).unwrap()).as_deref(), Some(&b"before restart"[..]));
             group_id
         };
 
@@ -418,11 +605,11 @@ mod tests {
         assert_eq!(ag.epoch(), bg.epoch(), "both ends must resume at the same epoch");
 
         let ct = ag.encrypt(b"after restart").unwrap();
-        assert_eq!(bg.process(ct).unwrap().as_deref(), Some(&b"after restart"[..]));
+        assert_eq!(app(bg.process(ct).unwrap()).as_deref(), Some(&b"after restart"[..]));
 
         // And in the other direction, so this is not one-way luck.
         let ct = bg.encrypt(b"bob replies").unwrap();
-        assert_eq!(ag.process(ct).unwrap().as_deref(), Some(&b"bob replies"[..]));
+        assert_eq!(app(ag.process(ct).unwrap()).as_deref(), Some(&b"bob replies"[..]));
     }
 
     #[test]
@@ -455,8 +642,8 @@ mod tests {
         bg.process(out.commit).unwrap();
 
         let ct = ag.encrypt(b"hi carol").unwrap();
-        assert_eq!(cg.process(ct.clone()).unwrap().as_deref(), Some(&b"hi carol"[..]));
-        assert_eq!(bg.process(ct).unwrap().as_deref(), Some(&b"hi carol"[..]));
+        assert_eq!(app(cg.process(ct.clone()).unwrap()).as_deref(), Some(&b"hi carol"[..]));
+        assert_eq!(app(bg.process(ct).unwrap()).as_deref(), Some(&b"hi carol"[..]));
     }
 
     #[test]
@@ -499,7 +686,7 @@ mod tests {
         let bob = Session::open(&dir, b"bob").unwrap();
         let mut bg = bob.join(&out.welcome.unwrap()).expect("a pre-restart key package must open");
         let ct = ag.encrypt(b"welcome back").unwrap();
-        assert_eq!(bg.process(ct).unwrap().as_deref(), Some(&b"welcome back"[..]));
+        assert_eq!(app(bg.process(ct).unwrap()).as_deref(), Some(&b"welcome back"[..]));
     }
 
     #[test]
@@ -544,7 +731,7 @@ mod tests {
         let first = ag.encrypt(b"message one").unwrap();
         let second = stale.encrypt(b"message two").unwrap();
 
-        assert_eq!(bg.process(first).unwrap().as_deref(), Some(&b"message one"[..]));
+        assert_eq!(app(bg.process(first).unwrap()).as_deref(), Some(&b"message one"[..]));
         assert!(
             bg.process(second).is_err(),
             "a message sent at an already-spent generation must not be deliverable"
@@ -568,10 +755,10 @@ mod tests {
         assert_eq!(alice_group.epoch(), bob_group.epoch());
 
         let ct = alice_group.encrypt(b"hello bob").unwrap();
-        assert_eq!(bob_group.process(ct).unwrap().as_deref(), Some(&b"hello bob"[..]));
+        assert_eq!(app(bob_group.process(ct).unwrap()).as_deref(), Some(&b"hello bob"[..]));
 
         let ct = bob_group.encrypt(b"hello alice").unwrap();
-        assert_eq!(alice_group.process(ct).unwrap().as_deref(), Some(&b"hello alice"[..]));
+        assert_eq!(app(alice_group.process(ct).unwrap()).as_deref(), Some(&b"hello alice"[..]));
     }
 
     #[test]
@@ -595,8 +782,8 @@ mod tests {
         assert_eq!(cg.epoch(), ag.epoch(), "carol must join at the current epoch");
 
         let ct = ag.encrypt(b"hi all").unwrap();
-        assert_eq!(bg.process(ct.clone()).unwrap().as_deref(), Some(&b"hi all"[..]));
-        assert_eq!(cg.process(ct).unwrap().as_deref(), Some(&b"hi all"[..]));
+        assert_eq!(app(bg.process(ct.clone()).unwrap()).as_deref(), Some(&b"hi all"[..]));
+        assert_eq!(app(cg.process(ct).unwrap()).as_deref(), Some(&b"hi all"[..]));
     }
 
     #[test]
@@ -621,7 +808,7 @@ mod tests {
         let ct = ag.encrypt(b"after carol left").unwrap();
         assert!(cg.process(ct.clone()).is_err(), "a removed member must not be able to decrypt");
         assert_eq!(
-            bg.process(ct).unwrap().as_deref(),
+            app(bg.process(ct).unwrap()).as_deref(),
             Some(&b"after carol left"[..]),
             "remaining members must still receive"
         );
@@ -719,6 +906,194 @@ mod tests {
         let ct = ag.encrypt(b"over the wire").unwrap();
         let bytes = ct.to_bytes().unwrap();
         let reparsed = parse_message(&bytes).unwrap();
-        assert_eq!(bg.process(reparsed).unwrap().as_deref(), Some(&b"over the wire"[..]));
+        assert_eq!(app(bg.process(reparsed).unwrap()).as_deref(), Some(&b"over the wire"[..]));
+    }
+
+    #[test]
+    fn a_safety_number_is_computed_from_the_group_not_the_directory() {
+        // Found by probing, and the reason `GroupHandle::members` exists.
+        //
+        // A safety number built from keys the *server* published matches on both ends
+        // even when the server put its own leaf in the group: it hands Alice and Bob each
+        // other's real key to display, and MLS-encrypts to a third leaf. The comparison
+        // then actively reassures the two people it should be warning.
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+        // Mallory presents Bob's credential bytes. Nothing in MLS prevents that — a
+        // `BasicCredential` is an unauthenticated label (see [`Session::new`]).
+        let mallory = Session::new(b"bob@instance").unwrap();
+
+        let mut group = alice.create_group().unwrap();
+        let commit = group.add_member(mallory.key_package().unwrap()).unwrap();
+        mallory.join(&commit.welcome.expect("a welcome")).unwrap();
+
+        // The broken construction: fingerprints over directory keys.
+        let alice_from_directory = SafetyNumber::between(
+            &Fingerprint::compute(alice.public_key(), b"alice@instance"),
+            &Fingerprint::compute(bob.public_key(), b"bob@instance"),
+        );
+        let bob_from_directory = SafetyNumber::between(
+            &Fingerprint::compute(bob.public_key(), b"bob@instance"),
+            &Fingerprint::compute(alice.public_key(), b"alice@instance"),
+        );
+        assert_eq!(
+            alice_from_directory, bob_from_directory,
+            "the directory-sourced numbers agree — which is exactly the danger"
+        );
+
+        // The construction that holds: fingerprints from the group's own roster.
+        let peer = group
+            .members()
+            .into_iter()
+            .find(|m| m.index != group.own_member().unwrap().index)
+            .expect("a second member");
+        let from_group = group.safety_number_with(&peer).unwrap();
+
+        assert_ne!(
+            from_group, alice_from_directory,
+            "a number sourced from the group must expose the substituted leaf"
+        );
+        assert_eq!(
+            peer.signature_key,
+            mallory.public_key(),
+            "the roster names the key actually in the group, not the one advertised"
+        );
+    }
+
+    #[test]
+    fn both_ends_of_an_honest_group_see_the_same_safety_number() {
+        // The other half of the property: sourcing from the roster must not break the
+        // ordinary case, or users learn that mismatches are normal and stop looking.
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let commit = alice_group.add_member(bob.key_package().unwrap()).unwrap();
+        let bob_group = bob.join(&commit.welcome.expect("a welcome")).unwrap();
+
+        let alice_me = alice_group.own_member().unwrap();
+        let bob_me = bob_group.own_member().unwrap();
+
+        let alice_shows = alice_group.safety_number_with(&bob_me).unwrap();
+        let bob_shows = bob_group.safety_number_with(&alice_me).unwrap();
+        assert_eq!(alice_shows, bob_shows);
+    }
+
+    #[test]
+    fn an_added_member_cannot_be_added_silently() {
+        // "A member added without existing members seeing the commit is a wiretap."
+        // Before `GroupEvent`, processing that commit returned the same `None` as every
+        // other handshake, so no client could have surfaced it.
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+        let mallory = Session::new(b"mallory@instance").unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let first = alice_group.add_member(bob.key_package().unwrap()).unwrap();
+        let mut bob_group = bob.join(&first.welcome.expect("a welcome")).unwrap();
+
+        let second = alice_group.add_member(mallory.key_package().unwrap()).unwrap();
+        let event = bob_group.process(second.commit).unwrap();
+
+        let GroupEvent::MembershipChanged { added, removed, committer } = event else {
+            panic!("bob must be told the roster changed, got {event:?}");
+        };
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].identity, b"mallory@instance");
+        assert_eq!(
+            added[0].signature_key,
+            mallory.public_key(),
+            "the event must carry the key that joined, so a UI can show its safety number"
+        );
+        assert!(removed.is_empty());
+        assert_eq!(
+            committer,
+            Some(alice_group.own_member().unwrap().index),
+            "bob must be able to say who did it"
+        );
+    }
+
+    #[test]
+    fn a_removed_member_is_reported_to_everyone_left() {
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+        let carol = Session::new(b"carol@instance").unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let first = alice_group.add_member(bob.key_package().unwrap()).unwrap();
+        let mut bob_group = bob.join(&first.welcome.expect("a welcome")).unwrap();
+
+        let second = alice_group.add_member(carol.key_package().unwrap()).unwrap();
+        bob_group.process(second.commit).unwrap();
+
+        let carol_index = alice_group
+            .members()
+            .into_iter()
+            .find(|m| m.identity == b"carol@instance")
+            .expect("carol is in the roster")
+            .index;
+        let third = alice_group.remove_member(carol_index).unwrap();
+
+        let GroupEvent::MembershipChanged { added, removed, .. } =
+            bob_group.process(third.commit).unwrap()
+        else {
+            panic!("a removal must be visible too");
+        };
+        assert!(added.is_empty());
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].identity, b"carol@instance");
+    }
+
+    #[test]
+    fn a_member_learns_that_it_was_removed() {
+        // The roster diff cannot see this one: mls-rs does not advance a group whose local
+        // client was just ejected, so before and after are identical and the diff reports
+        // nothing. Without a distinct variant a removed device keeps a conversation on
+        // screen that it can no longer read.
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let commit = alice_group.add_member(bob.key_package().unwrap()).unwrap();
+        let mut bob_group = bob.join(&commit.welcome.expect("a welcome")).unwrap();
+
+        let bob_leaf = alice_group
+            .members()
+            .into_iter()
+            .find(|m| m.identity == b"bob@instance")
+            .expect("bob is in the roster")
+            .index;
+        let removal = alice_group.remove_member(bob_leaf).unwrap();
+
+        let event = bob_group.process(removal.commit).unwrap();
+        assert_eq!(
+            event,
+            GroupEvent::Removed { by: Some(alice_group.own_member().unwrap().index) },
+            "a removed member must be told, and by whom"
+        );
+    }
+
+    #[test]
+    fn the_roster_names_every_member_and_its_key() {
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+
+        let mut group = alice.create_group().unwrap();
+        group.add_member(bob.key_package().unwrap()).unwrap();
+
+        let members = group.members();
+        assert_eq!(members.len(), 2);
+        let by_identity: Vec<_> = members.iter().map(|m| m.identity.clone()).collect();
+        assert!(by_identity.contains(&b"alice@instance".to_vec()));
+        assert!(by_identity.contains(&b"bob@instance".to_vec()));
+
+        let own = group.own_member().unwrap();
+        assert_eq!(own.identity, b"alice@instance");
+        assert_eq!(own.signature_key, alice.public_key());
+        assert_eq!(
+            own.fingerprint(),
+            alice.fingerprint(),
+            "the roster's view of this device must agree with its own"
+        );
     }
 }

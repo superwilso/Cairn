@@ -67,14 +67,14 @@ crates/
   cairn-cli/          headless demo client                 (AGPL-3.0)
 ```
 
-No UI yet — deliberately. The protocol comes first, and the core is fully testable without
-one.
+There is a minimal line-based client, not a graphical one. The protocol comes first, and
+the core is fully testable without a UI.
 
 ## Try it
 
 ```bash
-cargo test --workspace     # 89 tests
-cargo run -p cairn-cli     # the vertical slice, end to end
+cargo test --workspace     # 176 tests
+cargo run -p cairn-cli     # the vertical slice, in-process, end to end
 ```
 
 The demo establishes an MLS group, sends franked encrypted messages, has the "server"
@@ -82,8 +82,36 @@ sequence and tag them without seeing plaintext, builds a transcript report, veri
 and then demonstrates that editing a message, dropping context, or reattributing a message
 to another account are all detected.
 
-Run the server with `cargo run -p cairn-server` (defaults to `127.0.0.1:8080`; set
-`CAIRN_BIND` to change).
+### Two people, over a real server
+
+```bash
+CAIRN_REGISTRATION_POLICY=open cargo run -p cairn-server    # 127.0.0.1:8080
+
+# Bob, in one terminal — publish key packages, then note his user id
+cargo run -p cairn-cli -- chat --name bob
+  /keys 5
+  /whoami
+
+# Alice, in another — create a room and add him
+cargo run -p cairn-cli -- chat --name alice
+  /new
+  /add usr_...
+  hello
+
+# Bob opens the room id Alice was shown, compares safety numbers, and verifies
+  /open rom_...
+  /safety
+  /verify 0
+```
+
+The prompt carries the tier badge at all times, and says `plaintext-transport` over
+`http://` — MLS protects the message body there and nothing protects anything else.
+Members added to a room are announced in the timeline with their verification state, and
+`/safety` shows numbers derived from the MLS group's own roster, which is the only source
+that makes the comparison mean anything (`docs/01-threat-model.md` §4).
+
+**Not yet an invite flow:** the room id and user id still have to be passed between people
+by hand. See M3 in [the roadmap](docs/10-roadmap.md).
 
 ## Documentation
 

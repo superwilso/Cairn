@@ -9,7 +9,10 @@
 //! 5. Tampering with the report is detected.
 //!
 //! This is what `docs/README` calls the Phase 4 exit condition, minus the network hop.
-//! Run with `cargo run -p cairn-cli`.
+//! Run with `cargo run -p cairn-cli` — or `cargo run -p cairn-cli -- chat` for the
+//! interactive client against a real instance.
+
+mod chat;
 
 use cairn_crypto::franking::{self, Commitment, Context, ReportedMessage, ServerFrankingKey};
 use cairn_crypto::mls::Session;
@@ -18,6 +21,16 @@ use cairn_crypto::TranscriptReport;
 use cairn_proto::{DeviceId, RoomId, UserId};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("chat") {
+        return chat::run(chat::Options::from_args(std::env::args().skip(2))?);
+    }
+    demo()
+}
+
+/// The in-process vertical slice, kept because it is the cheapest way to see the whole
+/// protocol at once without running a server.
+fn demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Cairn vertical slice ===\n");
 
     // --- 1. Two participants, one MLS group -------------------------------------------
@@ -91,9 +104,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prev = Some(commitment);
 
         // Recipient: decrypt, and retain what a future report would need.
-        let decrypted = bob_group
-            .process(cairn_crypto::mls::parse_message(&wire)?)?
-            .ok_or("expected an application message")?;
+        let decrypted = match bob_group.process(cairn_crypto::mls::parse_message(&wire)?)? {
+            cairn_crypto::mls::GroupEvent::Application(data) => data,
+            other => return Err(format!("expected an application message, got {other:?}").into()),
+        };
         assert_eq!(decrypted, plaintext, "decrypted text must match what was sent");
 
         println!(
