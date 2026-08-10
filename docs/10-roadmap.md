@@ -76,6 +76,52 @@ needs a room id pasted to them out of band and must be added by user id, so "joi
 invite, without being told what to type" is not yet true. That belongs with M3's invite
 work, which the same exit condition depends on.
 
+### Direction: WhatsApp for the surface, not for the architecture
+
+The owner's call, and the boundary matters more than the list.
+
+**Take from WhatsApp:** onboarding and identity, everyday messaging features, multi-device
+and backup.
+
+**Do not take:** its encryption model. **ADR-001 stands.** WhatsApp end-to-end encrypts
+groups far larger than Cairn's T2 ceiling, which is a real demonstration that the other
+choice works — and it was considered and declined. T3 remains transport-only and
+server-readable, because that is what buys server-side moderation and search on the
+surfaces where abuse actually scales. Everything below is additive to that model, and any
+proposal that quietly erodes it is out of scope, not a refinement.
+
+Also declined, for the record: **phone-number identity**. It is the strongest discovery
+mechanism available and the most criticised thing about WhatsApp, because the address-book
+upload hands the server the social graph. `01-threat-model.md` §3 already concedes broad
+metadata exposure, so this would not break a stated guarantee — it would make the conceded
+thing much worse, in the one product area where Cairn claims to be different.
+
+#### What this means concretely
+
+- **Usernames plus invite links** replace passing raw ids by hand. `@alice` claimed like an
+  account; a link carrying a room capability for joining. This leaks nothing the server does
+  not already know — it holds the accounts — and it removes the friction that has ended
+  every session so far at "paste this uuid to your friend". Depends on the room-invite
+  token design recorded under M3.
+- **Everyday messaging**: disappearing messages, voice notes, media, message history. All
+  but the first are behind attachments, which are behind [ADR-007](adr/007-server-storage.md).
+  Disappearing messages are independent and cheap, and fit the threat model without strain.
+- **Multi-device and backup.** Device-scoped MLS leaves already exist
+  (`01-threat-model.md` §6), so the foundation is there and largely unused; `/v1/devices`
+  exists but no linking flow does. Copy WhatsApp's *shape* for backup, not its defaults —
+  cloud backup is historically where its E2EE guarantee weakened, and any backup here has to
+  answer to `07-regulatory-posture.md` and the keystore decision above.
+
+**Not adopted:** read receipts and typing indicators. Both leak more than users expect —
+presence and timing are exactly what `01-threat-model.md` §3 lists as already-conceded
+metadata, and these would broadcast it continuously rather than per message.
+
+#### Sequencing is unchanged
+
+[ADR-007](adr/007-server-storage.md) still comes first. Media, voice notes and history all
+sit behind attachments, which sit behind the storage rewrite. Usernames and disappearing
+messages are the two items that can proceed in parallel, since neither needs attachments.
+
 ### Decided, unimplemented
 
 Four calls made by the owner, so a session does not re-litigate them:
