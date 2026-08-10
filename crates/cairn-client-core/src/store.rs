@@ -43,6 +43,19 @@ pub struct ConversationRecord {
     /// The room's tier, recorded so a resumed conversation is rebuilt at the tier it was
     /// created with rather than one inferred from whatever the server says today.
     pub tier: Tier,
+    /// Highest server sequence number this device has already processed.
+    ///
+    /// Persisted because **a message cannot be processed twice**: MLS deletes each message
+    /// key after use, so re-reading a room from the start after a restart does not replay
+    /// the history, it produces `invalid generation` and `incorrect epoch` errors for
+    /// traffic already consumed. A client that keeps this only in memory shows a wall of
+    /// decryption failures on every launch and teaches its user that those are normal —
+    /// which is the state in which a real failure goes unnoticed.
+    ///
+    /// `#[serde(default)]` so an index written before this field loads as 0 rather than
+    /// failing, which for an old index means one final replay and then correctness.
+    #[serde(default)]
+    pub cursor: u64,
 }
 
 /// A room id → MLS group id index, persisted as one JSON file.
@@ -95,11 +108,34 @@ impl ConversationIndex {
             }
         }
 
+        // Recording a room again must not rewind its cursor: `record` is called after a
+        // join and after an add, both of which happen mid-conversation.
+        let cursor = self.rooms.get(&room).map_or(0, |existing| existing.cursor);
         self.rooms.insert(
             room,
-            ConversationRecord { group_id: group_id.map(hex::encode), tier: seal.tier() },
+            ConversationRecord { group_id: group_id.map(hex::encode), tier: seal.tier(), cursor },
         );
         self.save()
+    }
+
+    /// Note that everything up to `seq` has been processed.
+    ///
+    /// Monotonic. Messages can arrive out of order within one fetch, and moving the cursor
+    /// backwards would mean asking the server for traffic whose keys are already gone.
+    pub fn advance(&mut self, room: RoomId, seq: u64) -> Result<(), IndexError> {
+        let Some(record) = self.rooms.get_mut(&room) else {
+            return Ok(());
+        };
+        if seq <= record.cursor {
+            return Ok(());
+        }
+        record.cursor = seq;
+        self.save()
+    }
+
+    /// Where to resume reading this room. Zero for a room never read.
+    pub fn cursor(&self, room: &RoomId) -> u64 {
+        self.rooms.get(room).map_or(0, |record| record.cursor)
     }
 
     pub fn get(&self, room: &RoomId) -> Option<&ConversationRecord> {
@@ -138,6 +174,57 @@ impl ConversationIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_proto::RoomShape;
+
+    #[test]
+    fn a_read_cursor_survives_a_restart() {
+        // Not a convenience. MLS discards each message key after use, so a client that
+        // restarts at sequence 0 cannot re-read what it already read — it produces
+        // decryption failures for its own history. Observed by restarting the interactive
+        // client against a live server: "invalid generation 0", "incorrect epoch".
+        let dir = scratch("cursor");
+        let room = RoomId::new();
+        let seal = RoomSeal::new(RoomShape {
+            is_direct: true,
+            is_publicly_discoverable: false,
+            member_ceiling: 2,
+        })
+        .unwrap();
+
+        {
+            let mut index = ConversationIndex::open(&dir).unwrap();
+            index.record(room, &seal, Some(b"group")).unwrap();
+            assert_eq!(index.cursor(&room), 0);
+            index.advance(room, 7).unwrap();
+        }
+
+        let index = ConversationIndex::open(&dir).unwrap();
+        assert_eq!(index.cursor(&room), 7);
+    }
+
+    #[test]
+    fn a_cursor_never_moves_backwards() {
+        let dir = scratch("monotonic");
+        let room = RoomId::new();
+        let seal = RoomSeal::new(RoomShape {
+            is_direct: true,
+            is_publicly_discoverable: false,
+            member_ceiling: 2,
+        })
+        .unwrap();
+
+        let mut index = ConversationIndex::open(&dir).unwrap();
+        index.record(room, &seal, Some(b"group")).unwrap();
+        index.advance(room, 9).unwrap();
+
+        // Out-of-order arrivals within one fetch must not rewind it.
+        index.advance(room, 4).unwrap();
+        assert_eq!(index.cursor(&room), 9);
+
+        // Nor must re-recording the room, which happens on every join and add.
+        index.record(room, &seal, Some(b"group")).unwrap();
+        assert_eq!(index.cursor(&room), 9, "re-recording a room must not replay it");
+    }
 
     fn direct() -> RoomSeal {
         RoomSeal::new(cairn_proto::RoomShape {

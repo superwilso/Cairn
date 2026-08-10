@@ -183,6 +183,28 @@ impl Conversation {
         self.group.as_mut()
     }
 
+    /// Everyone in this conversation, as the MLS group's own state records them.
+    ///
+    /// Empty for a T3 conversation, which has no group: its membership is the server's to
+    /// state, and a client must not present a server's list with the same confidence as a
+    /// roster it verified.
+    pub fn members(&self) -> Vec<GroupMember> {
+        self.group.as_ref().map(GroupHandle::members).unwrap_or_default()
+    }
+
+    /// This device's own leaf.
+    pub fn own_member(&self) -> Result<GroupMember, ConversationError> {
+        Ok(self.group.as_ref().ok_or(MlsError::NoGroup)?.own_member()?)
+    }
+
+    /// The safety number to compare with `peer`, out of band.
+    pub fn safety_number_with(
+        &self,
+        peer: &GroupMember,
+    ) -> Result<cairn_crypto::verification::SafetyNumber, ConversationError> {
+        Ok(self.group.as_ref().ok_or(MlsError::NoGroup)?.safety_number_with(peer)?)
+    }
+
     /// Encrypt and frank a message.
     ///
     /// Franking and encryption happen together and cannot be separated by a caller —
@@ -220,6 +242,37 @@ impl Conversation {
         .with_franking_commitment(commitment.to_hex());
         let envelope = self.sign(envelope)?;
         Ok(OutboundMessage { envelope, opening, commitment })
+    }
+
+    /// Wrap an MLS handshake message — a commit or a welcome — for relay through the room.
+    ///
+    /// MLS produces these; something has to carry them. Cairn uses the room's own message
+    /// stream rather than a separate channel, so the server sequences handshakes and
+    /// application messages together. That ordering is what a single-instance deployment
+    /// gives MLS for free (ADR-002), and splitting the two streams would reintroduce the
+    /// problem of relating them.
+    ///
+    /// Deliberately unfranked: franking binds *content* a recipient may want to report,
+    /// and a handshake has none. A commitment here would be a commitment to ciphertext
+    /// nobody can open, which is worse than none — it would look like evidence.
+    pub fn wrap_handshake(
+        &self,
+        message: &[u8],
+        now_ms: i64,
+    ) -> Result<Envelope, ConversationError> {
+        let tier = self.seal.tier();
+        if !tier.is_e2ee() {
+            return Err(ConversationError::NotEncrypted);
+        }
+        let envelope = Envelope::new(
+            tier,
+            self.room,
+            self.user,
+            self.device,
+            now_ms,
+            EnvelopePayload::MlsHandshake { message: message.to_vec(), epoch_seq: None },
+        )?;
+        self.sign(envelope)
     }
 
     /// Send plaintext in a T3 conversation.
@@ -268,6 +321,7 @@ impl Conversation {
                     GroupEvent::MembershipChanged { added, removed, committer } => {
                         return Ok(TimelineEvent::Membership { added, removed, committer })
                     }
+                    GroupEvent::Removed { by } => return Ok(TimelineEvent::RemovedFromRoom { by }),
                     GroupEvent::Other => return Ok(TimelineEvent::Nothing),
                 };
 
@@ -296,6 +350,27 @@ impl Conversation {
     }
 }
 
+/// Accept `envelope` as an invitation to join a group, if that is what it carries.
+///
+/// A client polling a room it was just added to sees the welcome as an ordinary message.
+/// `Ok(None)` means the envelope was not a welcome — commits and application messages for
+/// a group this device is not yet in look the same from outside and are simply not for it.
+/// A malformed welcome is an error rather than `None`, so a joiner that can never join
+/// finds out instead of polling forever.
+pub fn accept_welcome(
+    session: &Session,
+    envelope: &Envelope,
+) -> Result<Option<GroupHandle>, ConversationError> {
+    let EnvelopePayload::MlsHandshake { message, .. } = &envelope.payload else {
+        return Ok(None);
+    };
+    let parsed = cairn_crypto::mls::parse_message(message)?;
+    if !cairn_crypto::mls::is_welcome(&parsed) {
+        return Ok(None);
+    }
+    Ok(Some(session.join(&parsed)?))
+}
+
 /// What actually gets encrypted: the message and its franking opening.
 #[derive(Debug, Serialize, Deserialize)]
 struct InnerBody {
@@ -319,6 +394,13 @@ pub enum TimelineEvent {
         removed: Vec<GroupMember>,
         /// Leaf index of the member who committed the change, when the message named one.
         committer: Option<u32>,
+    },
+    /// **This device was removed from the conversation.** It can no longer read anything
+    /// sent after this point, and a client that keeps the room looking live is lying about
+    /// it.
+    RemovedFromRoom {
+        /// Leaf index of the member who removed it, when the commit named one.
+        by: Option<u32>,
     },
     /// A handshake that changed no membership — a proposal, or a key update.
     Nothing,

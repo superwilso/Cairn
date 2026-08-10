@@ -119,6 +119,19 @@ which tier they are in.
    member is a wiretap — so this must be visible in the timeline, not a toast.
 7. **No dark patterns toward T3.** Never make the less-private option the default styling,
    the pre-selected choice, or the faster path.
+8. **The badge is derived locally, never taken from the server.** The client's own
+   `RoomSeal` decides whether it encrypts, so a badge sourced from the instance's response
+   could describe something other than what the client does with the message.
+   `Client::create_room` derives the tier from the room's shape — a pure function of the
+   published rule in §2 — and **refuses the room** if the instance disagrees in either
+   direction, including when the instance claims *more* protection than the rule allows.
+9. **A badge covers content, not the connection.** An E2EE indicator over a plaintext
+   transport tells the user something true about their message body and something false
+   about everything around it. The client states the transport separately.
+
+**Status.** 1, 5, 6, 8, and 9 are implemented in `cairn-cli chat`; 2 is met trivially by a
+line-based client whose prompt *is* the composer. 3, 4, and 7 await a graphical client and
+a T3 implementation — the current client creates only T1 rooms.
 
 ---
 

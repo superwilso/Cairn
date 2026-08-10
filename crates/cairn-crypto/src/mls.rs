@@ -102,6 +102,27 @@ pub fn parse_message(bytes: &[u8]) -> Result<MlsMessage, MlsError> {
     Ok(MlsMessage::from_bytes(bytes)?)
 }
 
+/// The leaf behind a commit, when it was an ordinary member.
+///
+/// External senders and new-member proposals deliberately yield `None`: their index refers
+/// to a different table, so showing it as a member number would name the wrong person.
+fn sender_index(sender: &mls_rs::group::Sender) -> Option<u32> {
+    match sender {
+        mls_rs::group::Sender::Member(index) => Some(*index),
+        _ => None,
+    }
+}
+
+/// Whether a message is a welcome, and so an invitation to join rather than group traffic.
+///
+/// A client polling a room it has not joined needs to tell the two apart before trying:
+/// feeding a commit to [`Session::join`] fails, and treating every failure as "not a
+/// welcome" would swallow genuine errors — a corrupt welcome would look identical to an
+/// ordinary message and the user would simply never join.
+pub fn is_welcome(message: &MlsMessage) -> bool {
+    matches!(message.wire_format(), mls_rs::WireFormat::Welcome)
+}
+
 /// Generate a fresh signature keypair for the pinned ciphersuite.
 fn generate_signature_key(
 ) -> Result<(mls_rs::crypto::SignatureSecretKey, mls_rs::crypto::SignaturePublicKey), MlsError> {
@@ -325,6 +346,21 @@ pub enum GroupEvent {
         /// The leaf that committed the change, when the message named one.
         committer: Option<u32>,
     },
+    /// **This device was removed from the group.**
+    ///
+    /// A separate variant because the roster diff cannot see it: `mls-rs` does not advance
+    /// a group the local client was just ejected from, so before and after are identical
+    /// and [`GroupEvent::MembershipChanged`] would report nothing changed. Found by
+    /// running the removal over HTTP and printing what the removed member actually got —
+    /// `Membership { added: [], removed: [], committer: Some(0) }`.
+    ///
+    /// Left unreported, a client would keep showing a conversation it had been thrown out
+    /// of, and the user would learn about it only when a send failed for reasons the UI
+    /// could not explain.
+    Removed {
+        /// The member who did it, when the commit named one.
+        by: Option<u32>,
+    },
     /// A proposal, or a handshake that did not alter the roster.
     Other,
 }
@@ -424,6 +460,9 @@ impl GroupHandle {
                 Ok(GroupEvent::Application(app.data().to_vec()))
             }
             ReceivedMessage::Commit(commit) => {
+                if let mls_rs::group::CommitEffect::Removed { remover, .. } = &commit.effect {
+                    return Ok(GroupEvent::Removed { by: sender_index(remover) });
+                }
                 let after = self.members();
                 let added: Vec<_> = after.iter().filter(|m| !before.contains(m)).cloned().collect();
                 let removed: Vec<_> =
@@ -1003,6 +1042,35 @@ mod tests {
         assert!(added.is_empty());
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].identity, b"carol@instance");
+    }
+
+    #[test]
+    fn a_member_learns_that_it_was_removed() {
+        // The roster diff cannot see this one: mls-rs does not advance a group whose local
+        // client was just ejected, so before and after are identical and the diff reports
+        // nothing. Without a distinct variant a removed device keeps a conversation on
+        // screen that it can no longer read.
+        let alice = Session::new(b"alice@instance").unwrap();
+        let bob = Session::new(b"bob@instance").unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let commit = alice_group.add_member(bob.key_package().unwrap()).unwrap();
+        let mut bob_group = bob.join(&commit.welcome.expect("a welcome")).unwrap();
+
+        let bob_leaf = alice_group
+            .members()
+            .into_iter()
+            .find(|m| m.identity == b"bob@instance")
+            .expect("bob is in the roster")
+            .index;
+        let removal = alice_group.remove_member(bob_leaf).unwrap();
+
+        let event = bob_group.process(removal.commit).unwrap();
+        assert_eq!(
+            event,
+            GroupEvent::Removed { by: Some(alice_group.own_member().unwrap().index) },
+            "a removed member must be told, and by whom"
+        );
     }
 
     #[test]

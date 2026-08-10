@@ -142,11 +142,30 @@ holds.
 polish. They are what makes A4 a bounded adversary rather than an unbounded one, and they
 belong in the same milestone as encryption itself.
 
-**Status.** Safety numbers are implemented and tested (`cairn-crypto::verification`),
-including detection of a key that changes after verification. They are **not yet shown to
-any user**, and key transparency is unimplemented. So A4 remains an *unbounded* adversary
-in practice: the tool exists, but nothing in the product yet puts it in front of the person
-who has to use it. A primitive nobody sees protects nobody.
+**Status.** Safety numbers are implemented, tested, and now **shown to the user** by the
+interactive client (`cairn-cli chat`, `/safety`), with verification state persisted across
+restarts and a loud, sticky warning when a verified contact's key changes.
+
+Two things had to be fixed before that display was worth anything, and both were found by
+attacking the code rather than reading it:
+
+- **The number was computed over the wrong key.** Nothing could read the MLS roster, so the
+  only key a client could reach was the one the *server* published in its account
+  directory. A malicious server could therefore hand Alice and Bob each other's real keys
+  to display while committing a third leaf into the group: both sides saw the *same*
+  number, compared it, and were reassured. Numbers are now derived from the group's own
+  ratchet tree (`GroupHandle::safety_number_with`), which the server cannot alter without
+  every member's client rejecting the commit.
+- **Membership changes were invisible.** A commit adding a member was indistinguishable
+  from any other handshake, so no client could have warned about one. Roster changes, and
+  this device's own removal, are now distinct events the client prints in the timeline.
+
+**A4 is bounded for a user who actually compares.** That is a narrower claim than "A4 is
+bounded", and the gap is deliberate: verification is manual and per-peer, so it protects
+exactly the conversations someone took the trouble to check. **Key transparency remains
+unimplemented** (M5), and until it exists, a user who never compares a number is still
+exposed to key substitution — the tool is now in front of them, but using it is their
+decision.
 
 ---
 

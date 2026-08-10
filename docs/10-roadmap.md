@@ -53,17 +53,28 @@ self-hosting guide.
 The owner has deferred UI, so this is deliberately minimal — a TUI or a plain desktop
 window, not the native Windows client of ADR-006.
 
-- [ ] Minimal client UI (TUI is acceptable and cheapest)
-- [ ] **Tier badge always visible** — `docs/02-encryption-tiers.md` §4 is normative, and a
-      client that hides it is worse than one with no encryption, because users calibrate to
-      the badge
-- [ ] **Safety numbers displayed and comparable.** Until a UI shows them, key verification
-      protects nobody and a malicious server stays unbounded (`01-threat-model.md` §4)
-- [ ] Membership changes visible in the timeline — a silently added member is a wiretap
-- [ ] Contact store persisting verification state
+- [x] **Minimal client UI.** `cargo run -p cairn-cli -- chat`, line-based, no new
+      dependencies. Creates rooms, adds members, sends and receives, verifies contacts.
+- [x] **Tier badge always visible** — on every prompt, derived *locally* from the room's
+      shape. `Client::create_room` refuses a room the instance classifies differently in
+      either direction, rather than displaying a label it cannot vouch for. The badge also
+      says `plaintext-transport` over `http://`, since a lock icon there would be a claim
+      the threat model does not support.
+- [x] **Safety numbers displayed and comparable** (`/safety`, `/verify`), computed from
+      the MLS roster. Probing found the previous construction certified nothing: both ends
+      of a MITM'd conversation displayed the *same* number. See `01-threat-model.md` §4.
+- [x] **Membership changes visible in the timeline.** Additions, removals, and this
+      device's own removal are distinct events; before this a commit adding a member was
+      indistinguishable from any other handshake.
+- [x] Contact store persisting verification state, including a sticky
+      `ChangedSinceVerified` warning that re-observation cannot clear.
 
-**Exit:** a friend installs it, joins by invite, sends a message, and compares a safety
-number, without being told what to type.
+**Exit: partly met.** The mechanics work end to end against a real server — verified by
+running two clients, not only by tests, which is how the message-truncation and
+cursor-replay bugs surfaced. **What is still owed is the invite flow**: a joiner currently
+needs a room id pasted to them out of band and must be added by user id, so "joins by
+invite, without being told what to type" is not yet true. That belongs with M3's invite
+work, which the same exit condition depends on.
 
 ## M3 — Friends test
 
@@ -72,7 +83,9 @@ number, without being told what to type.
 - [ ] Self-hosting guide, honest about what is not ready
 - [ ] Docker image and compose file
 - [ ] TLS guidance — the server has no transport security of its own
-- [ ] Invite flow that a non-technical person can follow
+- [ ] Invite flow that a non-technical person can follow — **M2's exit condition depends
+      on this**, not just M3's: today a joiner is handed a room id out of band and added by
+      user id
 - [ ] Backup and restore, including **the franking key**: losing it invalidates every
       report the instance ever issued
 - [ ] Rate limiting on registration and sending

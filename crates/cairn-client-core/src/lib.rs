@@ -25,8 +25,8 @@ pub mod transport;
 pub use client::{Client, ClientError};
 pub use contacts::{ContactError, ContactRecord, ContactStore};
 pub use conversation::{
-    Conversation, ConversationError, OutboundMessage, ReceivedFranking, ReceivedMessage,
-    TimelineEvent,
+    accept_welcome, Conversation, ConversationError, OutboundMessage, ReceivedFranking,
+    ReceivedMessage, TimelineEvent,
 };
 pub use store::{ConversationIndex, ConversationRecord, IndexError};
 pub use transport::{Transport, TransportError};
