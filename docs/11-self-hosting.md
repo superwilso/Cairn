@@ -125,7 +125,71 @@ If you are upgrading an instance that predates this change, it will hold a `stat
 instead. That is imported automatically on first start and **left in place**, so a rollback
 to the previous release still finds its data. Nothing to do.
 
-## 6. Updating
+## 6. Running it at home, without publishing your home IP
+
+A Raspberry Pi in a spare room is a legitimate deployment, and it is the reason paid
+capacity on a flagship instance is acceptable (`13-customisation.md` §2): the alternative to
+paying is real. But **every user of your instance connects to it**, and by default that means
+every user learns your home IP address.
+
+For three friends who already know where you live, that may be fine. For anything wider it
+is a doxxing risk you cannot take back, and it is worth deciding *before* you hand anyone an
+invite. Three options, in increasing order of what you give up.
+
+### Do not publish it at all — WireGuard or Tailscale
+
+Do not expose the instance to the internet. Put every device on a private overlay network
+and let the instance listen only there.
+
+Nothing to hide, because nothing is public: no port forwarding, no DNS record, no
+certificate. **This is the best option for a friends test**, and the one to start with. What
+you give up is that everyone needs the overlay client installed and configured, so it does
+not scale past people who will tolerate that.
+
+### A rented front door — VPS plus a tunnel back
+
+Rent the cheapest VPS available, point your domain at *its* address, and tunnel from the Pi
+to it over WireGuard. Users see the VPS. Your home IP appears in nothing public.
+
+**Terminate TLS on the Pi, not on the VPS.** This is the part that matters and the part most
+guides get wrong. A normal reverse proxy decrypts and re-encrypts, so the VPS sees every
+request in the clear — all metadata, and in a T3 room the actual message content. Configure
+the VPS as a **stream-level passthrough** instead (SNI routing, no TLS termination), and it
+carries bytes it cannot read. It still sees who connects, when, and how much, which is the
+metadata `01-threat-model.md` §3.1 already concedes — but it stops there.
+
+What you give up: a few dollars a month, and the VPS provider becomes a party who can
+observe traffic patterns.
+
+### Hide it completely — a Tor onion service
+
+An onion service has no IP address to leak, needs no port forwarding, no DNS, and no
+certificate authority — the address authenticates the service by construction. For a
+messaging instance the latency is tolerable.
+
+What you give up: users need Tor, discovery is harder, and **calls are effectively out** —
+real-time media over Tor is not viable.
+
+### Two things a tunnel does not fix
+
+- **A commercial tunnel that terminates TLS sees everything the VPS option was configured
+  not to see.** Cloudflare Tunnel and similar are genuinely easy and genuinely hide your IP,
+  but they decrypt your traffic to do it. That is a third party your users did not choose,
+  with the same view of metadata your own instance has and, on T3 rooms, of content. If you
+  use one, say so — running a privacy product through a provider you have not disclosed is
+  exactly the kind of unstated protection gap this project refuses elsewhere.
+- **Hiding the server's address does nothing for peer-to-peer calls.** ICE hands each peer
+  the other's IP directly, so a call would leak the address you went to trouble to hide —
+  and not only yours. [`12-realtime-media.md`](12-realtime-media.md) §10 makes relaying the
+  default for this reason; if you are hiding your home IP, treat relaying as **mandatory**,
+  not a default to turn off for bandwidth.
+
+Also worth knowing before you start: many residential ISPs prohibit running servers, most
+hand out dynamic addresses (so you need dynamic DNS), and an increasing number use CGNAT,
+which makes inbound connections impossible without one of the options above regardless of
+what you want.
+
+## 7. Updating
 
 ```bash
 git pull && docker compose up -d --build

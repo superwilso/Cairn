@@ -260,7 +260,17 @@ more infrastructure.
 
 ## 12. Open questions
 
-1. **Do calls inherit the room's tier, or are they always E2EE?** This document assumes
+1. **~~Do calls inherit the room's tier?~~ DECIDED (owner): inherit, with an upgrade-only
+   choice at creation.** A call takes its room's tier; at creation the creator may
+   additionally opt *up* to E2EE, never down. A T3 room may host an E2EE call; a T1 or T2
+   room may never host a transport-only one, and there is no setter afterwards. The
+   badge-disagreement worry below is resolved by the asymmetry — the difference is always in
+   the safer direction and the user chose it. See `02-encryption-tiers.md` §6.4.
+
+   §5's rule is unaffected and still binding: a call that *is* E2EE never degrades to
+   plaintext mid-session for a client that cannot keep up. It refuses.
+
+   Original framing, kept so it is not re-litigated: This document assumes
    inherit — §5 depends on it, and it is what keeps the badge honest. It resolves the open
    question left at `02-encryption-tiers.md` §6.4, which leaned the other way ("always
    E2EE"). The reason for the change: an always-E2EE call inside a T3 public room means the

@@ -159,7 +159,26 @@ Per the plan's verification step: for every protection claimed, name the adversa
    T3, but §3 forbids conversion. Current answer: publishing an invite for a T2 community is
    **disallowed**; admins must create a T3 community instead. Confirm this is workable in
    practice, since it is the most likely source of user frustration in this design.
-4. **Voice and video tiers.** Discord uses MLS for E2EE calls; do calls inherit the room's
+4. **Voice and video tiers — DECIDED (owner): calls inherit, with an upgrade-only choice at
+   creation.**
+
+   A call takes its room's tier by default. At the moment a call is created, the creator may
+   additionally choose to make it end-to-end encrypted — but **only upwards**. A T3 room may
+   host an E2EE call; a T1 or T2 room may never host a transport-only one. The choice is made
+   once, at creation, and there is no setter afterwards, exactly as with a room's own tier.
+
+   That asymmetry is the whole of it. An option that could go either way would be a tier
+   downgrade with a friendlier name, and non-negotiable #1 forbids it. An upgrade-only option
+   cannot weaken anything: the badge on a T3 call that opted up says more protection, and it
+   is true.
+
+   The UI consequence is that a call's badge and its room's badge can now legitimately
+   differ, which is precisely what §12.1 of [`12-realtime-media.md`](12-realtime-media.md)
+   worried about. It is acceptable *because the difference is always in the safer direction*
+   and because the user chose it deliberately. A client must show the call's own badge, never
+   inherit the room's on screen.
+
+   Superseded reasoning, kept so it is not re-litigated: Discord uses MLS for E2EE calls; do calls inherit the room's
    tier, or are they always E2EE? The original leaning here was always-E2EE, since call media
    is not searched or moderated server-side anyway.
    [`12-realtime-media.md`](12-realtime-media.md) argues the opposite — calls should
