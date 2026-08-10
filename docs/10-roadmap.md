@@ -154,6 +154,38 @@ session's to change: **do calls inherit the room's tier?** `02-encryption-tiers.
 leaned always-E2EE; §12.1 of the new document argues for inherit, so that a room's badge and
 its call's badge cannot disagree.
 
+### Decided while the owner was reachable, for a session that is not
+
+Four calls made deliberately in advance, so an unattended session does not guess.
+
+- **Usernames resolve by exact match only.** `@alice` looks up if you already know the
+  handle; there is **no search, listing, or browse**. Knowing a name confirms that account
+  exists, which is the price of the feature — but nobody can walk the instance for a roster.
+  Partial search was declined: on a private instance the membership list *is* the social
+  graph, and `01-threat-model.md` §3 concedes metadata to the server, not to every account
+  that registers.
+- **Disappearing messages: per-room, any member may set it, and the clock starts on send.**
+  Applies to future messages only. Start-on-read was declined because it requires the client
+  to report having read a message, which is a read receipt wearing a different name — and
+  read receipts were already excluded for broadcasting presence. "Any member" rather than
+  moderators-only because a DM has no moderator and both parties are equals.
+- **Local message history is stored now, unencrypted, and said so plainly.** `0600`, beside
+  the client state that already sits there in the clear. This is strictly no worse than
+  today — the group keys are already on disk — and without it the client cannot hold a real
+  conversation, since MLS discards each message key after use and a restart loses everything.
+  It is superseded by the platform keystores when the native clients land, and the docs must
+  keep saying which of the two is in force.
+- **Invite links: the creator chooses the terms.** All three shapes are offered at creation
+  — single-use with a 24h expiry (the default), single-use with no expiry, and multi-use with
+  a cap and a window — because the right answer differs between "a link for one friend" and
+  "onboarding a group this evening".
+
+  **One shape stays forbidden: unlimited uses.** An unbounded link is a public invite in
+  everything but name, and `RoomSeal::may_mint_public_invite` exists because
+  discoverability is an input to `derive_tier` — a genuinely public invite to a T1 or T2
+  room would mean it should have been T3, and the tier cannot change (ADR-001). A capped,
+  expiring link does not make a room discoverable. An uncapped one does.
+
 ### Decided, unimplemented
 
 Four calls made by the owner, so a session does not re-litigate them:

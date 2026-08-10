@@ -45,13 +45,20 @@ server* pays for it, and they will find out when the bill arrives. So the design
 already says for file size, and the UI should be honest that the limit is the instance's
 choice rather than a paywall.
 
-This leaves a genuine open question rather than a decided one: **how a flagship instance
-funds itself.** Ads and content-derived monetization are out permanently, and
+That leaves the question of **how a flagship instance funds itself.** Ads and content-derived monetization are out permanently, and
 non-negotiable #5 says the flagship gets no protocol privileges a self-hosted instance
 cannot have — but resource limits are not protocol privileges, so a funded flagship with
 higher upload ceilings does not violate it. Donations, paid hosting, and paid-tier
 *capacity* (never features, never protocol) are all consistent with the rules as written.
-**Owner decision, unmade.**
+**DECIDED (owner): a flagship instance may fund itself, because using it is optional.**
+Nobody is obliged to use the flagship — the software is self-hostable and a Raspberry Pi in
+a spare room is a legitimate deployment (`11-self-hosting.md` §7). That is what makes paid
+*capacity* on the flagship acceptable where it would not be in a product people are locked
+into: the alternative is not "pay", it is "run your own", and that alternative is real.
+
+The limits that stay fixed regardless: no ads, no content-derived revenue, and no protocol
+privilege the flagship holds that a self-hosted instance cannot. Capacity is not a protocol
+privilege. A feature gated behind payment would be.
 
 ## 3. Custom emoji is a content oracle if built the obvious way
 

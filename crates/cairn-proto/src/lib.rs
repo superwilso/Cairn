@@ -18,12 +18,14 @@
 pub mod envelope;
 pub mod ids;
 pub mod tier;
+pub mod username;
 
 pub use envelope::{
     device_authorization_bytes, request_signing_bytes, Envelope, EnvelopePayload, ResourceRef,
 };
 pub use ids::{BlobId, DeviceId, InstanceId, MessageId, RoomId, UserId};
 pub use tier::{derive_tier, RoomSeal, RoomShape, ShapeError, Tier};
+pub use username::{Username, UsernameError, MAX_USERNAME_LEN, MIN_USERNAME_LEN};
 
 /// The wire protocol version this build speaks.
 ///
