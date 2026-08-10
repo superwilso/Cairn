@@ -168,6 +168,50 @@ essentially nowhere else. That makes them a good demonstration of why the authen
 unfurl exists — and it also means carousel support is hostage to §2's adapter breakage in
 exactly the way the rest of the Instagram adapter is.
 
+## Instagram: music and comments
+
+Asked directly, so recorded. **Neither can be embedded**, and the reason is structural
+rather than a gap in the implementation.
+
+**Instagram's oEmbed returns an embed — not data.** Its payload is HTML: a `blockquote`
+plus a script, or an iframe, which Instagram then renders. That is how every product with
+rich Instagram embeds does it, and it is why theirs show music playing and comments
+underneath — *Instagram is serving them at display time*. It also requires a Meta app and
+an access token; the unauthenticated endpoint has been gone since 2020.
+
+Cairn cannot use that payload. Rendering it means the **recipient's** device contacts
+Instagram, which is the exact leak this design exists to prevent (see "The design", and the
+recipient-fetches-nothing rule under Implementation notes). The privacy property and the
+sanctioned mechanism are mutually exclusive. That trade is deliberate, and it costs
+precisely this.
+
+So each would have to come from scraping with the sender's session, and each fails for its
+own additional reason on top of §2's ToS and fragility problems:
+
+**Comments** are third-party content. Copying them into an encrypted conversation means
+re-hosting words written by people who are not in it and did not consent, with a takedown
+path we do not have (§4). Worse, it collides with §3: a card is unverifiable, so a modified
+client could fabricate comments **attributed to named real people**. A made-up headline is
+bad; a made-up quote under a real person's handle is defamation with a UI around it. If
+comments are ever shown, a count is defensible and their text is not.
+
+**Music** on a Reel is licensed audio. Re-hosting it is a copyright question that a
+thumbnail mostly avoids, and it needs the attachments subsystem that does not exist. The
+audio track is also not exposed as metadata — you would be extracting it from a scraped
+media URL.
+
+**What is achievable**, within the model that already exists:
+
+- The caption, author, and thumbnail *URL* from OpenGraph, subject to Instagram's login
+  wall, which unauthenticated fetches usually hit.
+- Carousels as the list-shaped card already designed above.
+- The audio track's **name** as text — "Original audio — handle", or a song title — shown
+  as a sender claim like every other field. No playback.
+- A comment or like **count**, same footing. Not the text.
+
+Everything past that requires either an iframe, which forfeits the recipient's privacy, or
+re-hosting other people's media and words, which forfeits the takedown story.
+
 ## Video
 
 Two different features get called "video", and conflating them produces bad decisions.
