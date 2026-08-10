@@ -230,7 +230,8 @@ fn mark_claimed(dir: &std::path::Path, user: UserId, device: DeviceId) -> Fallib
 
 fn help() {
     println!("Commands:");
-    println!("  /new                 create a direct (T1) room");
+    println!("  /dm <user-id>        start a direct message with someone");
+    println!("  /new                 create an empty direct (T1) room");
     println!("  /rooms               list rooms this device knows");
     println!("  /open <room-id>      open a room already joined");
     println!("  /add <user-id>       add someone to the open room");
@@ -295,6 +296,7 @@ impl App {
                 println!("  published {count}; the instance now holds {remaining} for you");
             }
             "/new" => self.new_room()?,
+            "/dm" => self.direct_message(rest.parse()?)?,
             "/rooms" => self.list_rooms(),
             "/open" => self.open_room(rest.parse()?)?,
             "/add" => self.add_member(rest.parse()?)?,
@@ -304,6 +306,29 @@ impl App {
             other => println!("  ! unknown command {other}"),
         }
         Ok(false)
+    }
+
+    /// Start a DM: create the room and add the other person, in one step.
+    ///
+    /// Composition of `/new` and `/add`, and deliberately nothing more — it introduces no
+    /// new server call and no new authorization path. The two-step version stays because
+    /// a room you create and populate later is a real case; this is for the common one.
+    ///
+    /// The result is a two-member T1 room, which is all a DM is in Cairn: there is no
+    /// separate pairwise protocol, so a DM and a group chat share one code path and one
+    /// set of bugs (ADR-002).
+    fn direct_message(&mut self, peer: UserId) -> Fallible<()> {
+        if peer == self.client.user() {
+            return Err("that is your own user id".into());
+        }
+        self.new_room()?;
+        self.add_member(peer)?;
+        let room = self.open.as_ref().map(|open| open.convo.room());
+        if let Some(room) = room {
+            println!("  they should run: /open {room}");
+            println!("  then both of you: /safety, and compare the numbers out of band");
+        }
+        Ok(())
     }
 
     fn new_room(&mut self) -> Fallible<()> {
@@ -320,7 +345,6 @@ impl App {
 
         self.index.record(created.room, &created.seal, convo.group_id())?;
         println!("  room {} created, tier {}", created.room, created.tier_label());
-        println!("  tell the other person to run: /open {}", created.room);
         self.open = Some(Open { convo, seal: created.seal, cursor: 0 });
         Ok(())
     }

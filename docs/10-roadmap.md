@@ -76,6 +76,89 @@ needs a room id pasted to them out of band and must be added by user id, so "joi
 invite, without being told what to type" is not yet true. That belongs with M3's invite
 work, which the same exit condition depends on.
 
+### Direction: WhatsApp for the surface, not for the architecture
+
+The owner's call, and the boundary matters more than the list.
+
+**Take from WhatsApp:** onboarding and identity, everyday messaging features, multi-device
+and backup.
+
+**Do not take:** its encryption model. **ADR-001 stands.** WhatsApp end-to-end encrypts
+groups far larger than Cairn's T2 ceiling, which is a real demonstration that the other
+choice works — and it was considered and declined. T3 remains transport-only and
+server-readable, because that is what buys server-side moderation and search on the
+surfaces where abuse actually scales. Everything below is additive to that model, and any
+proposal that quietly erodes it is out of scope, not a refinement.
+
+Also declined, for the record: **phone-number identity**. It is the strongest discovery
+mechanism available and the most criticised thing about WhatsApp, because the address-book
+upload hands the server the social graph. `01-threat-model.md` §3 already concedes broad
+metadata exposure, so this would not break a stated guarantee — it would make the conceded
+thing much worse, in the one product area where Cairn claims to be different.
+
+#### What this means concretely
+
+- **Usernames plus invite links** replace passing raw ids by hand. `@alice` claimed like an
+  account; a link carrying a room capability for joining. This leaks nothing the server does
+  not already know — it holds the accounts — and it removes the friction that has ended
+  every session so far at "paste this uuid to your friend". Depends on the room-invite
+  token design recorded under M3.
+- **Everyday messaging**: disappearing messages, voice notes, media, message history. All
+  but the first are behind attachments, which are behind [ADR-007](adr/007-server-storage.md).
+  Disappearing messages are independent and cheap, and fit the threat model without strain.
+- **Multi-device and backup.** Device-scoped MLS leaves already exist
+  (`01-threat-model.md` §6), so the foundation is there and largely unused; `/v1/devices`
+  exists but no linking flow does. Copy WhatsApp's *shape* for backup, not its defaults —
+  cloud backup is historically where its E2EE guarantee weakened, and any backup here has to
+  answer to `07-regulatory-posture.md` and the keystore decision above.
+
+**Not adopted:** read receipts and typing indicators. Both leak more than users expect —
+presence and timing are exactly what `01-threat-model.md` §3 lists as already-conceded
+metadata, and these would broadcast it continuously rather than per message.
+
+#### Sequencing is unchanged
+
+[ADR-007](adr/007-server-storage.md) still comes first. Media, voice notes and history all
+sit behind attachments, which sit behind the storage rewrite. Usernames and disappearing
+messages are the two items that can proceed in parallel, since neither needs attachments.
+
+### Direction: Discord's real-time features
+
+Voice calls, group calls and screen sharing are what keep communities on Discord, and
+`08-feature-parity.md` marked them v2 without saying what they cost. Now designed in
+[`12-realtime-media.md`](12-realtime-media.md), against Discord's own **DAVE** protocol as
+the reference. Four things a session should not have to rediscover:
+
+- **This is the largest component the project has considered** — larger than the server. A
+  call needs its own MLS group (participants are not room members), the server has to
+  sequence commits under join/leave races, and media needs SFrame (RFC 9605) plus an SFU.
+- **It lands after the native clients**, not before. A terminal cannot capture a microphone.
+  Sequencing: ADR-007 → attachments → native clients → this.
+- **No downgrade, unlike DAVE.** Discord falls back to a plaintext passthrough mode for
+  clients that cannot do E2EE media. Non-negotiable #1 forbids that here, so an E2EE-tier
+  call **refuses** such a client rather than degrading. The cost — "your friend must update"
+  instead of a warning banner — is accepted.
+- **Calls are unreportable.** Transcript franking has no live-media equivalent, which is now
+  stated in `04-safety-architecture.md` rather than discovered later.
+
+One open question is escalated rather than answered, because the tier model is not a
+session's to change: **do calls inherit the room's tier?** `02-encryption-tiers.md` §6.4
+leaned always-E2EE; §12.1 of the new document argues for inherit, so that a room's badge and
+its call's badge cannot disagree.
+
+### Decided, unimplemented
+
+Four calls made by the owner, so a session does not re-litigate them:
+
+- **Server storage → `redb`** ([ADR-007](adr/007-server-storage.md)). This is the next
+  item; it unblocks attachments, which unblock images in link previews and Instagram media.
+- **Attachment liability → sender responsible**, instance offers a removal path
+  (`05-embeds.md` §4).
+- **Client state at rest → platform keystores**, with the native clients. Blocks linked
+  social accounts until it lands (`11-self-hosting.md`).
+- **Room invites → single-use capability tokens**, which are not the public invite
+  `may_mint_public_invite` forbids. Design and probes recorded under M3 below.
+
 ## M3 — Friends test
 
 **Goal:** the owner runs an instance and a handful of people use it for real.
@@ -96,7 +179,30 @@ work, which the same exit condition depends on.
       notices the account already exists — without that, a returning user is locked out of
       their own account.
 - [ ] **Room invite links** — a joiner is still handed a room id and a user id by hand.
-      **M2's exit condition depends on this**, not just M3's.
+      **M2's exit condition depends on this**, not just M3's. `/dm <user-id>` now does
+      create-and-add in one step, so what remains is removing the id-passing entirely.
+
+      **Design, settled so it is not re-derived:**
+
+      - A **single-use, server-generated, non-enumerable token** minted by a member with
+        role ≥ Moderator, redeemed once, which adds the bearer as a `Member`.
+      - **This is not the invite `RoomSeal::may_mint_public_invite` forbids**, and the
+        distinction is the whole design. That guard blocks a *publicly discoverable*
+        invite for an E2EE room, because discoverability is an input to `derive_tier` — a
+        published invite would mean the room should have been T3, and the tier cannot
+        change (ADR-001). A capability handed to one named person and spent on redemption
+        does not make the room discoverable, so it does not weaken the tier. Say so in the
+        code, or someone will later "fix" the inconsistency by loosening the guard.
+      - Store the token **hashed** (SHA-256) and compare in constant time via `subtle`,
+        matching the project's convention. The server can read its own state, so this is
+        damage-limitation on a state leak, not a secrecy claim.
+      - Redemption must still check the member ceiling, or a DM invite becomes a way past
+        the two-person bound that `membership_respects_the_room_ceiling` defends.
+      - Retain spent tokens rather than deleting them, as `InviteRecord` already does, so
+        a replay is distinguishable from an unknown token.
+      - **Probe before trusting it**: redeem twice, redeem after removal, redeem against a
+        full room, redeem a token minted for a different room, and mint as a non-moderator.
+        Membership is where this project's three shipped vulnerabilities lived.
 - [ ] Backup and restore, including **the franking key**: losing it invalidates every
       report the instance ever issued
 - [ ] Rate limiting on registration and sending

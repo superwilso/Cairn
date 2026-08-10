@@ -93,6 +93,15 @@ deniable protocol offers. Cairn accepts this trade on frankable surfaces and sta
 
 - It does not stop a determined sender from abusing someone. It makes reporting credible
   after the fact.
+- **It does not cover voice, video, or screen sharing at all**, and no realistic extension
+  would. There is no server-held commitment to a stream nobody stored, a recipient-side
+  recording is defeated by an abuser who stops when recording starts, and always-on call
+  recording in the client would be a larger privacy hazard than the abuse it documents.
+  Calls on E2EE tiers therefore get block, leave, and account-level ban — not content
+  reports. That is a genuine hole in this document's coverage rather than an implementation
+  gap, it is stated now rather than when calls ship, and it is a direct argument for the
+  policy lists in §2: they are what still works when reporting does not. See
+  [`12-realtime-media.md`](12-realtime-media.md) §7.
 - It does not work if the recipient never reports.
 - A malicious server can refuse to issue tags, or discard them. It cannot forge one.
 - **The franking key must be persisted.** Losing it invalidates every historical report.

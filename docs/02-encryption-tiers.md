@@ -160,5 +160,11 @@ Per the plan's verification step: for every protection claimed, name the adversa
    **disallowed**; admins must create a T3 community instead. Confirm this is workable in
    practice, since it is the most likely source of user frustration in this design.
 4. **Voice and video tiers.** Discord uses MLS for E2EE calls; do calls inherit the room's
-   tier, or are they always E2EE? Leaning always-E2EE, since call media is not searched or
-   moderated server-side anyway.
+   tier, or are they always E2EE? The original leaning here was always-E2EE, since call media
+   is not searched or moderated server-side anyway.
+   [`12-realtime-media.md`](12-realtime-media.md) argues the opposite — calls should
+   **inherit** — because an always-E2EE call inside a T3 room makes the room's badge and the
+   call's badge disagree, and a user calibrated to "this room is public" would be in a surface
+   with different rules. Still an owner decision; see §12.1 of that document for the full
+   argument, and §5 for why a Discord-style downgrade to plaintext mid-call is forbidden here
+   whichever way this lands.

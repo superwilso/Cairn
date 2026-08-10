@@ -117,6 +117,29 @@ no embed at all, because users calibrate to the card.
 
 ### 4. Takedowns and liability
 
+**Decided (owner): the sender is responsible, and the instance offers a removal path.**
+
+The sender chose to re-host someone else's media, so the obligation follows the choice. The
+instance operator provides a documented way to have stored media removed on request, and
+nothing more — a self-hoster running Cairn for six friends must not inherit a moderation
+duty they cannot discharge.
+
+This is also the only option consistent with the rule that the flagship instance gets no
+protocol privileges a self-hosted one cannot have: an operator-responsibility model would
+oblige every self-hoster to run moderation, which in practice means only the flagship could.
+
+What it requires, and none of it exists yet:
+
+- A removal endpoint, and an operator-facing way to act on a request.
+- A written policy, in the repository, saying who to contact and what happens.
+- Retention rules — how long removed media is actually gone for.
+
+Note the limit honestly: in **T1 and T2 the server holds ciphertext it cannot read**, so
+"remove this image" means removing bytes identified from outside, not content the operator
+can find by looking. A takedown story that assumes the operator can search is a story for
+T3 only.
+
+
 The sender re-uploads someone else's media into the encrypted envelope. That is a copy, and
 copies attract takedown requests.
 
@@ -167,6 +190,137 @@ carousel children. So carousels are reachable through the authenticated path and
 essentially nowhere else. That makes them a good demonstration of why the authenticated
 unfurl exists — and it also means carousel support is hostage to §2's adapter breakage in
 exactly the way the rest of the Instagram adapter is.
+
+## Linking an account and extracting the media
+
+The proposal: the user links their Instagram account, a lightweight background browser
+extracts the images or video, and **only those files** are sent, with the original link as
+metadata. `kkinstagram.com` as the fallback when there is no session or the extraction
+fails.
+
+**The shape is right and is already step 1 of the fallback chain.** Sending files rather
+than Instagram's iframe is what preserves the recipient-fetches-nothing rule, and it is the
+only way to show gated content at all. What follows is what it costs, so the cost is chosen
+rather than discovered.
+
+### It does not remove the account leak — it concentrates it
+
+An authenticated fetch means Instagram observes: *this named account requested this post at
+this time.* Anonymous fetching leaks an IP; a linked account leaks an identity. The
+**recipient** is fully protected either way, and the **sender** is more exposed, not less.
+Any UI that presents linking as a privacy improvement is claiming a protection that does not
+exist. It is a capability improvement.
+
+Two consequences that must reach the user before they link:
+
+- **Instagram may ban the account.** Automated fetching from a logged-in session is what
+  their anti-automation systems exist to catch, and the penalty lands on the user's real
+  account, not on Cairn. This is a materially different risk from a card that fails to load.
+- **The session cookie is a credential.** `cairn_crypto::store` writes client state
+  unencrypted at `0600`. A stored Instagram session grants access to someone's actual social
+  account, which is a worse thing to hold at rest than group keys are. **Blocked on platform
+  keystore storage**, not shippable before it.
+
+### The browser is the expensive part
+
+Extraction needs a renderer, because the media URLs come out of Instagram's JavaScript.
+That means executing hostile remote code on the sender's device, inside a project that is
+`#![forbid(unsafe_code)]` with a deliberately small supply chain.
+
+**Bundling a browser engine is not acceptable** — it would be the largest single addition to
+the attack surface and the supply chain, and per-app Chromium is not viable on mobile
+anyway (ADR-006 targets five native clients).
+
+The defensible form is the **platform's existing WebView** — WKWebView on Apple, Android
+WebView, WebView2 on Windows — driven off-screen, with JavaScript enabled only for the
+fetch and the result treated as untrusted input. That keeps the engine out of the supply
+chain and puts it where the OS already patches it.
+
+So the seam is a trait, not an implementation:
+
+```
+client-core:  trait MediaFetcher { fn fetch(&self, url) -> Result<Vec<Media>> }
+platform:     supplies one backed by the OS WebView
+```
+
+Card construction, clamping, EXIF stripping, and the tier rules stay below the FFI line
+(ADR-006). Only the fetch crosses it. A platform that supplies no fetcher degrades to the
+proxy rung, which is the correct behaviour rather than a broken one.
+
+### It needs attachments first
+
+"Send only those files" is the attachments subsystem: encrypted blob storage, chunking,
+size ceilings, a per-attachment key inside the encrypted message. It does not exist,
+`EnvelopePayload` has no variant for it, and it lands on the server's per-message
+full-state rewrite. **This is the same blocker that keeps thumbnails out of text cards**,
+and it does not get smaller because the files are larger.
+
+It also makes Cairn the **host** of someone else's photo or video, which is exactly the
+takedown and liability question in §4 — unanswered, and a legal design question rather than
+a technical one.
+
+### kkinstagram as the fallback
+
+Correct choice, and it is already modelled: `CardSource::Proxy`, whose `caveat()` a client
+must display. The honest framing is that the proxy **sees the URL** — the leak moves from
+Instagram to a third party rather than disappearing. That is often the better trade, and it
+is still a trade the user should be told about, per the rule that a less private path is
+never taken silently.
+
+### Order of work
+
+1. Attachments subsystem (own ADR), which needs the storage rewrite fixed first.
+2. Platform keystore storage, before any session credential is held.
+3. `MediaFetcher` trait plus one platform implementation.
+4. Per-platform opt-in, with the account-ban and identity-exposure warnings above.
+5. `kkinstagram` proxy rung, which can ship **before** any of the others and is the cheapest
+   real improvement available today.
+
+Step 5 is worth doing on its own. Steps 1 and 2 are large, and neither is an embed problem.
+
+## Instagram: music and comments
+
+Asked directly, so recorded. **Neither can be embedded**, and the reason is structural
+rather than a gap in the implementation.
+
+**Instagram's oEmbed returns an embed — not data.** Its payload is HTML: a `blockquote`
+plus a script, or an iframe, which Instagram then renders. That is how every product with
+rich Instagram embeds does it, and it is why theirs show music playing and comments
+underneath — *Instagram is serving them at display time*. It also requires a Meta app and
+an access token; the unauthenticated endpoint has been gone since 2020.
+
+Cairn cannot use that payload. Rendering it means the **recipient's** device contacts
+Instagram, which is the exact leak this design exists to prevent (see "The design", and the
+recipient-fetches-nothing rule under Implementation notes). The privacy property and the
+sanctioned mechanism are mutually exclusive. That trade is deliberate, and it costs
+precisely this.
+
+So each would have to come from scraping with the sender's session, and each fails for its
+own additional reason on top of §2's ToS and fragility problems:
+
+**Comments** are third-party content. Copying them into an encrypted conversation means
+re-hosting words written by people who are not in it and did not consent, with a takedown
+path we do not have (§4). Worse, it collides with §3: a card is unverifiable, so a modified
+client could fabricate comments **attributed to named real people**. A made-up headline is
+bad; a made-up quote under a real person's handle is defamation with a UI around it. If
+comments are ever shown, a count is defensible and their text is not.
+
+**Music** on a Reel is licensed audio. Re-hosting it is a copyright question that a
+thumbnail mostly avoids, and it needs the attachments subsystem that does not exist. The
+audio track is also not exposed as metadata — you would be extracting it from a scraped
+media URL.
+
+**What is achievable**, within the model that already exists:
+
+- The caption, author, and thumbnail *URL* from OpenGraph, subject to Instagram's login
+  wall, which unauthenticated fetches usually hit.
+- Carousels as the list-shaped card already designed above.
+- The audio track's **name** as text — "Original audio — handle", or a song title — shown
+  as a sender claim like every other field. No playback.
+- A comment or like **count**, same footing. Not the text.
+
+Everything past that requires either an iframe, which forfeits the recipient's privacy, or
+re-hosting other people's media and words, which forfeits the takedown story.
 
 ## Video
 

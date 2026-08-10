@@ -83,7 +83,7 @@ Then, to talk:
 
 1. Your friend runs `/keys 5` to publish key packages, and `/whoami` to get their user id.
    **Without published key packages nobody can add them to a room.**
-2. You run `/new`, then `/add usr_...` with their id.
+2. You run `/dm usr_...` with their id. That creates the room and adds them in one step.
 3. They run `/open rom_...` with the room id you were shown.
 4. Both of you run `/safety` and compare the numbers **out of band** — on a call, or in
    person. If they match, no key substitution happened. If they differ, stop.
@@ -141,7 +141,17 @@ Honest list. Each of these is real and none is hypothetical.
   restart does not replay them — it cannot, because MLS discards each message key after
   use.
 - **Polling, not push.** The client fetches when you press enter.
-- **Client state is written unencrypted**, `0600` on Unix. Anyone with read access to the
+- **No voice, video, or screen sharing.** Designed, unbuilt, and behind the native clients
+  ([`12-realtime-media.md`](12-realtime-media.md)). Worth reading before you plan an
+  instance around it: a media server's egress scales with the square of the participant
+  count — five people on 720p video is roughly 30 Mbps out, sustained — so calls are the
+  point where a self-hosted instance stops being bandwidth-negligible.
+- **Client state is written unencrypted**, `0600` on Unix. **Decided (owner): platform
+  keystores** — Keychain, Android Keystore, DPAPI, libsecret — behind an FFI seam, landing
+  with the native clients. A passphrase-derived key was considered and rejected as a
+  stopgap: it prompts on every launch and protects nothing while the client runs. Until
+  keystores exist, **no linked social accounts**, because a session cookie is a credential
+  and this is where it would sit. Anyone with read access to the
   account's home directory has the group keys. This is consistent with
   `docs/01-threat-model.md` §3.4, which does not claim to defend a compromised device — but
   it is weaker than a platform keystore, which is what a finished client would use.
