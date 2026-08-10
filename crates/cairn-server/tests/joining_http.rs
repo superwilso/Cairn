@@ -14,7 +14,7 @@ use cairn_client_core::client::Client;
 use cairn_client_core::transport::HttpTransport;
 use cairn_client_core::{accept_welcome, Conversation, TimelineEvent};
 use cairn_crypto::mls::Session;
-use cairn_proto::{DeviceId, RoomSeal, RoomShape, UserId};
+use cairn_proto::{DeviceId, DeviceIdentity, RoomSeal, RoomShape, UserId};
 use cairn_server::state::{Instance, RegistrationPolicy};
 
 fn shape() -> RoomShape {
@@ -60,8 +60,12 @@ struct Peer {
 
 impl Peer {
     fn new(server: &Server, name: &str) -> Self {
-        let session = Arc::new(Session::open(scratch(name), name.as_bytes()).unwrap());
+        // The credential is built from the ids, not from `name`. A display-name credential
+        // is what let one member present another's label and lock the real person out of
+        // the room; `claim_key_packages` now refuses anything it cannot attribute.
         let (user, device) = (UserId::new(), DeviceId::new());
+        let identity = DeviceIdentity::new(user, device).to_credential();
+        let session = Arc::new(Session::open(scratch(name), &identity).unwrap());
         let client = Client::new(
             HttpTransport::new(format!("http://{}", server.addr)),
             session.clone(),
@@ -204,7 +208,14 @@ fn a_member_added_later_shows_up_in_the_timeline() {
 
     let added = announced.expect("bob must be told that someone joined his conversation");
     assert_eq!(added.len(), 1);
-    assert_eq!(added[0].identity, b"carol-third");
+    // Asserted as an *account*, which is what the credential now carries. Under the old
+    // display-name form this comparison could only ever be against a string the joining
+    // client chose for itself.
+    assert_eq!(
+        DeviceIdentity::parse(&added[0].identity).expect("a Cairn credential").user(),
+        carol.user,
+        "the event must name the account that joined, not a label it picked"
+    );
     assert_eq!(
         added[0].signature_key,
         carol.session.public_key(),
@@ -248,7 +259,9 @@ fn a_removed_member_stops_being_able_to_read_and_everyone_is_told() {
     let bob_leaf = alice_convo
         .members()
         .into_iter()
-        .find(|m| m.identity == b"bob-remove")
+        // Found by account id rather than by label — the mapping from MLS roster to server
+        // member that the old credential made impossible.
+        .find(|m| DeviceIdentity::parse(&m.identity).is_ok_and(|id| id.belongs_to(bob.user)))
         .expect("bob is in the roster")
         .index;
     let output = alice_convo.group_mut().unwrap().remove_member(bob_leaf).unwrap();

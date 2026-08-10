@@ -17,7 +17,7 @@ use cairn_client_core::client::Client;
 use cairn_client_core::transport::HttpTransport;
 use cairn_client_core::{Conversation, ConversationIndex};
 use cairn_crypto::mls::Session;
-use cairn_proto::{DeviceId, RoomSeal, RoomShape, UserId};
+use cairn_proto::{DeviceId, DeviceIdentity, RoomSeal, RoomShape, UserId};
 use cairn_server::state::{Instance, RegistrationPolicy};
 
 fn dm_shape() -> RoomShape {
@@ -64,9 +64,14 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(server: &Server, dir: PathBuf, identity: &[u8]) -> Self {
-        let session = Arc::new(Session::open(&dir, identity).unwrap());
+    fn new(server: &Server, dir: PathBuf, _identity: &[u8]) -> Self {
+        // Ids first: the MLS credential is built from them now, not from a display name.
+        // The instance refuses a key package whose credential names a different account,
+        // and a claiming client refuses one that does not match what it asked for.
         let (user, device) = (UserId::new(), DeviceId::new());
+        let session = Arc::new(
+            Session::open(&dir, &DeviceIdentity::new(user, device).to_credential()).unwrap(),
+        );
         let client = Client::new(
             HttpTransport::new(format!("http://{}", server.addr)),
             session.clone(),
@@ -77,9 +82,13 @@ impl Peer {
     }
 
     /// Reopen from disk alone, as a restarted process would.
-    fn restart(self, server: &Server, identity: &[u8]) -> Self {
+    fn restart(self, server: &Server, _identity: &[u8]) -> Self {
         let Peer { dir, user, device, .. } = self;
-        let session = Arc::new(Session::open(&dir, identity).unwrap());
+        // The same credential the directory was created under — a session that reopened
+        // with different bytes would be refused by the device-key store.
+        let session = Arc::new(
+            Session::open(&dir, &DeviceIdentity::new(user, device).to_credential()).unwrap(),
+        );
         let client = Client::new(
             HttpTransport::new(format!("http://{}", server.addr)),
             session.clone(),

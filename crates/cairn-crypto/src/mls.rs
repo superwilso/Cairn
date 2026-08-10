@@ -102,6 +102,20 @@ pub fn parse_message(bytes: &[u8]) -> Result<MlsMessage, MlsError> {
     Ok(MlsMessage::from_bytes(bytes)?)
 }
 
+/// The credential bytes inside a key package, before anyone is added with it.
+///
+/// This is what makes a credential *checkable* rather than merely present. A client that
+/// claimed key packages for one account can read what the returned package actually claims
+/// and refuse a mismatch — without which carrying an account id in the credential would be
+/// decoration, since nothing would ever compare it.
+///
+/// `None` when the message is not a key package, or carries a credential type this build
+/// does not use. Both are refusals at the call site, not defaults to fall back on.
+pub fn key_package_credential(message: &MlsMessage) -> Option<Vec<u8>> {
+    let kp = message.as_key_package()?;
+    kp.signing_identity().credential.as_basic().map(|b| b.identifier().to_vec())
+}
+
 /// The leaf behind a commit, when it was an ordinary member.
 ///
 /// External senders and new-member proposals deliberately yield `None`: their index refers

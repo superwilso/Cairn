@@ -102,6 +102,18 @@ the server keeps only a hash, so it cannot be recovered or read out of a backup.
 unlimited link, deliberately: an uncapped one is a public invite in all but name, and a
 public invite to a T1 or T2 room would mean it should have been T3.
 
+**Every MLS leaf now names the account that holds it.** The credential used to be a display
+name the client chose for itself, which probing showed let one member present another's
+label: every client displayed the impostor as that person, and because MLS refuses duplicate
+identities, **the real person could then never join that room at all**. Credentials now carry
+the account and device ids the instance already authenticates, checked both when a key
+package is published and when one is claimed.
+
+Two consequences for an operator. A client too old to name its account **cannot publish key
+packages** to an upgraded instance and cannot be added to a room — everyone upgrades
+together. And `/members` now prints account ids matching what `/roster` shows, so the
+encrypted group and the server's member list can be compared by eye.
+
 **Redeeming joins the room; it does not give you the keys.** The group's keys are held by
 its members, not the instance, so nobody can hand them out on the strength of a token. Until
 an existing member adds you to the encrypted group, the room is visible and unreadable. The

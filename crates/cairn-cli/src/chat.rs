@@ -44,7 +44,7 @@ use cairn_client_core::{
 };
 use cairn_crypto::mls::{GroupMember, Session};
 use cairn_crypto::verification::VerificationState;
-use cairn_proto::{DeviceId, RoomId, RoomSeal, RoomShape, UserId};
+use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, UserId};
 
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -134,14 +134,21 @@ struct Open {
 
 /// Run the client until the user quits.
 pub fn run(options: Options) -> Fallible<()> {
-    let identity = format!("{}@{}", options.name, options.server).into_bytes();
+    // Identity is per-directory, so a returning user must reuse their ids. Storing them
+    // beside the group index keeps "who am I" and "what have I joined" in one place.
+    //
+    // Loaded *before* the session, because the MLS credential is now built from these ids
+    // rather than from a display name. The old order could not have done that.
+    let (user, device, already_claimed) = load_or_create_identity(&options.dir)?;
+
+    // The credential names the account and device the server authenticates, not the name
+    // this client was started with. Probing the old `name@server` form found that a member
+    // could join a room presenting someone else's label — every client displayed her as
+    // them, and MLS's duplicate-identity rule then locked the real person out of the room.
+    let identity = DeviceIdentity::new(user, device).to_credential();
     let session = Arc::new(Session::open(&options.dir, &identity)?);
     let transport = HttpTransport::new(&options.server);
     let tls = transport.is_tls();
-
-    // Identity is per-directory, so a returning user must reuse their ids. Storing them
-    // beside the group index keeps "who am I" and "what have I joined" in one place.
-    let (user, device, already_claimed) = load_or_create_identity(&options.dir)?;
     let client = Client::new(transport, session.clone(), user, device);
 
     let mut app = App {
@@ -190,8 +197,13 @@ pub fn run(options: Options) -> Fallible<()> {
              ciphertext. Use https for anything real."
         );
     }
-    println!("\nYou are {}", String::from_utf8_lossy(&app.identity));
-    println!("user id  {user}\n");
+    // The name is a label for reading; the ids are what decide anything. Printing both,
+    // in that order, is the same distinction the credential now makes — the old build
+    // printed the credential itself here, which was a display name pretending to be an
+    // identity.
+    println!("\nYou are {} on this device", options.name);
+    println!("user id   {user}");
+    println!("device id {device}\n");
     help();
 
     let stdin = io::stdin();
@@ -931,10 +943,27 @@ fn announce(
     }
 }
 
-/// A member's identity as text, falling back to hex rather than replacement characters —
-/// a mangled label is indistinguishable from a deliberately confusing one.
+/// A member's identity, as something a person can compare against the roster.
+///
+/// The credential now carries the account and device rather than a name, so this shows the
+/// account id — which is exactly the value `/roster` prints for server-side members, so the
+/// two lists can be lined up by eye. That comparison is what the old display-name credential
+/// made impossible.
+///
+/// A credential this build cannot parse is shown as hex and **named as unattributable**
+/// rather than rendered as text. A leaf whose account nobody can determine is precisely the
+/// thing that used to be displayed as a trustworthy-looking name.
 fn label(member: &GroupMember) -> String {
-    String::from_utf8(member.identity.clone()).unwrap_or_else(|e| hex::encode(e.into_bytes()))
+    match DeviceIdentity::parse(&member.identity) {
+        Ok(id) => format!("{} ({})", id.user(), short_device(id)),
+        Err(_) => format!("unattributable leaf {}", hex::encode(&member.identity)),
+    }
+}
+
+/// Enough of the device id to tell one of someone's devices from another.
+fn short_device(id: DeviceIdentity) -> String {
+    let full = id.device().to_string();
+    full.chars().take(12).collect()
 }
 
 fn state_marker(state: VerificationState) -> &'static str {
