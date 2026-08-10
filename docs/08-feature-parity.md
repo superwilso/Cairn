@@ -74,7 +74,7 @@ question in `01-threat-model.md` §10.
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
 | Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ end to end |
-| GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
+| GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 — designed in [`14-gifs.md`](14-gifs.md); Tenor's API shut down June 2026, and the naive build leaks search terms and readers to the provider |
 | Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
 | Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |
 | Large file limits | ⚠️ paywalled | ⚠️ | ⚠️ 2 GB | ⚠️ | ✅ 2 GB free | 🎯 operator-set |
