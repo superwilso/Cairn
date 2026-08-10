@@ -122,6 +122,30 @@ metadata, and these would broadcast it continuously rather than per message.
 sit behind attachments, which sit behind the storage rewrite. Usernames and disappearing
 messages are the two items that can proceed in parallel, since neither needs attachments.
 
+### Direction: Discord's real-time features
+
+Voice calls, group calls and screen sharing are what keep communities on Discord, and
+`08-feature-parity.md` marked them v2 without saying what they cost. Now designed in
+[`12-realtime-media.md`](12-realtime-media.md), against Discord's own **DAVE** protocol as
+the reference. Four things a session should not have to rediscover:
+
+- **This is the largest component the project has considered** — larger than the server. A
+  call needs its own MLS group (participants are not room members), the server has to
+  sequence commits under join/leave races, and media needs SFrame (RFC 9605) plus an SFU.
+- **It lands after the native clients**, not before. A terminal cannot capture a microphone.
+  Sequencing: ADR-007 → attachments → native clients → this.
+- **No downgrade, unlike DAVE.** Discord falls back to a plaintext passthrough mode for
+  clients that cannot do E2EE media. Non-negotiable #1 forbids that here, so an E2EE-tier
+  call **refuses** such a client rather than degrading. The cost — "your friend must update"
+  instead of a warning banner — is accepted.
+- **Calls are unreportable.** Transcript franking has no live-media equivalent, which is now
+  stated in `04-safety-architecture.md` rather than discovered later.
+
+One open question is escalated rather than answered, because the tier model is not a
+session's to change: **do calls inherit the room's tier?** `02-encryption-tiers.md` §6.4
+leaned always-E2EE; §12.1 of the new document argues for inherit, so that a room's badge and
+its call's badge cannot disagree.
+
 ### Decided, unimplemented
 
 Four calls made by the owner, so a session does not re-litigate them:

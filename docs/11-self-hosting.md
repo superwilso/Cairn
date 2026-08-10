@@ -141,6 +141,11 @@ Honest list. Each of these is real and none is hypothetical.
   restart does not replay them — it cannot, because MLS discards each message key after
   use.
 - **Polling, not push.** The client fetches when you press enter.
+- **No voice, video, or screen sharing.** Designed, unbuilt, and behind the native clients
+  ([`12-realtime-media.md`](12-realtime-media.md)). Worth reading before you plan an
+  instance around it: a media server's egress scales with the square of the participant
+  count — five people on 720p video is roughly 30 Mbps out, sustained — so calls are the
+  point where a self-hosted instance stops being bandwidth-negligible.
 - **Client state is written unencrypted**, `0600` on Unix. **Decided (owner): platform
   keystores** — Keychain, Android Keystore, DPAPI, libsecret — behind an FFI seam, landing
   with the native clients. A passphrase-derived key was considered and rejected as a

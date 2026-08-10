@@ -48,6 +48,14 @@ Discord is the benchmark; nobody else is close.
 | Server discovery | ✅ | ❌ | ❌ | ❌ | ✅ | 🎯 v2 |
 | Large public groups | ✅ | ⚠️ 1,000 | ⚠️ ~1,000 | ❌ | ✅ 200,000 | 🎯 T3 |
 
+**Voice channels and screen share are designed but unbuilt**, and the v2 marks above hide
+how large they are: see [`12-realtime-media.md`](12-realtime-media.md). Three things from
+that document change what the table implies. Calls need their own MLS group and an SFU, so
+this is the biggest single component the project has considered. It lands **after** the
+native clients, because a terminal cannot capture a microphone. And unlike Discord, Cairn
+will refuse a call rather than downgrade it to plaintext for a client that cannot do E2EE
+media — the badge is not allowed to lie.
+
 **Bots are not optional.** They are much of why Discord communities stay on Discord. A bot
 in an E2EE room is a group member holding keys — an A6 adversary with a friendly name
 (`01-threat-model.md` §5). The design must surface that to users, and it is an open
