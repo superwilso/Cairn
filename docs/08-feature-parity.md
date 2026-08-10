@@ -82,9 +82,12 @@ question in `01-threat-model.md` §10.
 **Attachments exist server-side**: a client uploads ciphertext to a room, the server stores
 bytes it cannot read, and any member of that room may fetch them. Membership is checked on
 upload *and* on fetch, and evaluated at fetch time — so removing someone revokes their access
-to the room's attachments rather than leaving them a permanent read channel. What is still
-owed is the client half: encrypting the file and carrying the key inside the encrypted
-message body.
+to the room's attachments rather than leaving them a permanent read channel. The encryption is
+`cairn_crypto::attachment`: a fresh single-use key per attachment, XChaCha20-Poly1305, and
+the key carried inside the encrypted message body — so a tier's guarantee extends to
+attachments rather than stopping at message text. Verified over a socket against the bytes
+the *server returns*, not a local buffer. What is still owed is the client plumbing that
+puts the key into the body and offers a file picker.
 
 Link previews are where Cairn does something none of them do — see
 [`05-embeds.md`](05-embeds.md). Signal does the unauthenticated version; the authenticated

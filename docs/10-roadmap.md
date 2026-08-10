@@ -121,8 +121,9 @@ metadata, and these would broadcast it continuously rather than per message.
 [ADR-007](adr/007-server-storage.md) came first and is **done**, so the dependency that
 blocked most of this list is gone: media, voice notes and history sit behind attachments,
 and attachments sat behind the storage rewrite. **Attachments are now half-built**: the server side landed — ciphertext blobs stored against
-a room, membership checked on upload and on fetch — and what remains is the client half,
-encrypting the file and carrying its key inside the encrypted message body.
+a room, membership checked on upload and on fetch — and the encryption alongside it
+(`cairn_crypto::attachment`). What remains is the client plumbing: putting the key into the
+encrypted message body and offering a file to send.
 Usernames and disappearing messages remain the two items that can proceed in parallel,
 since neither needs attachments.
 

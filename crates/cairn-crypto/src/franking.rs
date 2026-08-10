@@ -286,7 +286,7 @@ impl TranscriptReport {
     }
 }
 
-mod hex_array {
+pub(crate) mod hex_array {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {

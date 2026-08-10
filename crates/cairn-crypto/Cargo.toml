@@ -25,3 +25,4 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }

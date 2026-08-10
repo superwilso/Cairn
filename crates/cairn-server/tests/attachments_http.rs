@@ -266,3 +266,39 @@ fn an_empty_attachment_is_refused() {
     let (room, _) = server.instance.create_room(dm_shape(), alice.user).unwrap();
     assert_eq!(upload(&server, &alice, room, b"").status, 400);
 }
+
+#[test]
+fn the_instance_never_holds_a_readable_attachment() {
+    // The end-to-end claim, over a socket, with the real encryption rather than a stand-in:
+    // seal on the client, upload, and confirm what the server hands back is still opaque —
+    // and that only the key from the encrypted message body opens it.
+    //
+    // Checked against the bytes the *server returns*, not against a local buffer, because
+    // the interesting failure is an instance that stores or serves plaintext.
+    let server = start();
+    let alice = Account::register(&server);
+    let bob = Account::register(&server);
+    let (room, _) = server.instance.create_room(dm_shape(), alice.user).unwrap();
+    server.instance.add_room_member(room, alice.user, bob.user).unwrap();
+
+    let plaintext = b"a private photo, or a leaked document, or anything else".to_vec();
+    let (key, sealed) = cairn_crypto::attachment::seal(&plaintext);
+
+    let uploaded = upload(&server, &alice, room, &sealed);
+    assert_eq!(uploaded.status, 201);
+
+    let fetched = download(&server, &bob, &blob_id(&uploaded));
+    assert_eq!(fetched.status, 200);
+
+    assert!(
+        !fetched.body.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+        "the instance must never hold or serve readable attachment bytes"
+    );
+
+    // Only the key, which travelled inside the encrypted message body, opens it.
+    assert_eq!(cairn_crypto::attachment::open(&key, &fetched.body).unwrap(), plaintext);
+
+    // And a member without that key gets nothing from the bytes alone.
+    let wrong = cairn_crypto::attachment::AttachmentKey::generate();
+    assert!(cairn_crypto::attachment::open(&wrong, &fetched.body).is_err());
+}
