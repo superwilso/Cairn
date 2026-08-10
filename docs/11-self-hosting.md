@@ -95,24 +95,32 @@ person (`docs/10-roadmap.md`, M3).
 
 ## 5. Back up the franking key
 
-The data volume holds two files:
+The data volume holds two things:
 
 - `franking.key` — **the one that is not replaceable.** Losing it invalidates every abuse
   report the instance ever issued: a report filed last week cannot be verified once the key
-  changes. It is regenerated silently on first start, so a lost key looks like a working
-  instance.
-- `state.json` — accounts, rooms, messages, invites.
+  changes. It is minted on first start and then never rewritten.
+- `cairn.redb` — accounts, rooms, messages, invites.
 
 ```bash
 docker compose stop cairn
 docker compose run --rm -v "$PWD:/backup" cairn \
-  sh -c 'cp /data/franking.key /data/state.json /backup/'
+  sh -c 'cp /data/franking.key /data/cairn.redb /backup/'
 docker compose start cairn
 ```
 
-Stopped first because the server rewrites `state.json` wholesale on every message, so a
-copy taken while it is running can catch a rename in progress. Restore by putting both
-files back into the volume before starting.
+Stopped first: the database is crash-consistent, but a plain `cp` of a live one is not a
+snapshot, and the two files must be restored as a matched pair.
+
+**Back up both, and keep them together.** A restore that brings back `cairn.redb` without
+`franking.key` used to start cleanly and mint a replacement key, which looked like a working
+instance while every report filed before the restore had silently stopped verifying. The
+server now refuses to start in that state and tells you to restore the key — but that only
+converts silent damage into a visible outage. The backup is still your responsibility.
+
+If you are upgrading an instance that predates this change, it will hold a `state.json`
+instead. That is imported automatically on first start and **left in place**, so a rollback
+to the previous release still finds its data. Nothing to do.
 
 ## 6. Updating
 
@@ -120,8 +128,11 @@ files back into the volume before starting.
 git pull && docker compose up -d --build
 ```
 
-The data volume is preserved. There is no schema migration story yet, so read the release
-notes before updating an instance holding conversations you care about.
+The data volume is preserved. The database records a schema version, and a build **refuses
+to open a database written by a newer build** rather than reading records under rules that
+have since changed — so a bad downgrade is an outage, not silent corruption. Migrations
+forward are automatic. Read the release notes anyway before updating an instance holding
+conversations you care about.
 
 ---
 
@@ -134,9 +145,6 @@ Honest list. Each of these is real and none is hypothetical.
 - **No rate limiting.** An authenticated account can drain another account's key packages,
   after which nobody can add that person to a room until they publish more. There is
   nothing throttling registration or sending either.
-- **Storage rewrites all state on every message.** It is O(messages) per message, so cost
-  grows quadratically with the conversation. Fine for a handful of people for a while;
-  not fine indefinitely, and it is why link previews carry no images yet.
 - **No message history on the client.** Messages arrive by polling and scroll past. A
   restart does not replay them — it cannot, because MLS discards each message key after
   use.

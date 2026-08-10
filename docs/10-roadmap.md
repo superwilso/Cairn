@@ -116,11 +116,13 @@ thing much worse, in the one product area where Cairn claims to be different.
 presence and timing are exactly what `01-threat-model.md` §3 lists as already-conceded
 metadata, and these would broadcast it continuously rather than per message.
 
-#### Sequencing is unchanged
+#### Sequencing
 
-[ADR-007](adr/007-server-storage.md) still comes first. Media, voice notes and history all
-sit behind attachments, which sit behind the storage rewrite. Usernames and disappearing
-messages are the two items that can proceed in parallel, since neither needs attachments.
+[ADR-007](adr/007-server-storage.md) came first and is **done**, so the dependency that
+blocked most of this list is gone: media, voice notes and history sit behind attachments,
+and attachments sat behind the storage rewrite. **Attachments are now the next gate.**
+Usernames and disappearing messages remain the two items that can proceed in parallel,
+since neither needs attachments.
 
 ### Direction: Discord's real-time features
 
@@ -150,8 +152,11 @@ its call's badge cannot disagree.
 
 Four calls made by the owner, so a session does not re-litigate them:
 
-- **Server storage → `redb`** ([ADR-007](adr/007-server-storage.md)). This is the next
-  item; it unblocks attachments, which unblock images in link previews and Instagram media.
+- **Server storage → `redb`** ([ADR-007](adr/007-server-storage.md)). **Done.** Storing a
+  message costs 640 bytes at message 1 and 646 at message 200, against 200× that under the
+  old snapshot design. Attachments are no longer blocked on storage, which unblocks images
+  in link previews and Instagram media. Migration from `state.json` is automatic and was
+  verified by upgrading a real instance created with the previous build.
 - **Attachment liability → sender responsible**, instance offers a removal path
   (`05-embeds.md` §4).
 - **Client state at rest → platform keystores**, with the native clients. Blocks linked
