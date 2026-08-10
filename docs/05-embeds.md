@@ -168,6 +168,93 @@ essentially nowhere else. That makes them a good demonstration of why the authen
 unfurl exists — and it also means carousel support is hostage to §2's adapter breakage in
 exactly the way the rest of the Instagram adapter is.
 
+## Linking an account and extracting the media
+
+The proposal: the user links their Instagram account, a lightweight background browser
+extracts the images or video, and **only those files** are sent, with the original link as
+metadata. `kkinstagram.com` as the fallback when there is no session or the extraction
+fails.
+
+**The shape is right and is already step 1 of the fallback chain.** Sending files rather
+than Instagram's iframe is what preserves the recipient-fetches-nothing rule, and it is the
+only way to show gated content at all. What follows is what it costs, so the cost is chosen
+rather than discovered.
+
+### It does not remove the account leak — it concentrates it
+
+An authenticated fetch means Instagram observes: *this named account requested this post at
+this time.* Anonymous fetching leaks an IP; a linked account leaks an identity. The
+**recipient** is fully protected either way, and the **sender** is more exposed, not less.
+Any UI that presents linking as a privacy improvement is claiming a protection that does not
+exist. It is a capability improvement.
+
+Two consequences that must reach the user before they link:
+
+- **Instagram may ban the account.** Automated fetching from a logged-in session is what
+  their anti-automation systems exist to catch, and the penalty lands on the user's real
+  account, not on Cairn. This is a materially different risk from a card that fails to load.
+- **The session cookie is a credential.** `cairn_crypto::store` writes client state
+  unencrypted at `0600`. A stored Instagram session grants access to someone's actual social
+  account, which is a worse thing to hold at rest than group keys are. **Blocked on platform
+  keystore storage**, not shippable before it.
+
+### The browser is the expensive part
+
+Extraction needs a renderer, because the media URLs come out of Instagram's JavaScript.
+That means executing hostile remote code on the sender's device, inside a project that is
+`#![forbid(unsafe_code)]` with a deliberately small supply chain.
+
+**Bundling a browser engine is not acceptable** — it would be the largest single addition to
+the attack surface and the supply chain, and per-app Chromium is not viable on mobile
+anyway (ADR-006 targets five native clients).
+
+The defensible form is the **platform's existing WebView** — WKWebView on Apple, Android
+WebView, WebView2 on Windows — driven off-screen, with JavaScript enabled only for the
+fetch and the result treated as untrusted input. That keeps the engine out of the supply
+chain and puts it where the OS already patches it.
+
+So the seam is a trait, not an implementation:
+
+```
+client-core:  trait MediaFetcher { fn fetch(&self, url) -> Result<Vec<Media>> }
+platform:     supplies one backed by the OS WebView
+```
+
+Card construction, clamping, EXIF stripping, and the tier rules stay below the FFI line
+(ADR-006). Only the fetch crosses it. A platform that supplies no fetcher degrades to the
+proxy rung, which is the correct behaviour rather than a broken one.
+
+### It needs attachments first
+
+"Send only those files" is the attachments subsystem: encrypted blob storage, chunking,
+size ceilings, a per-attachment key inside the encrypted message. It does not exist,
+`EnvelopePayload` has no variant for it, and it lands on the server's per-message
+full-state rewrite. **This is the same blocker that keeps thumbnails out of text cards**,
+and it does not get smaller because the files are larger.
+
+It also makes Cairn the **host** of someone else's photo or video, which is exactly the
+takedown and liability question in §4 — unanswered, and a legal design question rather than
+a technical one.
+
+### kkinstagram as the fallback
+
+Correct choice, and it is already modelled: `CardSource::Proxy`, whose `caveat()` a client
+must display. The honest framing is that the proxy **sees the URL** — the leak moves from
+Instagram to a third party rather than disappearing. That is often the better trade, and it
+is still a trade the user should be told about, per the rule that a less private path is
+never taken silently.
+
+### Order of work
+
+1. Attachments subsystem (own ADR), which needs the storage rewrite fixed first.
+2. Platform keystore storage, before any session credential is held.
+3. `MediaFetcher` trait plus one platform implementation.
+4. Per-platform opt-in, with the account-ban and identity-exposure warnings above.
+5. `kkinstagram` proxy rung, which can ship **before** any of the others and is the cheapest
+   real improvement available today.
+
+Step 5 is worth doing on its own. Steps 1 and 2 are large, and neither is an embed problem.
+
 ## Instagram: music and comments
 
 Asked directly, so recorded. **Neither can be embedded**, and the reason is structural
