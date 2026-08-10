@@ -83,10 +83,28 @@ impl Options {
         }
 
         let name = name.unwrap_or_else(|| "me".to_string());
-        let dir = dir.map_or_else(
-            || std::env::temp_dir().join("cairn").join(&name),
-            std::path::PathBuf::from,
-        );
+        // The location comes from `client-core`, not from here. A UI choosing where the
+        // device key lands is exactly what ADR-006 forbids, and this used to default to a
+        // temp directory the OS deletes on reboot — taking the account with it.
+        let dir = match dir {
+            Some(explicit) => std::path::PathBuf::from(explicit),
+            None => cairn_client_core::default_state_dir(&name)?,
+        };
+        cairn_client_core::statedir::prepare(&dir)?;
+
+        // Anyone who ran an earlier build has state in the old temp location. Say so rather
+        // than silently starting fresh, which looks exactly like a lost account — and rather
+        // than migrating it, since a temp directory may already hold a partly-cleaned
+        // identity and adopting half of one is worse than either.
+        let legacy = cairn_client_core::statedir::legacy_temp_dir(&name);
+        if legacy.exists() && legacy != dir {
+            eprintln!("note: earlier state found at {}", legacy.display());
+            eprintln!("      this build keeps state in {}", dir.display());
+            eprintln!(
+                "      the old location is a temp directory, cleared on reboot. Move it \
+                 across if that account still matters, or delete it."
+            );
+        }
         Ok(Self { server, dir, name, invite })
     }
 }

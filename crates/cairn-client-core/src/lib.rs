@@ -21,6 +21,7 @@ pub mod contacts;
 pub mod conversation;
 pub mod embed;
 pub mod history;
+pub mod statedir;
 pub mod store;
 pub mod transport;
 
@@ -31,6 +32,7 @@ pub use conversation::{
     ReceivedMessage, TimelineEvent,
 };
 pub use embed::{Card, CardSource};
+pub use statedir::{default_state_dir, StateDirError};
 pub use store::{ConversationIndex, ConversationRecord, IndexError};
 pub use transport::{Transport, TransportError};
 
