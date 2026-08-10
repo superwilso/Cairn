@@ -27,7 +27,18 @@ pub enum TransportError {
 #[derive(Debug, Clone)]
 pub struct Response {
     pub status: u16,
-    pub body: String,
+    /// Raw bytes. A downloaded attachment is ciphertext, and reading it into a `String`
+    /// would replace every invalid UTF-8 sequence with U+FFFD — corrupting the payload
+    /// while looking like a successful fetch.
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    /// The body as text, for the JSON endpoints. Lossy by construction, which is fine for
+    /// JSON and is why binary callers use [`Response::body`] directly.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
 }
 
 impl Response {
@@ -40,8 +51,31 @@ impl Response {
         if (200..300).contains(&self.status) {
             Ok(self)
         } else {
-            Err(TransportError::Status { status: self.status, body: self.body })
+            Err(TransportError::Status { status: self.status, body: self.text() })
         }
+    }
+}
+
+/// A request body, and what it is.
+///
+/// Bytes rather than `&str`, because attachments are binary and there is no lossless way to
+/// carry arbitrary ciphertext through a string. The content type travels with the bytes
+/// rather than being assumed by the transport: it was previously hard-coded to
+/// `application/json`, which silently mislabels every attachment upload.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestBody<'a> {
+    pub bytes: &'a [u8],
+    pub content_type: &'static str,
+}
+
+impl<'a> RequestBody<'a> {
+    pub fn json(body: &'a str) -> Self {
+        Self { bytes: body.as_bytes(), content_type: "application/json" }
+    }
+
+    /// Opaque bytes — an encrypted attachment. The server is not meant to parse these.
+    pub fn octets(bytes: &'a [u8]) -> Self {
+        Self { bytes, content_type: "application/octet-stream" }
     }
 }
 
@@ -55,13 +89,13 @@ pub trait Transport: Send + Sync + fmt::Debug {
         method: &str,
         path: &str,
         headers: &[(&str, String)],
-        body: Option<&str>,
+        body: Option<RequestBody<'_>>,
     ) -> Result<Response, TransportError>;
 }
 
 #[cfg(feature = "http")]
 mod http {
-    use super::{Response, Transport, TransportError};
+    use super::{RequestBody, Response, Transport, TransportError};
 
     /// An instance reachable over HTTP(S).
     ///
@@ -109,7 +143,7 @@ mod http {
             method: &str,
             path: &str,
             headers: &[(&str, String)],
-            body: Option<&str>,
+            body: Option<RequestBody<'_>>,
         ) -> Result<Response, TransportError> {
             let url = format!("{}{path}", self.base);
 
@@ -123,7 +157,9 @@ mod http {
                         request = request.header(*name, value);
                     }
                     match body {
-                        Some(body) => request.header("content-type", "application/json").send(body),
+                        Some(body) => {
+                            request.header("content-type", body.content_type).send(body.bytes)
+                        }
                         None => request.send_empty(),
                     }
                 }
@@ -152,10 +188,8 @@ mod http {
             };
 
             let status = response.status().as_u16();
-            let body = response
-                .body_mut()
-                .read_to_string()
-                .map_err(|e| TransportError::Io(e.to_string()))?;
+            let body =
+                response.body_mut().read_to_vec().map_err(|e| TransportError::Io(e.to_string()))?;
             Ok(Response { status, body })
         }
     }

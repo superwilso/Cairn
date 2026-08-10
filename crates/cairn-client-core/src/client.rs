@@ -38,6 +38,8 @@ pub enum ClientError {
          to the messages"
     )]
     TierDisagreement { local: &'static str, server: String },
+    #[error("the instance returned a malformed {0}")]
+    Malformed(&'static str),
 }
 
 /// Wall clock, in milliseconds since the Unix epoch.
@@ -73,6 +75,11 @@ struct CreateRoomRequest {
     is_direct: bool,
     is_publicly_discoverable: bool,
     member_ceiling: u32,
+}
+
+#[derive(Deserialize)]
+struct UploadedBlobResponse {
+    blob: String,
 }
 
 #[derive(Deserialize)]
@@ -192,7 +199,54 @@ impl<T: Transport> Client<T> {
         headers: &[(&str, String)],
         body: Option<&str>,
     ) -> Result<Response, ClientError> {
+        self.call_raw(method, path, headers, body.map(crate::transport::RequestBody::json))
+    }
+
+    /// The bytes-level escape hatch, for the one endpoint whose body is not JSON.
+    ///
+    /// Kept separate rather than widening `call`, so every existing caller stays visibly
+    /// JSON and an attachment upload has to say that it is not.
+    fn call_raw(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+        body: Option<crate::transport::RequestBody<'_>>,
+    ) -> Result<Response, ClientError> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
+    }
+
+    /// Upload an already-sealed attachment to a room, returning the id to reference it by.
+    ///
+    /// Takes ciphertext, never a file. Sealing happens in
+    /// [`cairn_crypto::attachment::seal`] and the key belongs in the encrypted message body
+    /// — a `Client` that took a plaintext file and encrypted it here would put the key on
+    /// the same call as the bytes, which is exactly the arrangement the blob store exists
+    /// to avoid.
+    pub fn upload_attachment(
+        &self,
+        room: RoomId,
+        sealed: &[u8],
+    ) -> Result<cairn_proto::BlobId, ClientError> {
+        let response = self.call_raw(
+            "POST",
+            &format!("/v1/rooms/{}/blobs", room.as_uuid()),
+            &self.auth("upload_blob", Some(room.into()))?,
+            Some(crate::transport::RequestBody::octets(sealed)),
+        )?;
+        let parsed: UploadedBlobResponse = serde_json::from_slice(&response.body)?;
+        parsed.blob.parse().map_err(|_| ClientError::Malformed("blob id"))
+    }
+
+    /// Fetch a sealed attachment. Still ciphertext — open it with the key from the message.
+    pub fn download_attachment(&self, blob: cairn_proto::BlobId) -> Result<Vec<u8>, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/blobs/{}", blob.as_uuid()),
+            &self.auth("download_blob", Some(blob.into()))?,
+            None,
+        )?;
+        Ok(response.body)
     }
 
     /// Claim this client's user id, registering its device as the account's first.
@@ -236,7 +290,7 @@ impl<T: Transport> Client<T> {
             &self.auth("publish_key_packages", Some(ResourceRef::Device(self.device)))?,
             Some(&body),
         )?;
-        let parsed: PublishKeyPackagesResponse = serde_json::from_str(&response.body)?;
+        let parsed: PublishKeyPackagesResponse = serde_json::from_slice(&response.body)?;
         Ok(parsed.remaining)
     }
 
@@ -255,7 +309,7 @@ impl<T: Transport> Client<T> {
         );
 
         match response {
-            Ok(response) => Ok(serde_json::from_str(&response.body)?),
+            Ok(response) => Ok(serde_json::from_slice(&response.body)?),
             Err(ClientError::Transport(TransportError::Status { status: 409, .. })) => {
                 Err(ClientError::NoKeyPackages(user))
             }
@@ -283,7 +337,7 @@ impl<T: Transport> Client<T> {
         })?;
         let response =
             self.call("POST", "/v1/rooms", &self.auth("create_room", None)?, Some(&body))?;
-        let parsed: CreatedRoomResponse = serde_json::from_str(&response.body)?;
+        let parsed: CreatedRoomResponse = serde_json::from_slice(&response.body)?;
 
         if parsed.tier != seal.tier().label() || parsed.e2ee != seal.tier().is_e2ee() {
             return Err(ClientError::TierDisagreement {
@@ -326,7 +380,7 @@ impl<T: Transport> Client<T> {
         let body = serde_json::to_string(envelope)?;
         let response =
             self.call("POST", &format!("/v1/rooms/{}/messages", room.as_uuid()), &[], Some(&body))?;
-        Ok(serde_json::from_str(&response.body)?)
+        Ok(serde_json::from_slice(&response.body)?)
     }
 
     /// Fetch messages after `after`. Polling is M1's delivery mechanism.
@@ -341,7 +395,7 @@ impl<T: Transport> Client<T> {
             &self.auth("read", Some(ResourceRef::Room(room)))?,
             None,
         )?;
-        Ok(serde_json::from_str(&response.body)?)
+        Ok(serde_json::from_slice(&response.body)?)
     }
 
     /// File a franking report and get the server's verdict.
@@ -352,7 +406,7 @@ impl<T: Transport> Client<T> {
     pub fn report(&self, report: &TranscriptReport) -> Result<ReportVerdict, ClientError> {
         let body = serde_json::to_string(report)?;
         let response = self.call("POST", "/v1/reports", &[], Some(&body))?;
-        Ok(serde_json::from_str(&response.body)?)
+        Ok(serde_json::from_slice(&response.body)?)
     }
 }
 
@@ -374,7 +428,7 @@ mod tests {
             _method: &str,
             _path: &str,
             _headers: &[(&str, String)],
-            _body: Option<&str>,
+            _body: Option<crate::transport::RequestBody<'_>>,
         ) -> Result<Response, TransportError> {
             Ok(Response {
                 status: 200,
@@ -383,7 +437,8 @@ mod tests {
                     uuid::Uuid::new_v4(),
                     self.tier,
                     self.e2ee
-                ),
+                )
+                .into_bytes(),
             })
         }
     }
