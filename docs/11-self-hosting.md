@@ -257,6 +257,11 @@ Honest list. Each of these is real and none is hypothetical.
   `docs/01-threat-model.md` §3.4, which does not claim to defend a compromised device — but
   it is weaker than a platform keystore, which is what a finished client would use.
 
+- **Disappearing messages are purged lazily**, when someone next reads the room. An
+  abandoned room keeps its messages until it is opened again, so the timer is an upper bound
+  on what a *reader* sees rather than a guarantee about what is on disk at any instant. A
+  background sweep would close that; it does not exist yet.
+
 **Structural, and the reason this is pre-alpha:**
 
 - **No external cryptographic review.** Scheduled for M5 and explicitly non-optional in

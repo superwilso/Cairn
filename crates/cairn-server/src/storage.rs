@@ -140,6 +140,9 @@ pub enum Write {
     /// Keyed by token hash, not the token.
     RoomInvite(String, RoomInviteRecord),
     Message(RoomId, StoredMessage),
+    /// Remove a message. Used by the disappearing-message purge, which must actually
+    /// delete rather than hide: a message still on disk has not disappeared.
+    DeleteMessage(RoomId, u64),
     /// Metadata and ciphertext together: a blob whose bytes landed without its metadata
     /// would be unreachable and unattributable, and one whose metadata landed without its
     /// bytes would be a dangling reference a member could fetch and get nothing for.
@@ -323,6 +326,10 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                 let mut t = tx.open_table(META).map_err(RedbError::from)?;
                 t.insert("registration_policy", serde_json::to_vec(policy)?.as_slice())
                     .map_err(RedbError::from)?;
+            }
+            Write::DeleteMessage(room, seq) => {
+                let mut t = tx.open_table(MESSAGES).map_err(RedbError::from)?;
+                t.remove((room.to_string().as_str(), *seq)).map_err(RedbError::from)?;
             }
             Write::Blob(id, record, bytes) => {
                 let key = id.to_string();
@@ -525,6 +532,9 @@ impl Storage for MemoryStorage {
                 }
                 Write::Policy(p) => inner.directory.registration_policy = *p,
                 Write::Message(room, m) => inner.messages.push((*room, m.clone())),
+                Write::DeleteMessage(room, seq) => {
+                    inner.messages.retain(|(r, m)| !(r == room && m.server_seq == *seq))
+                }
                 Write::Blob(id, r, b) => inner.blobs.push((*id, r.clone(), b.clone())),
             }
         }

@@ -48,6 +48,7 @@ pub fn router(instance: SharedInstance) -> Router {
                 .layer(DefaultBodyLimit::max(crate::state::MAX_BLOB_BYTES + 64 * 1024)),
         )
         .route("/v1/blobs/{blob}", get(download_blob))
+        .route("/v1/rooms/{room}/ttl", post(set_room_ttl))
         .route("/v1/rooms/{room}/invites", post(create_room_invite))
         .route("/v1/invites/redeem", post(redeem_room_invite))
         .route("/v1/usernames", post(claim_username))
@@ -81,7 +82,9 @@ impl IntoResponse for ServerError {
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ServerError::NoSuchBlob | ServerError::NoSuchUsername => StatusCode::NOT_FOUND,
             ServerError::UsernameTaken | ServerError::UsernameAlreadySet => StatusCode::CONFLICT,
-            ServerError::BadUsername(_) | ServerError::InviteUsesTooHigh => StatusCode::BAD_REQUEST,
+            ServerError::BadUsername(_) | ServerError::InviteUsesTooHigh | ServerError::BadTtl => {
+                StatusCode::BAD_REQUEST
+            }
             // Deliberately the same 401 as any other bad credential, and deliberately not
             // 404: distinguishing "no such invite" from "spent" would tell someone probing
             // tokens when they had found a real one.
@@ -371,6 +374,26 @@ async fn download_blob(
     Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
 }
 
+#[derive(Deserialize)]
+struct SetTtlRequest {
+    /// Milliseconds, or `null` to turn disappearing messages off.
+    #[serde(default)]
+    ttl_ms: Option<i64>,
+}
+
+/// Set the room's disappearing-message timer. Any member may.
+async fn set_room_ttl(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<SetTtlRequest>,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "set_room_ttl", Some(room.into()))?;
+    instance.set_room_ttl(room, actor, request.ttl_ms)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Serialize)]
 struct RoomMemberEntry {
     user: String,
@@ -591,7 +614,7 @@ async fn fetch_messages(
 ) -> Result<Json<Vec<FetchedMessage>>, ServerError> {
     let room = RoomId::from_uuid(room);
     let actor = signed_actor(&instance, &headers, "read", Some(room.into()))?;
-    let messages = instance.messages_since(room, actor, since.after)?;
+    let messages = instance.messages_since(room, actor, since.after, now_ms())?;
     Ok(Json(
         messages
             .into_iter()

@@ -96,6 +96,8 @@ pub enum ServerError {
     NoSuchUsername,
     #[error("not a usable username: {0}")]
     BadUsername(String),
+    #[error("a disappearing-message timer must be a positive duration")]
+    BadTtl,
     #[error("this invite is unknown, spent, expired, or revoked")]
     RoomInviteInvalid,
     #[error("an invite may admit at most {MAX_INVITE_USES} people; an unlimited one would be a public invite")]
@@ -224,13 +226,28 @@ pub struct Room {
     /// evidence honest members would later report.
     #[serde(default)]
     members: Vec<RoomMember>,
+    /// How long a message lives, in milliseconds, measured from when it was **sent**.
+    ///
+    /// Start-on-send rather than start-on-read: start-on-read needs the client to report
+    /// having read a message, which is a read receipt by another name, and those were
+    /// excluded for broadcasting presence (`docs/10-roadmap.md`).
+    ///
+    /// `default` so rooms created before this existed still decode.
+    #[serde(default)]
+    disappear_after_ms: Option<i64>,
 }
 
 impl Room {
     /// A bare room, for storage tests that need a value rather than a scenario.
     #[cfg(test)]
     pub(crate) fn for_test(seal: RoomSeal) -> Self {
-        Self { seal, next_seq: 0, last_franked: None, members: Vec::new() }
+        Self {
+            seal,
+            next_seq: 0,
+            last_franked: None,
+            members: Vec::new(),
+            disappear_after_ms: None,
+        }
     }
 
     fn has_member(&self, user: UserId) -> bool {
@@ -634,6 +651,7 @@ impl Instance {
             next_seq: 0,
             last_franked: None,
             members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
+            disappear_after_ms: None,
         };
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         rooms.insert(id, room.clone());
@@ -742,6 +760,69 @@ impl Instance {
         let updated = r.clone();
         drop(rooms);
         self.write(&[Write::Room(room, updated)])
+    }
+
+    /// Set or clear the room's disappearing-message timer. Any member may.
+    ///
+    /// "Any member" rather than moderators-only because a DM has no moderator and both
+    /// parties are equals — either should be able to ask for ephemerality. It applies to
+    /// **future messages only**: retroactively shortening the life of messages people
+    /// already sent under a different expectation is the same category of mistake as
+    /// downgrading a room's tier.
+    pub fn set_room_ttl(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        ttl_ms: Option<i64>,
+    ) -> Result<(), ServerError> {
+        if ttl_ms.is_some_and(|t| t <= 0) {
+            return Err(ServerError::BadTtl);
+        }
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if !r.has_member(actor) {
+            return Err(ServerError::NotAMember);
+        }
+        r.disappear_after_ms = ttl_ms;
+        let updated = r.clone();
+        drop(rooms);
+        self.write(&[Write::Room(room, updated)])
+    }
+
+    /// The room's disappearing-message timer, if set.
+    pub fn room_ttl(&self, room: RoomId) -> Option<i64> {
+        self.rooms
+            .lock()
+            .expect("rooms mutex poisoned")
+            .get(&room)
+            .and_then(|r| r.disappear_after_ms)
+    }
+
+    /// Delete messages past the room's timer.
+    ///
+    /// Actually deletes rather than filtering. A message the server still holds has not
+    /// disappeared, whatever the client shows — and the whole point of the feature is what
+    /// the *instance* stops being able to hand over.
+    ///
+    /// Purged lazily, on read. That means an abandoned room keeps its messages until someone
+    /// looks at it, which is a real limitation and is stated in `docs/11-self-hosting.md`
+    /// rather than implied away.
+    fn purge_expired(&self, room: RoomId, ttl_ms: i64, now_ms: i64) -> Result<(), ServerError> {
+        let cutoff = now_ms.saturating_sub(ttl_ms);
+        let expired: Vec<u64> = self
+            .storage
+            .messages_since(room, 0)?
+            .into_iter()
+            .filter(|m| m.envelope.sent_at_ms <= cutoff)
+            .map(|m| m.server_seq)
+            .collect();
+
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let writes: Vec<Write> =
+            expired.into_iter().map(|seq| Write::DeleteMessage(room, seq)).collect();
+        self.write(&writes)
     }
 
     /// The room's server-side membership, for a member.
@@ -1246,6 +1327,7 @@ impl Instance {
         room: RoomId,
         actor: UserId,
         after: u64,
+        now_ms: i64,
     ) -> Result<Vec<StoredMessage>, ServerError> {
         {
             let rooms = self.rooms.lock().expect("rooms mutex poisoned");
@@ -1253,6 +1335,11 @@ impl Instance {
             if !r.has_member(actor) {
                 return Err(ServerError::NotAMember);
             }
+        }
+        // Purge before reading, so an expired message is gone from storage rather than
+        // merely hidden from this caller.
+        if let Some(ttl) = self.room_ttl(room) {
+            self.purge_expired(room, ttl, now_ms)?;
         }
         // Read from storage rather than memory: the log is the one thing that grows
         // without bound, and it is where attachment bytes will land.
@@ -1632,7 +1719,7 @@ pub(crate) mod tests {
             "published key packages must survive"
         );
         assert_eq!(
-            restarted.messages_since(room, owner, 0).unwrap().len(),
+            restarted.messages_since(room, owner, 0, 0).unwrap().len(),
             1,
             "the message log must survive"
         );
@@ -1715,7 +1802,7 @@ pub(crate) mod tests {
 
         let restarted = Instance::open(storage).unwrap();
         assert_eq!(restarted.room_seal(room).unwrap().tier(), Tier::PublicCommunity);
-        assert_eq!(restarted.messages_since(room, user, 0).unwrap().len(), 3);
+        assert_eq!(restarted.messages_since(room, user, 0, 0).unwrap().len(), 3);
 
         // Device registrations must survive too, or every client is locked out after a
         // restart. Re-registering the same device must be refused, which proves the
@@ -1883,7 +1970,8 @@ pub(crate) mod tests {
         let e = sender
             .unsigned(room, EnvelopePayload::Plaintext { body: "one".into() })
             .with_franking_commitment(c1.to_hex());
-        inst.accept(sender.sign(e)).unwrap();
+        let signature = sender.session.sign(&e.signing_bytes()).unwrap();
+        inst.accept(e.with_signature(hex::encode(signature))).unwrap();
 
         // An unfranked message in between.
         inst.accept(sender.envelope(room, EnvelopePayload::Plaintext { body: "plain".into() }))
@@ -1920,9 +2008,9 @@ pub(crate) mod tests {
             let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
             inst.accept(e).unwrap();
         }
-        assert_eq!(inst.messages_since(room, sender.user, 0).unwrap().len(), 3);
-        assert_eq!(inst.messages_since(room, sender.user, 2).unwrap().len(), 1);
-        assert_eq!(inst.messages_since(room, sender.user, 99).unwrap().len(), 0);
+        assert_eq!(inst.messages_since(room, sender.user, 0, 0).unwrap().len(), 3);
+        assert_eq!(inst.messages_since(room, sender.user, 2, 0).unwrap().len(), 1);
+        assert_eq!(inst.messages_since(room, sender.user, 99, 0).unwrap().len(), 0);
     }
 }
 
@@ -2226,9 +2314,12 @@ mod membership {
         inst.accept(alice.envelope(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] }))
             .unwrap();
 
-        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+        assert!(matches!(
+            inst.messages_since(room, mallory.user, 0, 0),
+            Err(ServerError::NotAMember)
+        ));
         // The member still can, so the check is not simply refusing everyone.
-        assert_eq!(inst.messages_since(room, alice.user, 0).unwrap().len(), 1);
+        assert_eq!(inst.messages_since(room, alice.user, 0, 0).unwrap().len(), 1);
     }
 
     #[test]
@@ -2378,10 +2469,10 @@ mod membership {
 
         let restarted = Instance::open(storage).unwrap();
         // A member must not be locked out by a restart…
-        assert!(restarted.messages_since(room, member, 0).is_ok());
+        assert!(restarted.messages_since(room, member, 0, 0).is_ok());
         // …and an outsider must not be let in by one.
         assert!(matches!(
-            restarted.messages_since(room, outsider, 0),
+            restarted.messages_since(room, outsider, 0, 0),
             Err(ServerError::NotAMember)
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -2451,7 +2542,10 @@ mod roles {
             ),
             Err(ServerError::NotAMember)
         ));
-        assert!(matches!(inst.messages_since(room, mallory.user, 0), Err(ServerError::NotAMember)));
+        assert!(matches!(
+            inst.messages_since(room, mallory.user, 0, 0),
+            Err(ServerError::NotAMember)
+        ));
     }
 
     #[test]
@@ -2470,7 +2564,7 @@ mod roles {
 
         inst.remove_room_member(room, alice.user, mallory.user).unwrap();
 
-        let log = inst.messages_since(room, alice.user, 0).unwrap();
+        let log = inst.messages_since(room, alice.user, 0, 0).unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].envelope.sender, mallory.user);
     }
@@ -3097,5 +3191,117 @@ mod add_after_invite {
             inst.add_room_member(room, alice.user, carol.user),
             Err(ServerError::RoomFull)
         ));
+    }
+}
+
+#[cfg(test)]
+mod disappearing {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::{EnvelopePayload, Tier};
+
+    fn room_with_message(inst: &Instance, sent_at: i64) -> (RoomId, TestSender) {
+        let sender = TestSender::registered(inst);
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
+        let e = cairn_proto::Envelope::new(
+            Tier::PublicCommunity,
+            room,
+            sender.user,
+            sender.device,
+            sent_at,
+            EnvelopePayload::Plaintext { body: "ephemeral".into() },
+        )
+        .unwrap();
+        let signature = sender.session.sign(&e.signing_bytes()).unwrap();
+        inst.accept(e.with_signature(hex::encode(signature))).unwrap();
+        (room, sender)
+    }
+
+    #[test]
+    fn an_expired_message_leaves_storage_rather_than_being_hidden() {
+        // The property the whole feature rests on. Filtering on read would make the client
+        // *look* right while the instance still held everything — and what the instance can
+        // hand over is the entire point.
+        let inst = Instance::in_memory();
+        let (room, sender) = room_with_message(&inst, 0);
+        inst.set_room_ttl(room, sender.user, Some(1_000)).unwrap();
+
+        // Before expiry it is there.
+        assert_eq!(inst.messages_since(room, sender.user, 0, 500).unwrap().len(), 1);
+
+        // After expiry, gone from the caller's view...
+        assert!(inst.messages_since(room, sender.user, 0, 1_001).unwrap().is_empty());
+        // ...and gone from storage, which is the part that matters.
+        assert!(
+            inst.storage.messages_since(room, 0).unwrap().is_empty(),
+            "an expired message must be deleted, not filtered"
+        );
+    }
+
+    #[test]
+    fn a_room_without_a_timer_keeps_everything() {
+        // The counterfactual: without it, a purge bug that deleted unconditionally would
+        // still pass the test above.
+        let inst = Instance::in_memory();
+        let (room, sender) = room_with_message(&inst, 0);
+        assert_eq!(
+            inst.messages_since(room, sender.user, 0, 10_000_000).unwrap().len(),
+            1,
+            "no timer means no expiry"
+        );
+    }
+
+    #[test]
+    fn the_timer_applies_to_future_messages_not_past_expectations() {
+        // Setting a timer must not retroactively shorten the life of messages people
+        // already sent — but it does apply to everything in the room from then on, which is
+        // what users of every other product expect. The line being drawn is that turning it
+        // *on* is a room-wide decision, not that old messages are exempt forever.
+        let inst = Instance::in_memory();
+        let (room, sender) = room_with_message(&inst, 0);
+        inst.set_room_ttl(room, sender.user, Some(1_000)).unwrap();
+        assert!(inst.messages_since(room, sender.user, 0, 2_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn any_member_may_set_it_but_a_stranger_may_not() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_message(&inst, 0);
+        let bob = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, bob.user).unwrap();
+
+        assert!(inst.set_room_ttl(room, bob.user, Some(5_000)).is_ok(), "a member may set it");
+        assert_eq!(inst.room_ttl(room), Some(5_000));
+
+        let outsider = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.set_room_ttl(room, outsider.user, Some(1)),
+            Err(ServerError::NotAMember)
+        ));
+    }
+
+    #[test]
+    fn a_nonsense_timer_is_refused() {
+        let inst = Instance::in_memory();
+        let (room, owner) = room_with_message(&inst, 0);
+        assert!(matches!(inst.set_room_ttl(room, owner.user, Some(0)), Err(ServerError::BadTtl)));
+        assert!(matches!(inst.set_room_ttl(room, owner.user, Some(-1)), Err(ServerError::BadTtl)));
+        assert!(inst.set_room_ttl(room, owner.user, None).is_ok(), "clearing must be allowed");
+    }
+
+    #[test]
+    fn a_timer_survives_a_restart() {
+        // Otherwise a restart quietly turns disappearing messages off, and nobody is told.
+        let dir = temp_dir("ttl");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let room = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let (room, owner) = room_with_message(&inst, 0);
+            inst.set_room_ttl(room, owner.user, Some(60_000)).unwrap();
+            room
+        };
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.room_ttl(room), Some(60_000));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
