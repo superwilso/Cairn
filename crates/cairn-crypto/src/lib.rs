@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attachment;
 pub mod franking;
 pub mod mls;
 pub mod store;

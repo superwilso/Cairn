@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::{Commitment, Context as FrankingContext, ServerFrankingKey, Tag};
 use cairn_crypto::TranscriptReport;
-use cairn_proto::{DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId};
+use cairn_proto::{BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId};
 
 use crate::storage::{Storage, StorageError, Write};
 
@@ -80,6 +80,12 @@ pub enum ServerError {
     TooManyKeyPackages,
     #[error("rate limited; retry later")]
     RateLimited,
+    #[error("no such attachment")]
+    NoSuchBlob,
+    #[error("attachment is larger than this instance accepts ({MAX_BLOB_BYTES} bytes)")]
+    BlobTooLarge,
+    #[error("attachment is empty")]
+    BlobEmpty,
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -88,6 +94,14 @@ pub enum ServerError {
 /// unauthenticated party never sees but an authenticated one can drain, and without a cap
 /// a device could park unbounded storage on someone else's instance.
 pub const MAX_KEY_PACKAGES_PER_DEVICE: usize = 100;
+
+/// The largest attachment this build accepts, in bytes.
+///
+/// A ceiling, not a target, and deliberately modest. Every byte here is storage and egress
+/// the *operator* pays for — `docs/13-customisation.md` §2 is explicit that "unlimited
+/// uploads, free" means the person running the server finds out when the bill arrives. An
+/// instance that wants more should raise this knowingly.
+pub const MAX_BLOB_BYTES: usize = 25 * 1024 * 1024;
 
 /// How many times one account may claim key packages *for the same target* per window.
 ///
@@ -206,6 +220,22 @@ pub struct StoredMessage {
     pub server_seq: u64,
     /// Present when the message carried a franking commitment.
     pub franking_tag: Option<Tag>,
+}
+
+/// An attachment the server holds, minus its bytes.
+///
+/// The server stores ciphertext it cannot read: the client encrypts the file under a key it
+/// puts *inside* the encrypted message body, so the key never crosses the wire in the clear
+/// and the tier's guarantee extends to attachments rather than stopping at message text.
+///
+/// `room` is the access control boundary and is fixed at upload. It is recorded server-side
+/// rather than taken from the fetching client, because a client-supplied room would let
+/// anyone read any blob by naming a room they happen to be in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobRecord {
+    pub room: RoomId,
+    pub uploader: UserId,
+    pub size: usize,
 }
 
 /// A registered sending device.
@@ -813,6 +843,64 @@ impl Instance {
         Ok(claimed)
     }
 
+    /// Store an encrypted attachment against a room.
+    ///
+    /// Membership is checked here rather than at the HTTP boundary, and it is checked on the
+    /// *upload* as well as the fetch. Without the upload check, any authenticated account
+    /// could park storage on any instance by naming a room it is not in — and the blob would
+    /// then be readable by that room's members, which is a way to push content at people who
+    /// never admitted you.
+    pub fn store_blob(
+        &self,
+        actor: UserId,
+        room: RoomId,
+        bytes: Vec<u8>,
+    ) -> Result<BlobId, ServerError> {
+        if bytes.is_empty() {
+            return Err(ServerError::BlobEmpty);
+        }
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(ServerError::BlobTooLarge);
+        }
+
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            if !r.has_member(actor) {
+                return Err(ServerError::NotAMember);
+            }
+        }
+
+        let id = BlobId::new();
+        let record = BlobRecord { room, uploader: actor, size: bytes.len() };
+        self.write(&[Write::Blob(id, record, bytes)])?;
+        Ok(id)
+    }
+
+    /// Fetch an attachment, for a member of the room it was uploaded to.
+    ///
+    /// The membership check reads metadata first and the bytes only afterwards. Loading a
+    /// 25 MiB payload in order to decide whether the caller may see it would make the
+    /// access check itself the denial of service.
+    ///
+    /// Membership is evaluated **now**, not at upload time, so an account removed from a
+    /// room loses access to its attachments — consistent with `remove_room_member`, and the
+    /// alternative would leave a removed member with a permanent read channel into the room.
+    pub fn fetch_blob(&self, actor: UserId, id: BlobId) -> Result<Vec<u8>, ServerError> {
+        let record = self.storage.blob_meta(id)?.ok_or(ServerError::NoSuchBlob)?;
+
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            // A blob whose room is gone is unreachable rather than public.
+            let r = rooms.get(&record.room).ok_or(ServerError::NoSuchBlob)?;
+            if !r.has_member(actor) {
+                return Err(ServerError::NotAMember);
+            }
+        }
+
+        self.storage.blob_bytes(id)?.ok_or(ServerError::NoSuchBlob)
+    }
+
     pub fn room_seal(&self, room: RoomId) -> Option<RoomSeal> {
         self.rooms.lock().expect("rooms mutex poisoned").get(&room).map(|r| r.seal)
     }
@@ -1116,6 +1204,12 @@ pub(crate) mod tests {
             after: u64,
         ) -> Result<Vec<StoredMessage>, StorageError> {
             self.inner.messages_since(room, after)
+        }
+        fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
+            self.inner.blob_meta(id)
+        }
+        fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.blob_bytes(id)
         }
     }
 

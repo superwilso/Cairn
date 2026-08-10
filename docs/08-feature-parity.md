@@ -56,6 +56,14 @@ native clients, because a terminal cannot capture a microphone. And unlike Disco
 will refuse a call rather than downgrade it to plaintext for a client that cannot do E2EE
 media — the badge is not allowed to lie.
 
+**Customisation is a differentiator, not a footnote.** Most of what Discord charges for
+under Nitro is artificial scarcity — a limit chosen in order to sell removing it — and on an
+instance you run yourself there is nothing to remove. Designed in
+[`13-customisation.md`](13-customisation.md), including the two places "free" is not free
+(uploads and streaming cost the operator real money) and the one that is genuinely different
+under E2EE: a custom emoji fetched at render time tells the server which emoji you used and
+when, leaking content it could not otherwise read.
+
 **Bots are not optional.** They are much of why Discord communities stay on Discord. A bot
 in an E2EE room is a group member holding keys — an A6 adversary with a friendly name
 (`01-threat-model.md` §5). The design must surface that to users, and it is an open
@@ -65,11 +73,21 @@ question in `01-threat-model.md` §10.
 
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
-| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
+| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ server side done |
 | GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 | Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
 | Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |
 | Large file limits | ⚠️ paywalled | ⚠️ | ⚠️ 2 GB | ⚠️ | ✅ 2 GB free | 🎯 operator-set |
+
+**Attachments exist server-side**: a client uploads ciphertext to a room, the server stores
+bytes it cannot read, and any member of that room may fetch them. Membership is checked on
+upload *and* on fetch, and evaluated at fetch time — so removing someone revokes their access
+to the room's attachments rather than leaving them a permanent read channel. The encryption is
+`cairn_crypto::attachment`: a fresh single-use key per attachment, XChaCha20-Poly1305, and
+the key carried inside the encrypted message body — so a tier's guarantee extends to
+attachments rather than stopping at message text. Verified over a socket against the bytes
+the *server returns*, not a local buffer. What is still owed is the client plumbing that
+puts the key into the body and offers a file picker.
 
 Link previews are where Cairn does something none of them do — see
 [`05-embeds.md`](05-embeds.md). Signal does the unauthenticated version; the authenticated

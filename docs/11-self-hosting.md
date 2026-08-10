@@ -100,7 +100,10 @@ The data volume holds two things:
 - `franking.key` — **the one that is not replaceable.** Losing it invalidates every abuse
   report the instance ever issued: a report filed last week cannot be verified once the key
   changes. It is minted on first start and then never rewritten.
-- `cairn.redb` — accounts, rooms, messages, invites.
+- `cairn.redb` — accounts, rooms, messages, invites, **and attachments**. Attachment
+  ciphertext lives in here, so this file grows with what people send, not just with how many
+  of them there are. The per-attachment ceiling is `MAX_BLOB_BYTES` (25 MiB) — a deliberate
+  floor-level default, since every byte is storage and egress you pay for.
 
 ```bash
 docker compose stop cairn

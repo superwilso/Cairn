@@ -94,6 +94,11 @@ opaque_id!(
 opaque_id!(RoomId, "rom", "A conversation: DM, group chat, or community channel.");
 opaque_id!(MessageId, "msg", "A single message.");
 opaque_id!(InstanceId, "ins", "A Cairn server instance.");
+opaque_id!(
+    BlobId,
+    "blb",
+    "An encrypted attachment. Opaque ciphertext to the server, which stores it against the      room it was uploaded to and never holds the key."
+);
 
 #[cfg(test)]
 mod tests {

@@ -43,10 +43,10 @@ use redb::{Database, Error as RedbError, ReadableTable, ReadableTableMetadata, T
 use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::ServerFrankingKey;
-use cairn_proto::{DeviceId, RoomId, UserId};
+use cairn_proto::{BlobId, DeviceId, RoomId, UserId};
 
 use crate::state::{
-    AccountRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room, StoredMessage,
+    AccountRecord, BlobRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room, StoredMessage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +92,14 @@ const KEY_PACKAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("key_pac
 /// Keyed by `(room id, server_seq)` so a room's messages are contiguous and a fetch after
 /// a cursor is a range scan rather than a filter over everything.
 const MESSAGES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("messages");
+/// Attachment metadata — which room a blob belongs to, and who uploaded it.
+///
+/// Split from the bytes so an access check does not have to load the payload. Answering
+/// "may this account read this blob?" by first reading 25 MiB off disk would make the
+/// check itself a denial-of-service vector.
+const BLOB_META: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_meta");
+/// Attachment ciphertext. Opaque to the server, which never holds the key.
+const BLOB_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_bytes");
 
 /// Everything an instance holds except the message log.
 ///
@@ -121,6 +129,10 @@ pub enum Write {
     KeyPackages(DeviceId, VecDeque<String>),
     Policy(RegistrationPolicy),
     Message(RoomId, StoredMessage),
+    /// Metadata and ciphertext together: a blob whose bytes landed without its metadata
+    /// would be unreachable and unattributable, and one whose metadata landed without its
+    /// bytes would be a dangling reference a member could fetch and get nothing for.
+    Blob(BlobId, BlobRecord, Vec<u8>),
 }
 
 /// Where an instance keeps what must survive a restart.
@@ -140,6 +152,12 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
 
     /// Messages in a room with `server_seq` strictly greater than `after`, in order.
     fn messages_since(&self, room: RoomId, after: u64) -> Result<Vec<StoredMessage>, StorageError>;
+
+    /// A blob's metadata, without its bytes. Used for the access check.
+    fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError>;
+
+    /// A blob's ciphertext. Call only after the access check has passed.
+    fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError>;
 }
 
 /// A `redb`-backed store.
@@ -285,6 +303,14 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                 t.insert("registration_policy", serde_json::to_vec(policy)?.as_slice())
                     .map_err(RedbError::from)?;
             }
+            Write::Blob(id, record, bytes) => {
+                let key = id.to_string();
+                let mut meta = tx.open_table(BLOB_META).map_err(RedbError::from)?;
+                meta.insert(key.as_str(), serde_json::to_vec(record)?.as_slice())
+                    .map_err(RedbError::from)?;
+                let mut payload = tx.open_table(BLOB_BYTES).map_err(RedbError::from)?;
+                payload.insert(key.as_str(), bytes.as_slice()).map_err(RedbError::from)?;
+            }
             Write::Message(room, message) => {
                 let mut t = tx.open_table(MESSAGES).map_err(RedbError::from)?;
                 t.insert(
@@ -369,6 +395,17 @@ impl Storage for DbStorage {
         Ok(dir)
     }
 
+    fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
+        match self.read_blob_table(BLOB_META, id)? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError> {
+        self.read_blob_table(BLOB_BYTES, id)
+    }
+
     fn commit(&self, writes: &[Write]) -> Result<(), StorageError> {
         let tx = self.db.begin_write().map_err(RedbError::from)?;
         apply(&tx, writes)?;
@@ -396,6 +433,22 @@ impl Storage for DbStorage {
     }
 }
 
+impl DbStorage {
+    fn read_blob_table(
+        &self,
+        table: TableDefinition<&'static str, &'static [u8]>,
+        id: BlobId,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let tx = self.db.begin_read().map_err(RedbError::from)?;
+        let t = match tx.open_table(table) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(RedbError::from(e).into()),
+        };
+        Ok(t.get(id.to_string().as_str()).map_err(RedbError::from)?.map(|v| v.value().to_vec()))
+    }
+}
+
 /// Non-persistent storage, for tests and ephemeral instances.
 ///
 /// It really does store, unlike its predecessor: messages no longer live in
@@ -410,6 +463,7 @@ pub struct MemoryStorage {
 struct MemoryInner {
     directory: Directory,
     messages: Vec<(RoomId, StoredMessage)>,
+    blobs: Vec<(BlobId, BlobRecord, Vec<u8>)>,
 }
 
 impl Storage for MemoryStorage {
@@ -442,9 +496,18 @@ impl Storage for MemoryStorage {
                 }
                 Write::Policy(p) => inner.directory.registration_policy = *p,
                 Write::Message(room, m) => inner.messages.push((*room, m.clone())),
+                Write::Blob(id, r, b) => inner.blobs.push((*id, r.clone(), b.clone())),
             }
         }
         Ok(())
+    }
+
+    fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
+        Ok(self.blob(id, |(_, r, _)| r.clone()))
+    }
+
+    fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.blob(id, |(_, _, b)| b.clone()))
     }
 
     fn messages_since(&self, room: RoomId, after: u64) -> Result<Vec<StoredMessage>, StorageError> {
@@ -457,6 +520,13 @@ impl Storage for MemoryStorage {
             .collect();
         out.sort_by_key(|m| m.server_seq);
         Ok(out)
+    }
+}
+
+impl MemoryStorage {
+    fn blob<T>(&self, id: BlobId, pick: impl Fn(&(BlobId, BlobRecord, Vec<u8>)) -> T) -> Option<T> {
+        let inner = self.inner.lock().expect("memory storage mutex poisoned");
+        inner.blobs.iter().find(|(b, _, _)| *b == id).map(pick)
     }
 }
 
