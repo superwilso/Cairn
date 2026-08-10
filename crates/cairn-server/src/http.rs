@@ -59,6 +59,7 @@ impl IntoResponse for ServerError {
                 StatusCode::CONFLICT
             }
             ServerError::NoSuchAccount => StatusCode::NOT_FOUND,
+            ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             // Authorization failures on device linking. Distinguishable because an honest
             // client needs to know which of its inputs was wrong, and an attacker already
             // knows what they forged.
@@ -296,8 +297,8 @@ async fn claim_key_packages(
     headers: HeaderMap,
 ) -> Result<Json<Vec<ClaimedKeyPackage>>, ServerError> {
     let user = cairn_proto::UserId::from_uuid(user);
-    signed_actor(&instance, &headers, "claim_key_packages", Some(user.into()))?;
-    let claimed = instance.claim_key_packages(user)?;
+    let actor = signed_actor(&instance, &headers, "claim_key_packages", Some(user.into()))?;
+    let claimed = instance.claim_key_packages(actor, user, now_ms())?;
     Ok(Json(
         claimed
             .into_iter()

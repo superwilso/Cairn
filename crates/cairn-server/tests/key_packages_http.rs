@@ -362,3 +362,39 @@ fn malformed_key_packages_are_refused() {
     assert_eq!(publish(&server, &bob, bob.device, &[String::new()]).status, 400);
     assert_eq!(server.instance.key_packages_remaining(bob.device), 0);
 }
+
+#[test]
+fn an_attacker_cannot_drain_someone_elses_key_packages_over_http() {
+    // The drain was confirmed by probing before the limit existed: one authenticated
+    // account emptied a victim's whole published supply in a loop, after which nobody could
+    // add that victim to a room. Verified here over a socket rather than only in-process,
+    // because the actor identity was previously authenticated by the handler and then
+    // dropped — so the limit was expressible only where it could not be tested.
+    let server = start();
+    let attacker = Account::register(&server);
+    let bob = Account::register(&server);
+
+    let packages: Vec<String> = (0..10).map(|_| bob.key_package_hex()).collect();
+    assert_eq!(publish(&server, &bob, bob.device, &packages).status, 201);
+
+    let mut ok = 0;
+    let mut limited = 0;
+    for _ in 0..12 {
+        match claim(&server, &attacker, bob.user).status {
+            200 => ok += 1,
+            429 => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+
+    assert_eq!(ok, 3, "the attacker must be capped, not merely slowed");
+    assert!(limited > 0, "refusals must be reported as 429, not as an empty success");
+
+    // The property that matters to bob: someone else can still add him to a room.
+    let honest = Account::register(&server);
+    assert_eq!(
+        claim(&server, &honest, bob.user).status,
+        200,
+        "a drained-but-limited account must still be addable by an honest party"
+    );
+}

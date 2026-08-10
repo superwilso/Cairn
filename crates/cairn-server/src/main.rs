@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("CAIRN_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string()).parse()?;
 
     let data_dir = std::env::var("CAIRN_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    let storage = Arc::new(storage::FileStorage::new(&data_dir)?);
+    let storage = Arc::new(storage::DbStorage::new(&data_dir)?);
     let instance = Arc::new(state::Instance::open(storage)?);
 
     // Operator controls are configured at startup rather than exposed over HTTP. An

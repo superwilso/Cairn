@@ -1,6 +1,6 @@
 # ADR-007: redb for server storage
 
-**Status:** Accepted (owner decision), unimplemented.
+**Status:** Accepted (owner decision), **implemented**. Probe results in the final section.
 
 ## Context
 
@@ -48,6 +48,18 @@ precisely the things that look finished and are not, and this is the component h
 franking key — whose loss silently invalidates **every report the instance ever issued**.
 A subtle bug here does not announce itself.
 
+### Pinned to redb 2.x, not 4.x
+
+Found while adding the dependency, not in review: **redb 4.1 requires rustc 1.89**, and the
+MSRV floor is 1.85. `cargo add` quietly resolves to 2.6.3 rather than failing, so without
+checking, this would have surfaced later as an MSRV job failure in CI on someone else's
+change.
+
+Staying on 2.x is the right call for now — the floor exists because the crypto tree needs
+`edition2024`, and raising it to chase a storage dependency inverts that priority. It does
+mean a future decision: redb 2.x will not get new features indefinitely, so either the MSRV
+rises or the pin becomes a liability. Revisit when something needs 4.x, not before.
+
 ## Consequences
 
 - One substantial dependency added to a supply chain kept deliberately small. It goes
@@ -61,17 +73,47 @@ A subtle bug here does not announce itself.
   instruction simple and the blast radius of a corrupt database smaller.
 - `storage.rs` and `state.rs` are both CODEOWNERS paths. This lands as a reviewed PR.
 
-## Probes before this is trusted
+## Probes, and what they showed
 
 Storage is not a security boundary, but it holds the material several boundaries depend on.
-Per the project's method, write these and print what happens:
+All four ran; the results are below.
 
-- Kill the process mid-write; confirm the last committed state survives and no partial
-  record is readable.
-- Confirm the franking key round-trips across a restart, and that a **missing** key is an
-  error rather than a silent regeneration — a regenerated key looks like a working
-  instance and invalidates every prior report.
-- Import a `state.json` from the current format and confirm every account, room, membership
-  and message survives with identical ids.
-- Confirm cost per message is flat as the message count grows. That is the entire point of
-  this change, and it is the one thing a passing functional test would not tell us.
+**Kill the process mid-write.** `a_committed_write_survives_a_killed_process` re-executes
+the test binary and has the child `abort()` — no unwinding, no destructors, no clean
+shutdown. The first attempt used `std::mem::forget` instead and *proved nothing*: redb's
+exclusive file lock is process-wide, so the "crashed" store still held it and the reopen
+failed with `DatabaseAlreadyOpen` rather than testing durability at all. A passing version
+of that test would have been pure false confidence.
+
+Also verified over HTTP, per the project's rule about not trusting unit tests alone: two
+messages sent, `kill -9` on the server, restart, and the recipient's **first ever** poll
+returned both — decrypted, which additionally proves the envelopes round-tripped byte-exact.
+
+**The franking key.** Round-trips across restart (`franking_key_survives_a_restart`), and a
+new rule this ADR asked for now exists: a *missing* key beside a populated database is a
+hard error rather than a silent regeneration. Restoring a data volume without
+`franking.key` is a realistic operator mistake, and the old behaviour produced an instance
+that looked healthy while every historical report had quietly stopped verifying. Guarded
+both ways — `a_brand_new_instance_still_mints_its_first_key` is the counterfactual, since a
+rule of "missing key is always fatal" would mean no instance could ever start.
+
+**Import a `state.json`.** Covered by unit tests for exact id round-tripping, and then done
+for real: an instance was created with the *previous build*, populated over HTTP, shut down,
+and the new binary started on the same directory. It imported four messages out of the
+inline room log, and the recipient read messages written by the old server. The old file is
+left in place so a rollback still finds its data.
+
+**Cost per message.** The one a passing functional test would not tell us, so it is asserted
+rather than eyeballed: `a_message_costs_the_same_to_store_however_long_the_backlog` wraps the
+store and records bytes written per commit. Message 1 costs **640 bytes**, message 200 costs
+**646** — the drift is the message number in the body. Under the old design message 200 cost
+200 times message 1.
+
+A wall-clock assertion was deliberately avoided: it would be noise on a shared CI runner.
+Measured separately, a redb commit is about **750µs**. Worth recording, because the 500-message
+version of this test took 14 seconds and the obvious conclusion — that storage is slow — was
+wrong. In release it takes 0.32s; the cost was debug-mode Ed25519, not the database.
+
+Note also that the *old* code never called `fsync` at all, so its speed was partly an
+illusion: a crash could lose acknowledged writes. This is slower per commit and actually
+durable.

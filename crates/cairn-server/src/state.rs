@@ -3,8 +3,11 @@
 //! Logic lives here rather than in the HTTP handlers so it can be tested without a
 //! socket. The handlers in [`crate::http`] are a thin translation layer.
 //!
-//! State is held in memory and snapshotted through [`crate::storage`] on every mutation,
-//! so rooms, the message log, and — critically — the franking key survive a restart.
+//! Accounts, devices, rooms and invites are held in memory and written through
+//! [`crate::storage`] record-by-record as they change. **Messages are not held in memory**:
+//! they are the one unbounded thing here, and they are read back from storage on demand.
+//! The franking key survives a restart, which is the property the whole persistence layer
+//! exists for.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -15,7 +18,7 @@ use cairn_crypto::franking::{Commitment, Context as FrankingContext, ServerFrank
 use cairn_crypto::TranscriptReport;
 use cairn_proto::{DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId};
 
-use crate::storage::{Storage, StorageError};
+use crate::storage::{Storage, StorageError, Write};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -75,6 +78,8 @@ pub enum ServerError {
     BadKeyPackage,
     #[error("too many key packages; publish at most {MAX_KEY_PACKAGES_PER_DEVICE} per device")]
     TooManyKeyPackages,
+    #[error("rate limited; retry later")]
+    RateLimited,
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -83,6 +88,25 @@ pub enum ServerError {
 /// unauthenticated party never sees but an authenticated one can drain, and without a cap
 /// a device could park unbounded storage on someone else's instance.
 pub const MAX_KEY_PACKAGES_PER_DEVICE: usize = 100;
+
+/// How many times one account may claim key packages *for the same target* per window.
+///
+/// A legitimate claim happens when adding someone to a room, so a handful per hour is
+/// generous. Probing showed why a ceiling is needed at all: a single authenticated account
+/// drained a victim's entire published supply in a tight loop, after which **nobody** could
+/// add that victim to a room until they came back online and published more. That is a
+/// targeted denial of service on one person, and it left no trace the victim could see.
+pub const MAX_CLAIMS_PER_TARGET: usize = 3;
+
+/// How many key package claims one account may make in total per window, across all targets.
+///
+/// The per-target limit alone does not bound the work: an attacker can walk a list of user
+/// ids, and user ids are on every message. This is the ceiling that makes enumeration cost
+/// something.
+pub const MAX_CLAIMS_TOTAL: usize = 30;
+
+/// The window both claim limits are measured over.
+pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 /// How far outside the present a signed request's timestamp may be.
 ///
@@ -115,9 +139,20 @@ pub struct RoomMember {
     pub role: RoomRole,
 }
 
-/// A room as the server knows it.
+/// A room as the server knows it — **without** its messages.
+///
+/// The log used to live here, inline, and that is precisely what made storage quadratic:
+/// persisting a room meant rewriting every message it had ever carried. Messages are now
+/// keyed by `(room, server_seq)` in [`crate::storage`] and are never held in memory, which
+/// also matters for attachments — this record must stay small enough that every account,
+/// device and room fits in RAM at once.
+///
+/// Public only because [`crate::storage::Storage`] is, and a public trait cannot traffic in
+/// a private type. **Its fields stay private**: every rule about membership, sequencing and
+/// the franking chain is enforced by the methods in this module, and a caller that could
+/// set `members` or `next_seq` directly would bypass all of them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Room {
+pub struct Room {
     seal: RoomSeal,
     /// Strictly increasing, assigned by the server.
     ///
@@ -142,10 +177,15 @@ struct Room {
     /// evidence honest members would later report.
     #[serde(default)]
     members: Vec<RoomMember>,
-    log: Vec<StoredMessage>,
 }
 
 impl Room {
+    /// A bare room, for storage tests that need a value rather than a scenario.
+    #[cfg(test)]
+    pub(crate) fn for_test(seal: RoomSeal) -> Self {
+        Self { seal, next_seq: 0, last_franked: None, members: Vec::new() }
+    }
+
     fn has_member(&self, user: UserId) -> bool {
         self.members.iter().any(|m| m.user == user)
     }
@@ -218,53 +258,39 @@ pub enum RegistrationPolicy {
     InviteOnly,
 }
 
-/// Everything about an instance that must survive a restart.
+/// A fixed-window counter for key package claims.
 ///
-/// A list rather than a map so the on-disk form does not depend on how map keys are
-/// encoded, which is a needless way for a format to break between versions.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct PersistedState {
-    pub rooms: Vec<PersistedRoom>,
-    #[serde(default)]
-    pub devices: Vec<PersistedDevice>,
-    #[serde(default)]
-    pub accounts: Vec<PersistedAccount>,
-    #[serde(default)]
-    pub invites: Vec<PersistedInvite>,
-    #[serde(default)]
-    pub key_packages: Vec<PersistedKeyPackages>,
-    #[serde(default)]
-    pub registration_policy: RegistrationPolicy,
+/// In memory only, and deliberately not persisted. A restart forgets it, which is a real
+/// weakness — an attacker who can crash or wait out the server gets a fresh budget — but
+/// persisting it would put attacker-controlled write volume into the database, which is a
+/// worse trade. Recorded rather than hidden; see `docs/11-self-hosting.md`.
+#[derive(Debug, Default)]
+struct ClaimLimiter {
+    /// Timestamps of this actor's recent claims, oldest first, and who each was against.
+    events: HashMap<UserId, VecDeque<(i64, UserId)>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PersistedKeyPackages {
-    device: DeviceId,
-    packages: VecDeque<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PersistedAccount {
-    id: UserId,
-    record: AccountRecord,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PersistedInvite {
-    token: String,
-    record: InviteRecord,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PersistedDevice {
-    id: DeviceId,
-    record: DeviceRecord,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PersistedRoom {
-    id: RoomId,
-    room: Room,
+impl ClaimLimiter {
+    /// Record a claim by `actor` against `target`, or refuse it.
+    ///
+    /// Checks before recording, so a refused attempt does not itself consume budget. The
+    /// budget is per-actor, so this is not about one account starving another — it is that
+    /// a client which retries on a 429 would otherwise push its own window out indefinitely
+    /// and never recover.
+    fn admit(&mut self, actor: UserId, target: UserId, now_ms: i64) -> Result<(), ServerError> {
+        let recent = self.events.entry(actor).or_default();
+        while recent.front().is_some_and(|(at, _)| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS) {
+            recent.pop_front();
+        }
+        if recent.len() >= MAX_CLAIMS_TOTAL {
+            return Err(ServerError::RateLimited);
+        }
+        if recent.iter().filter(|(_, t)| *t == target).count() >= MAX_CLAIMS_PER_TARGET {
+            return Err(ServerError::RateLimited);
+        }
+        recent.push_back((now_ms, target));
+        Ok(())
+    }
 }
 
 /// The instance.
@@ -282,6 +308,8 @@ pub struct Instance {
     /// half-add.
     key_packages: Mutex<HashMap<DeviceId, VecDeque<String>>>,
     registration_policy: Mutex<RegistrationPolicy>,
+    /// Not persisted; see [`ClaimLimiter`].
+    claim_limiter: Mutex<ClaimLimiter>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -301,20 +329,17 @@ impl Instance {
     /// is what lets a report filed before a restart still verify afterwards.
     pub fn open(storage: Arc<dyn Storage>) -> Result<Self, ServerError> {
         let franking_key = storage.load_or_create_franking_key()?;
-        let persisted = storage.load_state()?;
-        let rooms = persisted.rooms.into_iter().map(|r| (r.id, r.room)).collect();
-        let devices = persisted.devices.into_iter().map(|d| (d.id, d.record)).collect();
-        let accounts = persisted.accounts.into_iter().map(|a| (a.id, a.record)).collect();
-        let invites = persisted.invites.into_iter().map(|i| (i.token, i.record)).collect();
+        // Everything but the message log. Messages are read from storage on demand — they
+        // are the only unbounded thing here, and they will hold attachment bytes.
+        let directory = storage.load_directory()?;
         Ok(Self {
-            rooms: Mutex::new(rooms),
-            devices: Mutex::new(devices),
-            accounts: Mutex::new(accounts),
-            invites: Mutex::new(invites),
-            key_packages: Mutex::new(
-                persisted.key_packages.into_iter().map(|k| (k.device, k.packages)).collect(),
-            ),
-            registration_policy: Mutex::new(persisted.registration_policy),
+            rooms: Mutex::new(directory.rooms.into_iter().collect()),
+            devices: Mutex::new(directory.devices.into_iter().collect()),
+            accounts: Mutex::new(directory.accounts.into_iter().collect()),
+            invites: Mutex::new(directory.invites.into_iter().collect()),
+            key_packages: Mutex::new(directory.key_packages.into_iter().collect()),
+            registration_policy: Mutex::new(directory.registration_policy),
+            claim_limiter: Mutex::new(ClaimLimiter::default()),
             franking_key,
             storage,
         })
@@ -322,7 +347,7 @@ impl Instance {
 
     /// An ephemeral instance backed by nothing. Tests and throwaway runs only.
     pub fn in_memory() -> Self {
-        Self::open(Arc::new(crate::storage::MemoryStorage))
+        Self::open(Arc::new(crate::storage::MemoryStorage::default()))
             .expect("memory storage cannot fail to open")
     }
 
@@ -330,43 +355,17 @@ impl Instance {
     ///
     /// Called while the caller still holds the rooms lock, so a save can never interleave
     /// with a mutation and record a torn view of the state.
-    fn persist(&self, rooms: &HashMap<RoomId, Room>) -> Result<(), ServerError> {
-        let devices = self.devices.lock().expect("devices mutex poisoned");
-        let accounts = self.accounts.lock().expect("accounts mutex poisoned");
-        let invites = self.invites.lock().expect("invites mutex poisoned");
-        let state = PersistedState {
-            rooms: rooms
-                .iter()
-                .map(|(id, room)| PersistedRoom { id: *id, room: room.clone() })
-                .collect(),
-            devices: devices
-                .iter()
-                .map(|(id, record)| PersistedDevice { id: *id, record: record.clone() })
-                .collect(),
-            accounts: accounts
-                .iter()
-                .map(|(id, record)| PersistedAccount { id: *id, record: record.clone() })
-                .collect(),
-            invites: invites
-                .iter()
-                .map(|(token, record)| PersistedInvite {
-                    token: token.clone(),
-                    record: record.clone(),
-                })
-                .collect(),
-            key_packages: self
-                .key_packages
-                .lock()
-                .expect("key packages mutex poisoned")
-                .iter()
-                .map(|(device, packages)| PersistedKeyPackages {
-                    device: *device,
-                    packages: packages.clone(),
-                })
-                .collect(),
-            registration_policy: *self.registration_policy.lock().expect("policy mutex poisoned"),
-        };
-        self.storage.save_state(&state)?;
+    /// Persist exactly what changed, atomically.
+    ///
+    /// Replaces a `persist()` that wrote the entire instance on every call. That signature
+    /// is what made storage quadratic, so it is gone rather than reimplemented: each caller
+    /// now names the records it touched.
+    ///
+    /// The cost of that precision is that a caller which forgets a record loses it on
+    /// restart, silently and only for that one field. `every_mutation_survives_a_restart`
+    /// is the regression test that exists to catch exactly that.
+    fn write(&self, writes: &[crate::storage::Write]) -> Result<(), ServerError> {
+        self.storage.commit(writes)?;
         Ok(())
     }
 
@@ -378,8 +377,7 @@ impl Instance {
     /// Set the registration policy. Operator action.
     pub fn set_registration_policy(&self, policy: RegistrationPolicy) -> Result<(), ServerError> {
         *self.registration_policy.lock().expect("policy mutex poisoned") = policy;
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)
+        self.write(&[Write::Policy(policy)])
     }
 
     /// Mint a registration invite. Operator action.
@@ -388,12 +386,12 @@ impl Instance {
         token: &str,
         expires_at_ms: Option<i64>,
     ) -> Result<(), ServerError> {
+        let record = InviteRecord { used_by: None, expires_at_ms };
         self.invites
             .lock()
             .expect("invites mutex poisoned")
-            .insert(token.to_owned(), InviteRecord { used_by: None, expires_at_ms });
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)
+            .insert(token.to_owned(), record.clone());
+        self.write(&[Write::Invite(token.to_owned(), record)])
     }
 
     /// Claim a user id, creating the account and registering its first device.
@@ -422,6 +420,7 @@ impl Instance {
         }
 
         let mut invites = self.invites.lock().expect("invites mutex poisoned");
+        let mut spent_invite = None;
         if self.registration_policy() == RegistrationPolicy::InviteOnly {
             let token = invite.ok_or(ServerError::InviteRequired)?;
             let record = invites.get_mut(token).ok_or(ServerError::InviteInvalid)?;
@@ -432,16 +431,27 @@ impl Instance {
                 return Err(ServerError::InviteInvalid);
             }
             record.used_by = Some(user);
+            spent_invite = Some((token.to_owned(), record.clone()));
         }
 
-        devices.insert(device, DeviceRecord { user, public_key: hex::encode(public_key) });
-        accounts.insert(user, AccountRecord { devices: vec![device] });
+        let device_record = DeviceRecord { user, public_key: hex::encode(public_key) };
+        let account_record = AccountRecord { devices: vec![device] };
+        devices.insert(device, device_record.clone());
+        accounts.insert(user, account_record.clone());
 
         drop(devices);
         drop(accounts);
         drop(invites);
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)
+
+        // One batch, so a crash cannot leave the invite spent with no account to show for
+        // it — which would lock the rightful holder out of an instance they were invited
+        // to, with no way to tell that from a stolen token.
+        let mut writes =
+            vec![Write::Device(device, device_record), Write::Account(user, account_record)];
+        if let Some((token, record)) = spent_invite {
+            writes.push(Write::Invite(token, record));
+        }
+        self.write(&writes)
     }
 
     /// Add a device to an account that already exists.
@@ -480,13 +490,17 @@ impl Instance {
             return Err(ServerError::BadDeviceAuthorization);
         }
 
-        devices.insert(new_device, DeviceRecord { user, public_key: hex::encode(new_public_key) });
+        let device_record = DeviceRecord { user, public_key: hex::encode(new_public_key) };
+        devices.insert(new_device, device_record.clone());
         account.devices.push(new_device);
+        let account_record = account.clone();
 
         drop(devices);
         drop(accounts);
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)
+        self.write(&[
+            Write::Device(new_device, device_record),
+            Write::Account(user, account_record),
+        ])
     }
 
     /// Authenticate an envelope against its claimed sending device.
@@ -523,18 +537,16 @@ impl Instance {
     ) -> Result<(RoomId, RoomSeal), ServerError> {
         let seal = RoomSeal::new(shape)?;
         let id = RoomId::new();
+        let room = Room {
+            seal,
+            next_seq: 0,
+            last_franked: None,
+            members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
+        };
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        rooms.insert(
-            id,
-            Room {
-                seal,
-                next_seq: 0,
-                last_franked: None,
-                members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
-                log: Vec::new(),
-            },
-        );
-        self.persist(&rooms)?;
+        rooms.insert(id, room.clone());
+        drop(rooms);
+        self.write(&[Write::Room(id, room)])?;
         Ok((id, seal))
     }
 
@@ -562,7 +574,9 @@ impl Instance {
         if !r.has_member(new_member) {
             r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
         }
-        self.persist(&rooms)
+        let updated = r.clone();
+        drop(rooms);
+        self.write(&[Write::Room(room, updated)])
     }
 
     /// Remove an account from a room.
@@ -601,7 +615,9 @@ impl Instance {
         }
 
         r.members.retain(|m| m.user != target);
-        self.persist(&rooms)
+        let updated = r.clone();
+        drop(rooms);
+        self.write(&[Write::Room(room, updated)])
     }
 
     /// Change an account's role. Owners only.
@@ -624,7 +640,9 @@ impl Instance {
         if let Some(m) = r.members.iter_mut().find(|m| m.user == target) {
             m.role = role;
         }
-        self.persist(&rooms)
+        let updated = r.clone();
+        drop(rooms);
+        self.write(&[Write::Room(room, updated)])
     }
 
     /// An account's role in a room, if any.
@@ -649,7 +667,9 @@ impl Instance {
         if !r.has_member(user) {
             r.members.push(RoomMember { user, role: RoomRole::Member });
         }
-        self.persist(&rooms)
+        let updated = r.clone();
+        drop(rooms);
+        self.write(&[Write::Room(room, updated)])
     }
 
     /// Verify a signed non-message request and return the acting account.
@@ -711,10 +731,10 @@ impl Instance {
         }
         queue.extend(packages);
         let remaining = queue.len();
+        let updated = queue.clone();
         drop(store);
 
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)?;
+        self.write(&[Write::KeyPackages(device, updated)])?;
         Ok(remaining)
     }
 
@@ -737,7 +757,21 @@ impl Instance {
     ///
     /// If any device has run out, this fails rather than returning a partial set, for the
     /// same reason. The caller learns the account cannot currently be added.
-    pub fn claim_key_packages(&self, user: UserId) -> Result<Vec<(DeviceId, String)>, ServerError> {
+    pub fn claim_key_packages(
+        &self,
+        actor: UserId,
+        user: UserId,
+        now_ms: i64,
+    ) -> Result<Vec<(DeviceId, String)>, ServerError> {
+        // `actor` exists so this rule can live here rather than in the handler. The HTTP
+        // layer already authenticated the caller and then dropped the identity on the
+        // floor, which made the limit below impossible to express where the rules live —
+        // and a rule in a handler is untested and bypassable.
+        self.claim_limiter
+            .lock()
+            .expect("claim limiter mutex poisoned")
+            .admit(actor, user, now_ms)?;
+
         let accounts = self.accounts.lock().expect("accounts mutex poisoned");
         let account = accounts.get(&user).ok_or(ServerError::NoSuchAccount)?;
         let devices = account.devices.clone();
@@ -765,10 +799,17 @@ impl Instance {
                 (*device, package)
             })
             .collect();
+
+        // Every drained queue in one batch. A partial write would hand out packages the
+        // instance still believes it holds, and `mls-rs` destroys a package's secrets on
+        // use — the second welcome built from a reissued package is permanently unopenable.
+        let writes: Vec<Write> = devices
+            .iter()
+            .map(|d| Write::KeyPackages(*d, store.get(d).cloned().unwrap_or_default()))
+            .collect();
         drop(store);
 
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        self.persist(&rooms)?;
+        self.write(&writes)?;
         Ok(claimed)
     }
 
@@ -821,8 +862,15 @@ impl Instance {
         };
 
         let stored = StoredMessage { envelope, server_seq, franking_tag };
-        room.log.push(stored.clone());
-        self.persist(&rooms)?;
+        let room_id = stored.envelope.room;
+        let updated = room.clone();
+        drop(rooms);
+
+        // The room and the message in one transaction. Split, a crash between them either
+        // loses the message while keeping the sequence number it consumed, or — far worse
+        // in the other order — replays that number onto a different message later and
+        // rewrites franked history at a sequence a moderator has already been shown.
+        self.write(&[Write::Room(room_id, updated), Write::Message(room_id, stored.clone())])?;
         Ok(stored)
     }
 
@@ -838,12 +886,16 @@ impl Instance {
         actor: UserId,
         after: u64,
     ) -> Result<Vec<StoredMessage>, ServerError> {
-        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let room = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
-        if !room.has_member(actor) {
-            return Err(ServerError::NotAMember);
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            if !r.has_member(actor) {
+                return Err(ServerError::NotAMember);
+            }
         }
-        Ok(room.log.iter().filter(|m| m.server_seq > after).cloned().collect())
+        // Read from storage rather than memory: the log is the one thing that grows
+        // without bound, and it is where attachment bytes will land.
+        Ok(self.storage.messages_since(room, after)?)
     }
 
     /// Verify a franking report submitted by a recipient.
@@ -1027,6 +1079,200 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Wraps a real store and records what each commit actually costs.
+    ///
+    /// The point is to measure the property ADR-007 exists for without a wall-clock
+    /// assertion, which on a shared CI runner would be noise rather than a signal.
+    #[derive(Debug)]
+    struct CountingStorage {
+        inner: crate::storage::DbStorage,
+        commits: Mutex<Vec<usize>>,
+    }
+
+    impl crate::storage::Storage for CountingStorage {
+        fn load_or_create_franking_key(
+            &self,
+        ) -> Result<cairn_crypto::franking::ServerFrankingKey, StorageError> {
+            self.inner.load_or_create_franking_key()
+        }
+        fn load_directory(&self) -> Result<crate::storage::Directory, StorageError> {
+            self.inner.load_directory()
+        }
+        fn commit(&self, writes: &[Write]) -> Result<(), StorageError> {
+            let bytes: usize = writes
+                .iter()
+                .map(|w| match w {
+                    Write::Room(_, r) => serde_json::to_vec(r).map(|v| v.len()).unwrap_or(0),
+                    Write::Message(_, m) => serde_json::to_vec(m).map(|v| v.len()).unwrap_or(0),
+                    _ => 0,
+                })
+                .sum();
+            self.commits.lock().unwrap().push(bytes);
+            self.inner.commit(writes)
+        }
+        fn messages_since(
+            &self,
+            room: RoomId,
+            after: u64,
+        ) -> Result<Vec<StoredMessage>, StorageError> {
+            self.inner.messages_since(room, after)
+        }
+    }
+
+    #[test]
+    fn a_message_costs_the_same_to_store_however_long_the_backlog() {
+        // ADR-007's fourth probe, and the one a passing functional test would not tell us:
+        // the old design serialised every message in the room on every append, so message
+        // 500 cost 500 times message 1. Nothing about correctness changes when that
+        // regresses — only the bill — so this is asserted rather than left to review.
+        let dir = temp_dir("flatcost");
+        let storage = Arc::new(CountingStorage {
+            inner: crate::storage::DbStorage::new(&dir).unwrap(),
+            commits: Mutex::new(Vec::new()),
+        });
+        let inst = Instance::open(storage.clone()).unwrap();
+        let sender = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape(), sender.user).unwrap();
+
+        storage.commits.lock().unwrap().clear();
+        for i in 0..200 {
+            let e = sender.envelope(room, EnvelopePayload::Plaintext { body: format!("m{i}") });
+            inst.accept(e).unwrap();
+        }
+
+        let costs = storage.commits.lock().unwrap().clone();
+        let first = costs[0];
+        let last = *costs.last().unwrap();
+        println!("bytes written for message 1: {first}, for message 200: {last}");
+
+        // Not "equal": the body carries the message number, so a couple of bytes of drift
+        // is expected and meaningless. Growth proportional to the backlog is not.
+        assert!(
+            last < first * 2,
+            "storing a message must not get more expensive as the room fills: \
+             first={first} bytes, last={last} bytes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_mutation_survives_a_restart() {
+        // Each caller now names the records it changed, instead of one `persist()` writing
+        // the world. That is what makes the cost flat, and it is also a new way to lose
+        // data silently: a caller that forgets a record loses just that field, only on
+        // restart. So exercise every mutating path and reload from disk.
+        let dir = temp_dir("allmutations");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+
+        let (room, owner, moderator, second_device, invite_used_by) = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            inst.set_registration_policy(RegistrationPolicy::InviteOnly).unwrap();
+            inst.create_invite("tok-a", None).unwrap();
+
+            let owner_key = cairn_crypto::mls::Session::new(b"owner").unwrap();
+            let owner = UserId::new();
+            let owner_device = DeviceId::new();
+            inst.claim_account(owner, owner_device, owner_key.public_key(), Some("tok-a"), 0)
+                .unwrap();
+
+            // A second device on the same account, authorised by the first.
+            let second_key = cairn_crypto::mls::Session::new(b"owner-2").unwrap();
+            let second_device = DeviceId::new();
+            let authorization = owner_key
+                .sign(&cairn_proto::device_authorization_bytes(
+                    owner,
+                    second_device,
+                    second_key.public_key(),
+                ))
+                .unwrap();
+            inst.link_device(
+                owner,
+                second_device,
+                second_key.public_key(),
+                owner_device,
+                &authorization,
+            )
+            .unwrap();
+
+            inst.create_invite("tok-b", None).unwrap();
+            let mod_key = cairn_crypto::mls::Session::new(b"mod").unwrap();
+            let moderator = UserId::new();
+            let mod_device = DeviceId::new();
+            inst.claim_account(moderator, mod_device, mod_key.public_key(), Some("tok-b"), 0)
+                .unwrap();
+
+            let (room, _) = inst.create_room(public_shape(), owner).unwrap();
+            inst.add_room_member(room, owner, moderator).unwrap();
+            inst.set_room_role(room, owner, moderator, RoomRole::Moderator).unwrap();
+            inst.publish_key_packages(owner, owner_device, vec!["aa".into(), "bb".into()]).unwrap();
+
+            let e = cairn_proto::Envelope::new(
+                Tier::PublicCommunity,
+                room,
+                owner,
+                owner_device,
+                0,
+                EnvelopePayload::Plaintext { body: "kept".into() },
+            )
+            .unwrap();
+            let signature = owner_key.sign(&e.signing_bytes()).unwrap();
+            inst.accept(e.with_signature(hex::encode(signature))).unwrap();
+
+            let used_by = inst
+                .invites
+                .lock()
+                .unwrap()
+                .get("tok-a")
+                .and_then(|r| r.used_by)
+                .expect("the invite must have been recorded as spent");
+            (room, owner, moderator, second_device, used_by)
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+
+        assert_eq!(
+            restarted.registration_policy(),
+            RegistrationPolicy::InviteOnly,
+            "the registration policy must survive"
+        );
+        assert_eq!(
+            restarted.invites.lock().unwrap().get("tok-a").and_then(|r| r.used_by),
+            Some(invite_used_by),
+            "a spent invite must stay spent, or it could be redeemed twice"
+        );
+        assert!(
+            restarted
+                .accounts
+                .lock()
+                .unwrap()
+                .get(&owner)
+                .unwrap()
+                .devices
+                .contains(&second_device),
+            "a linked device must survive, or the account loses it on restart"
+        );
+        assert_eq!(
+            restarted.room_role(room, moderator),
+            Some(RoomRole::Moderator),
+            "a role change must survive"
+        );
+        assert_eq!(
+            restarted.key_packages_remaining(
+                *restarted.accounts.lock().unwrap()[&owner].devices.first().unwrap()
+            ),
+            2,
+            "published key packages must survive"
+        );
+        assert_eq!(
+            restarted.messages_since(room, owner, 0).unwrap().len(),
+            1,
+            "the message log must survive"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_report_filed_before_a_restart_still_verifies_after_it() {
         // The property persistence exists for. If the franking key changed on restart,
@@ -1035,7 +1281,7 @@ pub(crate) mod tests {
         use cairn_crypto::franking::{Context, ReportedMessage, TranscriptReport};
 
         let dir = temp_dir("restart");
-        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
 
         let (room, sender, device, commitment, opening, tag, seq) = {
             let inst = Instance::open(storage.clone()).unwrap();
@@ -1087,7 +1333,7 @@ pub(crate) mod tests {
     #[test]
     fn rooms_and_messages_survive_a_restart() {
         let dir = temp_dir("rooms");
-        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
 
         let (room, user, device, pubkey) = {
             let inst = Instance::open(storage.clone()).unwrap();
@@ -1531,7 +1777,7 @@ mod accounts {
     fn accounts_and_invites_survive_a_restart() {
         let dir = std::env::temp_dir().join(format!("cairn-acct-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
 
         let (user, device) = {
             let inst = Instance::open(storage.clone()).unwrap();
@@ -1753,7 +1999,7 @@ mod membership {
     fn room_membership_survives_a_restart() {
         let dir = std::env::temp_dir().join(format!("cairn-mem-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
 
         let (room, member, outsider) = {
             let inst = Instance::open(storage.clone()).unwrap();
@@ -1929,7 +2175,7 @@ mod roles {
     fn roles_survive_a_restart() {
         let dir = std::env::temp_dir().join(format!("cairn-roles-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let storage = Arc::new(crate::storage::FileStorage::new(&dir).unwrap());
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
 
         let (room, owner, member) = {
             let inst = Instance::open(storage.clone()).unwrap();
@@ -1949,5 +2195,126 @@ mod roles {
             Err(ServerError::InsufficientRole)
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod claim_limits {
+    use super::tests::*;
+    use super::*;
+
+    /// Publish `n` packages for a freshly registered account.
+    fn victim_with(inst: &Instance, n: usize) -> TestSender {
+        let victim = TestSender::registered(inst);
+        inst.publish_key_packages(victim.user, victim.device, vec!["aa".into(); n]).unwrap();
+        victim
+    }
+
+    #[test]
+    fn an_attacker_cannot_drain_someone_elses_key_packages() {
+        // Found by probing, not by reading. Before the limit, one authenticated account
+        // emptied a victim's entire published supply in a tight loop, after which nobody
+        // could add that victim to a room until they came back and published more — a
+        // targeted denial of service that left no trace the victim could see.
+        let inst = Instance::in_memory();
+        let victim = victim_with(&inst, 10);
+        let attacker = TestSender::registered(&inst);
+
+        let mut claimed = 0;
+        for _ in 0..50 {
+            if inst.claim_key_packages(attacker.user, victim.user, 0).is_ok() {
+                claimed += 1;
+            }
+        }
+
+        assert_eq!(claimed, MAX_CLAIMS_PER_TARGET, "one account must not claim without bound");
+        assert!(
+            inst.key_packages_remaining(victim.device) > 0,
+            "a single attacker must not be able to empty the supply"
+        );
+
+        // The property that actually matters to the victim.
+        let honest = TestSender::registered(&inst);
+        assert!(
+            inst.claim_key_packages(honest.user, victim.user, 0).is_ok(),
+            "an honest party must still be able to add the victim to a room"
+        );
+    }
+
+    #[test]
+    fn walking_a_list_of_user_ids_is_bounded_too() {
+        // The per-target limit alone bounds nothing: user ids are on every message, so an
+        // attacker can simply move on to the next victim.
+        let inst = Instance::in_memory();
+        let attacker = TestSender::registered(&inst);
+        let victims: Vec<_> = (0..40).map(|_| victim_with(&inst, 2)).collect();
+
+        let claimed = victims
+            .iter()
+            .filter(|v| inst.claim_key_packages(attacker.user, v.user, 0).is_ok())
+            .count();
+
+        assert_eq!(claimed, MAX_CLAIMS_TOTAL, "an actor's total claim budget must be capped");
+    }
+
+    #[test]
+    fn the_budget_returns_after_the_window() {
+        // Otherwise this is not a rate limit but a lifetime quota, and an ordinary user who
+        // creates a lot of rooms one afternoon is locked out forever.
+        let inst = Instance::in_memory();
+        let victim = victim_with(&inst, 10);
+        let actor = TestSender::registered(&inst);
+
+        for _ in 0..MAX_CLAIMS_PER_TARGET {
+            inst.claim_key_packages(actor.user, victim.user, 0).unwrap();
+        }
+        assert!(matches!(
+            inst.claim_key_packages(actor.user, victim.user, 0),
+            Err(ServerError::RateLimited)
+        ));
+
+        assert!(
+            inst.claim_key_packages(actor.user, victim.user, CLAIM_WINDOW_MS).is_ok(),
+            "the window must expire"
+        );
+    }
+
+    #[test]
+    fn a_refused_claim_does_not_consume_budget() {
+        // A client that retries on a 429 would otherwise push its own window out
+        // indefinitely and never recover.
+        let inst = Instance::in_memory();
+        let victim = victim_with(&inst, 10);
+        let actor = TestSender::registered(&inst);
+
+        for _ in 0..MAX_CLAIMS_PER_TARGET {
+            inst.claim_key_packages(actor.user, victim.user, 0).unwrap();
+        }
+        // Hammer well past the total budget while refused.
+        for _ in 0..MAX_CLAIMS_TOTAL * 2 {
+            assert!(inst.claim_key_packages(actor.user, victim.user, 0).is_err());
+        }
+
+        // A different target is still within the untouched total budget.
+        let other = victim_with(&inst, 4);
+        assert!(
+            inst.claim_key_packages(actor.user, other.user, 0).is_ok(),
+            "rejections must not count against the actor's budget"
+        );
+    }
+
+    #[test]
+    fn claiming_your_own_key_packages_is_limited_the_same_way() {
+        // No self-exemption: an account is not more trustworthy against itself, and an
+        // exemption would be a free drain for anyone willing to register.
+        let inst = Instance::in_memory();
+        let me = victim_with(&inst, 10);
+        for _ in 0..MAX_CLAIMS_PER_TARGET {
+            inst.claim_key_packages(me.user, me.user, 0).unwrap();
+        }
+        assert!(matches!(
+            inst.claim_key_packages(me.user, me.user, 0),
+            Err(ServerError::RateLimited)
+        ));
     }
 }

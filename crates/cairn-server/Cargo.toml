@@ -22,6 +22,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 hex.workspace = true
 uuid.workspace = true
+redb = "2.6"
 
 [dev-dependencies]
 cairn-client-core.workspace = true
