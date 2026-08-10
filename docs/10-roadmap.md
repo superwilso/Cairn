@@ -31,8 +31,8 @@ persists, so what is left is the network.
 - [x] **Key package distribution.** `POST /v1/devices/{device}/key-packages` publishes,
       `POST /v1/users/{user}/key-packages` claims one per device and consumes them. Both
       require a signed request naming the target. Verified over a real socket in
-      `crates/cairn-server/tests/key_packages_http.rs`. **No rate limiting yet**, so an
-      authenticated account can still drain another's supply — M3.
+      `crates/cairn-server/tests/key_packages_http.rs`. The drain this originally warned
+      about is now **bounded** — see M3.
 - [x] **Message delivery.** `Client::fetch_since` polls; WebSocket can wait.
 - [x] **Franking round-trip over the wire**, not just in-process.
 
@@ -210,7 +210,18 @@ Four calls made by the owner, so a session does not re-litigate them:
         Membership is where this project's three shipped vulnerabilities lived.
 - [ ] Backup and restore, including **the franking key**: losing it invalidates every
       report the instance ever issued
-- [ ] Rate limiting on registration and sending
+- [x] **Rate limiting on key package claims.** Probing confirmed the drain rather than
+      assuming it: one authenticated account emptied a victim's whole published supply in a
+      loop, after which nobody could add that victim to a room. Now capped per actor —
+      `MAX_CLAIMS_PER_TARGET` and `MAX_CLAIMS_TOTAL` per hour — with the actor threaded into
+      `state.rs`, because the handler had authenticated it and then dropped it, leaving the
+      rule expressible only where it could not be tested. 429 verified over a socket.
+      **Bounds the rate, not the total**: several accounts still drain between them, and the
+      counter is in memory so a restart clears it.
+- [ ] Rate limiting on registration and sending. Both need the caller's address, which
+      `state.rs` never sees — so unlike the claim limit, this one genuinely cannot live
+      entirely where the other rules do, and that boundary needs designing rather than
+      assuming.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.

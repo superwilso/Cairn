@@ -78,6 +78,8 @@ pub enum ServerError {
     BadKeyPackage,
     #[error("too many key packages; publish at most {MAX_KEY_PACKAGES_PER_DEVICE} per device")]
     TooManyKeyPackages,
+    #[error("rate limited; retry later")]
+    RateLimited,
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -86,6 +88,25 @@ pub enum ServerError {
 /// unauthenticated party never sees but an authenticated one can drain, and without a cap
 /// a device could park unbounded storage on someone else's instance.
 pub const MAX_KEY_PACKAGES_PER_DEVICE: usize = 100;
+
+/// How many times one account may claim key packages *for the same target* per window.
+///
+/// A legitimate claim happens when adding someone to a room, so a handful per hour is
+/// generous. Probing showed why a ceiling is needed at all: a single authenticated account
+/// drained a victim's entire published supply in a tight loop, after which **nobody** could
+/// add that victim to a room until they came back online and published more. That is a
+/// targeted denial of service on one person, and it left no trace the victim could see.
+pub const MAX_CLAIMS_PER_TARGET: usize = 3;
+
+/// How many key package claims one account may make in total per window, across all targets.
+///
+/// The per-target limit alone does not bound the work: an attacker can walk a list of user
+/// ids, and user ids are on every message. This is the ceiling that makes enumeration cost
+/// something.
+pub const MAX_CLAIMS_TOTAL: usize = 30;
+
+/// The window both claim limits are measured over.
+pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 /// How far outside the present a signed request's timestamp may be.
 ///
@@ -237,6 +258,41 @@ pub enum RegistrationPolicy {
     InviteOnly,
 }
 
+/// A fixed-window counter for key package claims.
+///
+/// In memory only, and deliberately not persisted. A restart forgets it, which is a real
+/// weakness — an attacker who can crash or wait out the server gets a fresh budget — but
+/// persisting it would put attacker-controlled write volume into the database, which is a
+/// worse trade. Recorded rather than hidden; see `docs/11-self-hosting.md`.
+#[derive(Debug, Default)]
+struct ClaimLimiter {
+    /// Timestamps of this actor's recent claims, oldest first, and who each was against.
+    events: HashMap<UserId, VecDeque<(i64, UserId)>>,
+}
+
+impl ClaimLimiter {
+    /// Record a claim by `actor` against `target`, or refuse it.
+    ///
+    /// Checks before recording, so a refused attempt does not itself consume budget. The
+    /// budget is per-actor, so this is not about one account starving another — it is that
+    /// a client which retries on a 429 would otherwise push its own window out indefinitely
+    /// and never recover.
+    fn admit(&mut self, actor: UserId, target: UserId, now_ms: i64) -> Result<(), ServerError> {
+        let recent = self.events.entry(actor).or_default();
+        while recent.front().is_some_and(|(at, _)| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS) {
+            recent.pop_front();
+        }
+        if recent.len() >= MAX_CLAIMS_TOTAL {
+            return Err(ServerError::RateLimited);
+        }
+        if recent.iter().filter(|(_, t)| *t == target).count() >= MAX_CLAIMS_PER_TARGET {
+            return Err(ServerError::RateLimited);
+        }
+        recent.push_back((now_ms, target));
+        Ok(())
+    }
+}
+
 /// The instance.
 pub struct Instance {
     rooms: Mutex<HashMap<RoomId, Room>>,
@@ -252,6 +308,8 @@ pub struct Instance {
     /// half-add.
     key_packages: Mutex<HashMap<DeviceId, VecDeque<String>>>,
     registration_policy: Mutex<RegistrationPolicy>,
+    /// Not persisted; see [`ClaimLimiter`].
+    claim_limiter: Mutex<ClaimLimiter>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -281,6 +339,7 @@ impl Instance {
             invites: Mutex::new(directory.invites.into_iter().collect()),
             key_packages: Mutex::new(directory.key_packages.into_iter().collect()),
             registration_policy: Mutex::new(directory.registration_policy),
+            claim_limiter: Mutex::new(ClaimLimiter::default()),
             franking_key,
             storage,
         })
@@ -698,7 +757,21 @@ impl Instance {
     ///
     /// If any device has run out, this fails rather than returning a partial set, for the
     /// same reason. The caller learns the account cannot currently be added.
-    pub fn claim_key_packages(&self, user: UserId) -> Result<Vec<(DeviceId, String)>, ServerError> {
+    pub fn claim_key_packages(
+        &self,
+        actor: UserId,
+        user: UserId,
+        now_ms: i64,
+    ) -> Result<Vec<(DeviceId, String)>, ServerError> {
+        // `actor` exists so this rule can live here rather than in the handler. The HTTP
+        // layer already authenticated the caller and then dropped the identity on the
+        // floor, which made the limit below impossible to express where the rules live —
+        // and a rule in a handler is untested and bypassable.
+        self.claim_limiter
+            .lock()
+            .expect("claim limiter mutex poisoned")
+            .admit(actor, user, now_ms)?;
+
         let accounts = self.accounts.lock().expect("accounts mutex poisoned");
         let account = accounts.get(&user).ok_or(ServerError::NoSuchAccount)?;
         let devices = account.devices.clone();
@@ -2122,5 +2195,126 @@ mod roles {
             Err(ServerError::InsufficientRole)
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod claim_limits {
+    use super::tests::*;
+    use super::*;
+
+    /// Publish `n` packages for a freshly registered account.
+    fn victim_with(inst: &Instance, n: usize) -> TestSender {
+        let victim = TestSender::registered(inst);
+        inst.publish_key_packages(victim.user, victim.device, vec!["aa".into(); n]).unwrap();
+        victim
+    }
+
+    #[test]
+    fn an_attacker_cannot_drain_someone_elses_key_packages() {
+        // Found by probing, not by reading. Before the limit, one authenticated account
+        // emptied a victim's entire published supply in a tight loop, after which nobody
+        // could add that victim to a room until they came back and published more — a
+        // targeted denial of service that left no trace the victim could see.
+        let inst = Instance::in_memory();
+        let victim = victim_with(&inst, 10);
+        let attacker = TestSender::registered(&inst);
+
+        let mut claimed = 0;
+        for _ in 0..50 {
+            if inst.claim_key_packages(attacker.user, victim.user, 0).is_ok() {
+                claimed += 1;
+            }
+        }
+
+        assert_eq!(claimed, MAX_CLAIMS_PER_TARGET, "one account must not claim without bound");
+        assert!(
+            inst.key_packages_remaining(victim.device) > 0,
+            "a single attacker must not be able to empty the supply"
+        );
+
+        // The property that actually matters to the victim.
+        let honest = TestSender::registered(&inst);
+        assert!(
+            inst.claim_key_packages(honest.user, victim.user, 0).is_ok(),
+            "an honest party must still be able to add the victim to a room"
+        );
+    }
+
+    #[test]
+    fn walking_a_list_of_user_ids_is_bounded_too() {
+        // The per-target limit alone bounds nothing: user ids are on every message, so an
+        // attacker can simply move on to the next victim.
+        let inst = Instance::in_memory();
+        let attacker = TestSender::registered(&inst);
+        let victims: Vec<_> = (0..40).map(|_| victim_with(&inst, 2)).collect();
+
+        let claimed = victims
+            .iter()
+            .filter(|v| inst.claim_key_packages(attacker.user, v.user, 0).is_ok())
+            .count();
+
+        assert_eq!(claimed, MAX_CLAIMS_TOTAL, "an actor's total claim budget must be capped");
+    }
+
+    #[test]
+    fn the_budget_returns_after_the_window() {
+        // Otherwise this is not a rate limit but a lifetime quota, and an ordinary user who
+        // creates a lot of rooms one afternoon is locked out forever.
+        let inst = Instance::in_memory();
+        let victim = victim_with(&inst, 10);
+        let actor = TestSender::registered(&inst);
+
+        for _ in 0..MAX_CLAIMS_PER_TARGET {
+            inst.claim_key_packages(actor.user, victim.user, 0).unwrap();
+        }
+        assert!(matches!(
+            inst.claim_key_packages(actor.user, victim.user, 0),
+            Err(ServerError::RateLimited)
+        ));
+
+        assert!(
+            inst.claim_key_packages(actor.user, victim.user, CLAIM_WINDOW_MS).is_ok(),
+            "the window must expire"
+        );
+    }
+
+    #[test]
+    fn a_refused_claim_does_not_consume_budget() {
+        // A client that retries on a 429 would otherwise push its own window out
+        // indefinitely and never recover.
+        let inst = Instance::in_memory();
+        let victim = victim_with(&inst, 10);
+        let actor = TestSender::registered(&inst);
+
+        for _ in 0..MAX_CLAIMS_PER_TARGET {
+            inst.claim_key_packages(actor.user, victim.user, 0).unwrap();
+        }
+        // Hammer well past the total budget while refused.
+        for _ in 0..MAX_CLAIMS_TOTAL * 2 {
+            assert!(inst.claim_key_packages(actor.user, victim.user, 0).is_err());
+        }
+
+        // A different target is still within the untouched total budget.
+        let other = victim_with(&inst, 4);
+        assert!(
+            inst.claim_key_packages(actor.user, other.user, 0).is_ok(),
+            "rejections must not count against the actor's budget"
+        );
+    }
+
+    #[test]
+    fn claiming_your_own_key_packages_is_limited_the_same_way() {
+        // No self-exemption: an account is not more trustworthy against itself, and an
+        // exemption would be a free drain for anyone willing to register.
+        let inst = Instance::in_memory();
+        let me = victim_with(&inst, 10);
+        for _ in 0..MAX_CLAIMS_PER_TARGET {
+            inst.claim_key_packages(me.user, me.user, 0).unwrap();
+        }
+        assert!(matches!(
+            inst.claim_key_packages(me.user, me.user, 0),
+            Err(ServerError::RateLimited)
+        ));
     }
 }

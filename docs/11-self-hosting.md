@@ -142,9 +142,17 @@ Honest list. Each of these is real and none is hypothetical.
 
 **Will affect even a small friendly deployment:**
 
-- **No rate limiting.** An authenticated account can drain another account's key packages,
-  after which nobody can add that person to a room until they publish more. There is
-  nothing throttling registration or sending either.
+- **Rate limiting is partial.** Key package claims are now capped per account — 3 per
+  target and 30 in total per hour — because probing confirmed the drain was real: one
+  authenticated account emptied a victim's entire published supply in a tight loop, after
+  which nobody could add that victim to a room until they came back online and published
+  more, and the victim saw nothing.
+
+  **What the cap does not do:** it bounds the rate, not the total. Several accounts can
+  still drain a victim between them, one account can drain slowly across windows, and the
+  counter lives in memory, so restarting the server clears it. Keep your published supply
+  topped up (`/keys 10`) rather than treating this as solved. **Registration and message
+  sending are still unthrottled.**
 - **No message history on the client.** Messages arrive by polling and scroll past. A
   restart does not replay them — it cannot, because MLS discards each message key after
   use.
