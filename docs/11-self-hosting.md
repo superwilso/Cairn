@@ -89,6 +89,12 @@ Then, to talk:
    person. If they match, no key substitution happened. If they differ, stop.
 5. `/verify 0` records that you compared them. It persists.
 
+**Usernames now exist**, so step 1 can be `@alice` rather than a uuid — claim one once,
+and it is yours. They resolve by **exact match only**: there is no search or directory, so
+knowing a handle confirms an account exists but nobody can walk your instance for a list of
+who is on it. Lookups are rate limited per account, because exact-match resolution stops
+listing but not guessing.
+
 **There is no invite link yet.** Room ids and user ids are passed by hand. That is the main
 piece of unfinished work between here and something you would hand to a non-technical
 person (`docs/10-roadmap.md`, M3).

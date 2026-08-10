@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::{Commitment, Context as FrankingContext, ServerFrankingKey, Tag};
 use cairn_crypto::TranscriptReport;
-use cairn_proto::{BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId};
+use cairn_proto::{
+    BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId, Username,
+};
 
 use crate::storage::{Storage, StorageError, Write};
 
@@ -86,6 +88,14 @@ pub enum ServerError {
     BlobTooLarge,
     #[error("attachment is empty")]
     BlobEmpty,
+    #[error("that username is already taken")]
+    UsernameTaken,
+    #[error("this account already has a username")]
+    UsernameAlreadySet,
+    #[error("no account has that username")]
+    NoSuchUsername,
+    #[error("not a usable username: {0}")]
+    BadUsername(String),
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -118,6 +128,14 @@ pub const MAX_CLAIMS_PER_TARGET: usize = 3;
 /// ids, and user ids are on every message. This is the ceiling that makes enumeration cost
 /// something.
 pub const MAX_CLAIMS_TOTAL: usize = 30;
+
+/// How many username lookups one account may make per window.
+///
+/// Exact-match-only resolution stops an attacker *listing* the instance's accounts. It does
+/// not stop them *guessing* — a dictionary of common handles is cheap, and without a ceiling
+/// an attacker walks it and rebuilds the roster the design was meant to withhold. So the
+/// lookup path is bounded too, generously enough that a person adding friends never notices.
+pub const MAX_LOOKUPS_TOTAL: usize = 60;
 
 /// The window both claim limits are measured over.
 pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
@@ -340,6 +358,12 @@ pub struct Instance {
     registration_policy: Mutex<RegistrationPolicy>,
     /// Not persisted; see [`ClaimLimiter`].
     claim_limiter: Mutex<ClaimLimiter>,
+    /// Handle → account, both directions needed: one to resolve, one to refuse a second
+    /// handle for an account that already has one.
+    usernames: Mutex<HashMap<Username, UserId>>,
+    /// Bounds username *guessing*, which exact-match resolution does not. Not persisted,
+    /// for the same reason as [`ClaimLimiter`].
+    lookup_limiter: Mutex<HashMap<UserId, VecDeque<i64>>>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -370,6 +394,8 @@ impl Instance {
             key_packages: Mutex::new(directory.key_packages.into_iter().collect()),
             registration_policy: Mutex::new(directory.registration_policy),
             claim_limiter: Mutex::new(ClaimLimiter::default()),
+            usernames: Mutex::new(directory.usernames.into_iter().collect()),
+            lookup_limiter: Mutex::new(HashMap::new()),
             franking_key,
             storage,
         })
@@ -901,6 +927,75 @@ impl Instance {
         self.storage.blob_bytes(id)?.ok_or(ServerError::NoSuchBlob)
     }
 
+    /// Claim a handle for the acting account.
+    ///
+    /// One per account, and not reassignable here. A handle that could be released and
+    /// re-taken is a handle someone else can inherit: a person who remembers "@alice" and
+    /// types it a month later would reach whoever picked it up, with no signal that anything
+    /// changed. Renaming needs a story about the old name's afterlife before it is offered.
+    pub fn claim_username(&self, actor: UserId, name: Username) -> Result<(), ServerError> {
+        let mut usernames = self.usernames.lock().expect("usernames mutex poisoned");
+
+        if usernames.contains_key(&name) {
+            return Err(ServerError::UsernameTaken);
+        }
+        if usernames.values().any(|u| *u == actor) {
+            return Err(ServerError::UsernameAlreadySet);
+        }
+        // An unclaimed account must not be able to reserve a handle: registration is the
+        // thing that costs an invite, and a handle without an account behind it is squatting.
+        if !self.accounts.lock().expect("accounts mutex poisoned").contains_key(&actor) {
+            return Err(ServerError::NoSuchAccount);
+        }
+
+        usernames.insert(name.clone(), actor);
+        drop(usernames);
+        self.write(&[Write::Username(name, actor)])
+    }
+
+    /// Resolve a handle to an account. Exact match only — there is deliberately no search.
+    ///
+    /// Rate limited per actor, because exact-match resolution stops an attacker *listing*
+    /// accounts but not *guessing* them, and an unbounded lookup path rebuilds the roster
+    /// that withholding search was meant to protect.
+    pub fn lookup_username(
+        &self,
+        actor: UserId,
+        name: &Username,
+        now_ms: i64,
+    ) -> Result<UserId, ServerError> {
+        {
+            let mut limiter = self.lookup_limiter.lock().expect("lookup limiter poisoned");
+            let recent = limiter.entry(actor).or_default();
+            while recent.front().is_some_and(|at| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS) {
+                recent.pop_front();
+            }
+            if recent.len() >= MAX_LOOKUPS_TOTAL {
+                return Err(ServerError::RateLimited);
+            }
+            // Recorded before the answer is known, so a miss costs the same as a hit. A
+            // limiter that only counted successes would let an attacker guess for free.
+            recent.push_back(now_ms);
+        }
+
+        self.usernames
+            .lock()
+            .expect("usernames mutex poisoned")
+            .get(name)
+            .copied()
+            .ok_or(ServerError::NoSuchUsername)
+    }
+
+    /// The handle for an account, if it has claimed one.
+    pub fn username_of(&self, user: UserId) -> Option<Username> {
+        self.usernames
+            .lock()
+            .expect("usernames mutex poisoned")
+            .iter()
+            .find(|(_, u)| **u == user)
+            .map(|(n, _)| n.clone())
+    }
+
     pub fn room_seal(&self, room: RoomId) -> Option<RoomSeal> {
         self.rooms.lock().expect("rooms mutex poisoned").get(&room).map(|r| r.seal)
     }
@@ -1160,7 +1255,7 @@ pub(crate) mod tests {
         assert!(matches!(inst.accept(sender.sign(e)), Err(ServerError::BadCommitment)));
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    pub(crate) fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("cairn-state-{}-{}", name, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2410,5 +2505,129 @@ mod claim_limits {
             inst.claim_key_packages(me.user, me.user, 0),
             Err(ServerError::RateLimited)
         ));
+    }
+}
+
+#[cfg(test)]
+mod username_rules {
+    use super::tests::*;
+    use super::*;
+
+    fn name(s: &str) -> Username {
+        Username::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_handle_cannot_be_claimed_twice() {
+        // The impersonation this guards: if a handle could be re-registered, someone who
+        // remembers "@alice" reaches whoever holds it now, with no signal it changed hands.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+
+        inst.claim_username(alice.user, name("alice")).unwrap();
+        assert!(matches!(
+            inst.claim_username(mallory.user, name("alice")),
+            Err(ServerError::UsernameTaken)
+        ));
+        // And not by a different spelling of the same thing.
+        assert!(matches!(
+            inst.claim_username(mallory.user, name("ALICE")),
+            Err(ServerError::UsernameTaken)
+        ));
+    }
+
+    #[test]
+    fn an_unregistered_account_cannot_reserve_a_handle() {
+        // Registration is what costs an invite. A handle with no account behind it is
+        // squatting, and on an invite-only instance it would be free squatting.
+        let inst = Instance::in_memory();
+        assert!(matches!(
+            inst.claim_username(UserId::new(), name("ghost")),
+            Err(ServerError::NoSuchAccount)
+        ));
+    }
+
+    #[test]
+    fn one_account_gets_one_handle() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        inst.claim_username(alice.user, name("alice")).unwrap();
+        assert!(matches!(
+            inst.claim_username(alice.user, name("alice2")),
+            Err(ServerError::UsernameAlreadySet)
+        ));
+    }
+
+    #[test]
+    fn a_handle_resolves_to_its_account_and_nothing_else_does() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        inst.claim_username(alice.user, name("alice")).unwrap();
+
+        assert_eq!(inst.lookup_username(bob.user, &name("alice"), 0).unwrap(), alice.user);
+        // Case-insensitively, since Username normalises before it ever reaches the map.
+        assert_eq!(inst.lookup_username(bob.user, &name("Alice"), 0).unwrap(), alice.user);
+        assert!(matches!(
+            inst.lookup_username(bob.user, &name("alicia"), 0),
+            Err(ServerError::NoSuchUsername)
+        ));
+    }
+
+    #[test]
+    fn guessing_handles_is_bounded_even_though_listing_is_impossible() {
+        // Exact-match resolution stops an attacker *listing* accounts. It does not stop
+        // them *guessing*, and a dictionary of common handles is cheap — so without this
+        // ceiling the roster that withholding search protects is rebuilt anyway.
+        let inst = Instance::in_memory();
+        let attacker = TestSender::registered(&inst);
+
+        let mut answered = 0;
+        for i in 0..MAX_LOOKUPS_TOTAL * 2 {
+            match inst.lookup_username(attacker.user, &name(&format!("guess{i}")), 0) {
+                Err(ServerError::RateLimited) => break,
+                _ => answered += 1,
+            }
+        }
+        assert_eq!(answered, MAX_LOOKUPS_TOTAL, "guessing must be capped, not merely slowed");
+    }
+
+    #[test]
+    fn a_missed_guess_costs_the_same_as_a_hit() {
+        // A limiter that only counted successes would let an attacker probe for free, which
+        // is precisely the direction an attacker probes in.
+        let inst = Instance::in_memory();
+        let attacker = TestSender::registered(&inst);
+
+        for i in 0..MAX_LOOKUPS_TOTAL {
+            let _ = inst.lookup_username(attacker.user, &name(&format!("miss{i}")), 0);
+        }
+        assert!(matches!(
+            inst.lookup_username(attacker.user, &name("miss0"), 0),
+            Err(ServerError::RateLimited)
+        ));
+    }
+
+    #[test]
+    fn handles_survive_a_restart() {
+        let dir = temp_dir("usernames");
+        let storage = Arc::new(crate::storage::DbStorage::new(&dir).unwrap());
+        let user = {
+            let inst = Instance::open(storage.clone()).unwrap();
+            let alice = TestSender::registered(&inst);
+            inst.claim_username(alice.user, name("alice")).unwrap();
+            alice.user
+        };
+
+        let restarted = Instance::open(storage).unwrap();
+        assert_eq!(restarted.username_of(user), Some(name("alice")));
+        // And it is still taken, which is what stops a restart handing it to someone else.
+        let mallory = TestSender::registered(&restarted);
+        assert!(matches!(
+            restarted.claim_username(mallory.user, name("alice")),
+            Err(ServerError::UsernameTaken)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

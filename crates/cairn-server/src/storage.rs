@@ -43,7 +43,7 @@ use redb::{Database, Error as RedbError, ReadableTable, ReadableTableMetadata, T
 use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::ServerFrankingKey;
-use cairn_proto::{BlobId, DeviceId, RoomId, UserId};
+use cairn_proto::{BlobId, DeviceId, RoomId, UserId, Username};
 
 use crate::state::{
     AccountRecord, BlobRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room, StoredMessage,
@@ -89,6 +89,9 @@ const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 const DEVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("devices");
 const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites");
 const KEY_PACKAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("key_packages");
+/// Handle → account. Keyed by the *normalised* username, so the table cannot hold two rows
+/// that a user would read as the same name.
+const USERNAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("usernames");
 /// Keyed by `(room id, server_seq)` so a room's messages are contiguous and a fetch after
 /// a cursor is a range scan rather than a filter over everything.
 const MESSAGES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("messages");
@@ -112,6 +115,7 @@ pub struct Directory {
     pub accounts: Vec<(UserId, AccountRecord)>,
     pub invites: Vec<(String, InviteRecord)>,
     pub key_packages: Vec<(DeviceId, VecDeque<String>)>,
+    pub usernames: Vec<(Username, UserId)>,
     pub registration_policy: RegistrationPolicy,
 }
 
@@ -128,6 +132,7 @@ pub enum Write {
     Invite(String, InviteRecord),
     KeyPackages(DeviceId, VecDeque<String>),
     Policy(RegistrationPolicy),
+    Username(Username, UserId),
     Message(RoomId, StoredMessage),
     /// Metadata and ciphertext together: a blob whose bytes landed without its metadata
     /// would be unreachable and unattributable, and one whose metadata landed without its
@@ -298,6 +303,11 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                 t.insert(device.to_string().as_str(), serde_json::to_vec(packages)?.as_slice())
                     .map_err(RedbError::from)?;
             }
+            Write::Username(name, user) => {
+                let mut t = tx.open_table(USERNAMES).map_err(RedbError::from)?;
+                t.insert(name.as_str(), serde_json::to_vec(user)?.as_slice())
+                    .map_err(RedbError::from)?;
+            }
             Write::Policy(policy) => {
                 let mut t = tx.open_table(META).map_err(RedbError::from)?;
                 t.insert("registration_policy", serde_json::to_vec(policy)?.as_slice())
@@ -385,6 +395,7 @@ impl Storage for DbStorage {
         read_all!(DEVICES, dir.devices, |s: &str| s.parse::<DeviceId>().ok());
         read_all!(INVITES, dir.invites, |s: &str| Some(s.to_string()));
         read_all!(KEY_PACKAGES, dir.key_packages, |s: &str| s.parse::<DeviceId>().ok());
+        read_all!(USERNAMES, dir.usernames, |s: &str| Username::parse(s).ok());
 
         if let Ok(meta) = tx.open_table(META) {
             if let Some(v) = meta.get("registration_policy").map_err(RedbError::from)? {
@@ -479,6 +490,7 @@ impl Storage for MemoryStorage {
             accounts: inner.directory.accounts.clone(),
             invites: inner.directory.invites.clone(),
             key_packages: inner.directory.key_packages.clone(),
+            usernames: inner.directory.usernames.clone(),
             registration_policy: inner.directory.registration_policy,
         })
     }
@@ -494,6 +506,7 @@ impl Storage for MemoryStorage {
                 Write::KeyPackages(d, p) => {
                     upsert(&mut inner.directory.key_packages, *d, p.clone())
                 }
+                Write::Username(n, u) => upsert(&mut inner.directory.usernames, n.clone(), *u),
                 Write::Policy(p) => inner.directory.registration_policy = *p,
                 Write::Message(room, m) => inner.messages.push((*room, m.clone())),
                 Write::Blob(id, r, b) => inner.blobs.push((*id, r.clone(), b.clone())),

@@ -48,6 +48,8 @@ pub fn router(instance: SharedInstance) -> Router {
                 .layer(DefaultBodyLimit::max(crate::state::MAX_BLOB_BYTES + 64 * 1024)),
         )
         .route("/v1/blobs/{blob}", get(download_blob))
+        .route("/v1/usernames", post(claim_username))
+        .route("/v1/usernames/{name}", get(lookup_username))
         .route("/v1/reports", post(submit_report))
         .with_state(instance)
 }
@@ -75,7 +77,9 @@ impl IntoResponse for ServerError {
             }
             ServerError::NoSuchAccount => StatusCode::NOT_FOUND,
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-            ServerError::NoSuchBlob => StatusCode::NOT_FOUND,
+            ServerError::NoSuchBlob | ServerError::NoSuchUsername => StatusCode::NOT_FOUND,
+            ServerError::UsernameTaken | ServerError::UsernameAlreadySet => StatusCode::CONFLICT,
+            ServerError::BadUsername(_) => StatusCode::BAD_REQUEST,
             // 413 rather than 400: the request was well-formed, the instance just will not
             // hold something this big. An operator raising the ceiling changes the answer.
             ServerError::BlobTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -359,6 +363,42 @@ async fn download_blob(
     let actor = signed_actor(&instance, &headers, "download_blob", Some(blob.into()))?;
     let bytes = instance.fetch_blob(actor, blob)?;
     Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+#[derive(Deserialize)]
+struct ClaimUsernameRequest {
+    username: String,
+}
+
+#[derive(Serialize)]
+struct ResolvedUser {
+    user: String,
+}
+
+/// Claim a handle for the acting account.
+async fn claim_username(
+    State(instance): State<SharedInstance>,
+    headers: HeaderMap,
+    Json(request): Json<ClaimUsernameRequest>,
+) -> Result<StatusCode, ServerError> {
+    let actor = signed_actor(&instance, &headers, "claim_username", None)?;
+    let name = cairn_proto::Username::parse(&request.username)
+        .map_err(|e| ServerError::BadUsername(e.to_string()))?;
+    instance.claim_username(actor, name)?;
+    Ok(StatusCode::CREATED)
+}
+
+/// Resolve a handle. Authenticated, so lookups can be attributed and bounded.
+async fn lookup_username(
+    State(instance): State<SharedInstance>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ResolvedUser>, ServerError> {
+    let actor = signed_actor(&instance, &headers, "lookup_username", None)?;
+    let name =
+        cairn_proto::Username::parse(&name).map_err(|e| ServerError::BadUsername(e.to_string()))?;
+    let user = instance.lookup_username(actor, &name, now_ms())?;
+    Ok(Json(ResolvedUser { user: user.to_string() }))
 }
 
 fn now_ms() -> i64 {
