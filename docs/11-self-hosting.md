@@ -96,7 +96,18 @@ knowing a handle confirms an account exists but nobody can walk your instance fo
 who is on it. Lookups are rate limited per account, because exact-match resolution stops
 listing but not guessing.
 
-**There is no invite link yet.** Room ids and user ids are passed by hand. That is the main
+**Invite links exist now.** A moderator runs `/invite [uses] [hours]` in the open room —
+default one use, 24 hours — and the joiner runs `/join <token>`. The token is shown once;
+the server keeps only a hash, so it cannot be recovered or read out of a backup. There is no
+unlimited link, deliberately: an uncapped one is a public invite in all but name, and a
+public invite to a T1 or T2 room would mean it should have been T3.
+
+**Redeeming joins the room; it does not give you the keys.** The group's keys are held by
+its members, not the instance, so nobody can hand them out on the strength of a token. Until
+an existing member adds you to the encrypted group, the room is visible and unreadable. The
+client says so rather than implying the door is fully open.
+
+**Superseded note.** Room ids and user ids are passed by hand. That is the main
 piece of unfinished work between here and something you would hand to a non-technical
 person (`docs/10-roadmap.md`, M3).
 

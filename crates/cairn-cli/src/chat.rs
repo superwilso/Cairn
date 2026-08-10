@@ -236,7 +236,9 @@ fn help() {
     println!("  /open <room-id>      open a room already joined");
     println!(
         "  /add <@name|user-id> add someone to the open room
-  /username <name>     claim your handle, so people can find you without a uuid"
+  /username <name>     claim your handle, so people can find you without a uuid
+  /invite [uses] [hrs] mint an invite link for the open room (default 1 use, 24h)
+  /join <token>        redeem an invite"
     );
     println!("  /members             who is in the open room, and their verification state");
     println!("  /safety              safety numbers to compare out of band");
@@ -310,6 +312,8 @@ impl App {
                 self.add_member(user)?
             }
             "/username" => self.claim_username(rest)?,
+            "/invite" => self.create_invite(rest)?,
+            "/join" => self.join_by_invite(rest)?,
             "/members" => self.list_members(),
             "/safety" => self.show_safety_numbers(),
             "/verify" => self.verify(rest.parse()?)?,
@@ -335,6 +339,46 @@ impl App {
         let user = self.client.lookup_username(&name)?;
         println!("  {name} is {user}");
         Ok(user)
+    }
+
+    /// Mint an invite for the open room. `/invite [uses] [hours]`, defaulting to one use
+    /// and a day — the terms that make a leaked link least useful.
+    fn create_invite(&self, rest: &str) -> Fallible<()> {
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let mut parts = rest.split_whitespace();
+        let uses: u32 = parts.next().unwrap_or("1").parse().unwrap_or(1);
+        let hours: i64 = parts.next().unwrap_or("24").parse().unwrap_or(24);
+
+        let expires = if hours > 0 { Some(now_ms() + hours * 3_600_000) } else { None };
+
+        let token = self.client.create_room_invite(room, uses, expires)?;
+        println!("  invite for {room}:");
+        println!("    {token}");
+        if hours > 0 {
+            println!(
+                "  admits {uses}, expires in {hours}h. Shown once — the server keeps only a hash."
+            );
+        } else {
+            println!("  admits {uses}, never expires. Shown once — the server keeps only a hash.");
+        }
+        println!("  they run: /join <token>");
+        Ok(())
+    }
+
+    /// Redeem an invite.
+    ///
+    /// Prints what redemption does *not* do, which matters more here than the success
+    /// message. Joining the room server-side is not the same as being in its MLS group: the
+    /// group's keys are held by its members, not the instance, so nobody can hand them out
+    /// on the strength of a token. Until an existing member commits an Add, the room is
+    /// visible and unreadable — and a client that implied otherwise would be claiming a
+    /// protection had already been extended when it had not.
+    fn join_by_invite(&self, rest: &str) -> Fallible<()> {
+        let room = self.client.redeem_room_invite(rest.trim())?;
+        println!("  joined {room}");
+        println!("  publish key packages with /keys 5 if you have not — a member must still");
+        println!("  add you to the encrypted group before you can read anything");
+        Ok(())
     }
 
     /// Claim a handle for this account.

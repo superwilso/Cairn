@@ -48,6 +48,8 @@ pub fn router(instance: SharedInstance) -> Router {
                 .layer(DefaultBodyLimit::max(crate::state::MAX_BLOB_BYTES + 64 * 1024)),
         )
         .route("/v1/blobs/{blob}", get(download_blob))
+        .route("/v1/rooms/{room}/invites", post(create_room_invite))
+        .route("/v1/invites/redeem", post(redeem_room_invite))
         .route("/v1/usernames", post(claim_username))
         .route("/v1/usernames/{name}", get(lookup_username))
         .route("/v1/reports", post(submit_report))
@@ -367,6 +369,58 @@ async fn download_blob(
     let actor = signed_actor(&instance, &headers, "download_blob", Some(blob.into()))?;
     let bytes = instance.fetch_blob(actor, blob)?;
     Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+#[derive(Deserialize)]
+struct CreateRoomInviteRequest {
+    /// How many people this link may admit. Capped server-side; there is no unlimited.
+    uses: u32,
+    /// Absolute expiry in ms since the epoch, or `null` for none.
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct MintedInvite {
+    /// Returned **once**. Only a hash is stored, so this cannot be recovered later.
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct RedeemInviteRequest {
+    token: String,
+}
+
+#[derive(Serialize)]
+struct RedeemedInvite {
+    room: String,
+}
+
+/// Mint an invite for a room. Moderator or owner, same as adding someone directly.
+async fn create_room_invite(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<CreateRoomInviteRequest>,
+) -> Result<(StatusCode, Json<MintedInvite>), ServerError> {
+    let room = cairn_proto::RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "create_room_invite", Some(room.into()))?;
+    let token = instance.create_room_invite(actor, room, request.uses, request.expires_at_ms)?;
+    Ok((StatusCode::CREATED, Json(MintedInvite { token })))
+}
+
+/// Redeem an invite, joining the caller to its room.
+///
+/// The token is in the body rather than the path: a path lands in access logs and proxy
+/// logs, and this one is a credential.
+async fn redeem_room_invite(
+    State(instance): State<SharedInstance>,
+    headers: HeaderMap,
+    Json(request): Json<RedeemInviteRequest>,
+) -> Result<Json<RedeemedInvite>, ServerError> {
+    let actor = signed_actor(&instance, &headers, "redeem_room_invite", None)?;
+    let room = instance.redeem_room_invite(actor, &request.token, now_ms())?;
+    Ok(Json(RedeemedInvite { room: room.to_string() }))
 }
 
 #[derive(Deserialize)]

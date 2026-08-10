@@ -78,6 +78,16 @@ struct CreateRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct MintedInviteResponse {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct RedeemedInviteResponse {
+    room: String,
+}
+
+#[derive(Deserialize)]
 struct ResolvedUserResponse {
     user: String,
 }
@@ -219,6 +229,37 @@ impl<T: Transport> Client<T> {
         body: Option<crate::transport::RequestBody<'_>>,
     ) -> Result<Response, ClientError> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
+    }
+
+    /// Mint an invite for a room. The token comes back once and is not recoverable.
+    pub fn create_room_invite(
+        &self,
+        room: RoomId,
+        uses: u32,
+        expires_at_ms: Option<i64>,
+    ) -> Result<String, ClientError> {
+        let body = serde_json::json!({ "uses": uses, "expires_at_ms": expires_at_ms }).to_string();
+        let response = self.call(
+            "POST",
+            &format!("/v1/rooms/{}/invites", room.as_uuid()),
+            &self.auth("create_room_invite", Some(room.into()))?,
+            Some(&body),
+        )?;
+        let parsed: MintedInviteResponse = serde_json::from_slice(&response.body)?;
+        Ok(parsed.token)
+    }
+
+    /// Redeem an invite, joining this account to the room it names.
+    pub fn redeem_room_invite(&self, token: &str) -> Result<RoomId, ClientError> {
+        let body = serde_json::json!({ "token": token }).to_string();
+        let response = self.call(
+            "POST",
+            "/v1/invites/redeem",
+            &self.auth("redeem_room_invite", None)?,
+            Some(&body),
+        )?;
+        let parsed: RedeemedInviteResponse = serde_json::from_slice(&response.body)?;
+        parsed.room.parse().map_err(|_| ClientError::Malformed("room id"))
     }
 
     /// Claim a handle for this account. One per account, and not reassignable.
