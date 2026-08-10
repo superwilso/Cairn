@@ -172,17 +172,29 @@ mod tests {
         move |k: &str| map.get(k).cloned()
     }
 
+    /// A fake environment that satisfies *every* platform's home lookup.
+    ///
+    /// For tests whose subject is not the platform branch. Supplying only `HOME` made one of
+    /// them fail on Windows CI with `NoHome` — correctly, since the Windows branch reads
+    /// `APPDATA`, and the test was asserting something about `CAIRN_HOME` that has nothing to
+    /// do with either.
+    fn any_platform(extra: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("HOME", "/home/alice"),
+            ("APPDATA", r"C:\Users\alice\AppData\Roaming"),
+            ("USERPROFILE", r"C:\Users\alice"),
+        ];
+        pairs.extend_from_slice(extra);
+        env(&pairs)
+    }
+
     #[test]
     fn state_never_defaults_into_a_directory_the_os_deletes() {
         // The property this module exists for. `/tmp` is cleared on reboot on most Linux
         // systems — often it is tmpfs, so it is RAM — and pruned on a timer otherwise. The
         // old default put the device key, the MLS group state and the whole message history
         // there, so a reboot took the account with it.
-        let e = env(&[
-            ("HOME", "/home/alice"),
-            ("APPDATA", r"C:\Users\alice\AppData\Roaming"),
-            ("USERPROFILE", r"C:\Users\alice"),
-        ]);
+        let e = any_platform(&[]);
         let dir = resolve("alice", &e).unwrap();
         let temp = std::env::temp_dir();
         assert!(
@@ -213,7 +225,7 @@ mod tests {
         // `CAIRN_HOME=` in a shell script is a common accident. Treating it as set would
         // resolve state to a bare relative path, which lands wherever the client happened to
         // be started from — a different directory each time.
-        let e = env(&[("CAIRN_HOME", "   "), ("HOME", "/home/alice")]);
+        let e = any_platform(&[("CAIRN_HOME", "   ")]);
         let dir = resolve("alice", &e).unwrap();
         assert!(
             dir.is_absolute(),
