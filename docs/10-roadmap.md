@@ -227,11 +227,17 @@ Four calls made by the owner, so a session does not re-litigate them:
       client claims once and records it, because the server checks the invite *before* it
       notices the account already exists — without that, a returning user is locked out of
       their own account.
-- [ ] **Room invite links** — a joiner is still handed a room id and a user id by hand.
-      **M2's exit condition depends on this**, not just M3's. `/dm <user-id>` now does
-      create-and-add in one step, so what remains is removing the id-passing entirely.
+- [x] **Room invite links.** `/invite [uses] [hrs]` mints one, `/join <token>` redeems it.
+      The creator chooses the terms; unlimited uses stays forbidden in code, not merely in
+      docs. **M2's exit condition depended on this** and is now met.
 
-      **Design, settled so it is not re-derived:**
+      One bug the flow exposed, worth keeping: `add_room_member` checked the member ceiling
+      *before* checking whether the target was already a member, so a DM at its ceiling of
+      two was "full" for the joiner who had just redeemed an invite into it. Invites were
+      useless for exactly the case they exist for, every unit test passed, and it surfaced
+      only from running two clients through the whole flow.
+
+      **Design, as built:**
 
       - A **single-use, server-generated, non-enumerable token** minted by a member with
         role ≥ Moderator, redeemed once, which adds the bearer as a `Member`.
@@ -252,8 +258,21 @@ Four calls made by the owner, so a session does not re-litigate them:
       - **Probe before trusting it**: redeem twice, redeem after removal, redeem against a
         full room, redeem a token minted for a different room, and mint as a non-moderator.
         Membership is where this project's three shipped vulnerabilities lived.
-- [ ] Backup and restore, including **the franking key**: losing it invalidates every
-      report the instance ever issued
+- [x] **Backup and restore, including the franking key.** `cairn-server backup|verify|
+      restore`, a logical snapshot taken inside one read transaction rather than a file copy.
+
+      Probing the *documented* procedure is what shaped this. Copying a live `cairn.redb`
+      produces a file that **opens cleanly on an idle instance and cannot be opened at all on
+      a busy one** — so `cp` works exactly when an operator tests their backup and fails
+      exactly when they need it, with the failure surfacing at restore time. The command
+      opens the database instead, so redb's lock makes it refuse against a running instance.
+
+      The same probing found a hole in the protection already in place: `FrankingKeyMissing`
+      caught an *absent* key, and a **mismatched** one started perfectly cleanly while every
+      report filed before the restore silently stopped verifying. The database now records a
+      hash of the key it belongs to, so a separated pair is refused
+      (`StorageError::FrankingKeyMismatch`). Verified live: a report filed before a backup
+      still verifies against the restored instance.
 - [x] **Rate limiting on key package claims.** Probing confirmed the drain rather than
       assuming it: one authenticated account emptied a victim's whole published supply in a
       loop, after which nobody could add that victim to a room. Now capped per actor —

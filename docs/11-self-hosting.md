@@ -124,22 +124,59 @@ The data volume holds two things:
   floor-level default, since every byte is storage and egress you pay for.
 
 ```bash
+mkdir -p backups && chmod 777 backups     # the image runs as an unprivileged user
 docker compose stop cairn
-docker compose run --rm -v "$PWD:/backup" cairn \
-  sh -c 'cp /data/franking.key /data/cairn.redb /backup/'
+docker compose run --rm -v "$PWD/backups:/backups" cairn backup "/backups/$(date +%F)"
 docker compose start cairn
 ```
 
-Stopped first: the database is crash-consistent, but a plain `cp` of a live one is not a
-snapshot, and the two files must be restored as a matched pair.
+The image's entrypoint *is* `cairn-server`, so the subcommand is the first argument. That
+writes both files plus a `backup.json` manifest, then **reopens what it just wrote and checks
+it** before reporting success. Confirm an older backup at any time, without restoring it:
+
+```bash
+docker compose run --rm -v "$PWD/backups:/backups" cairn verify /backups/2026-08-10
+docker compose run --rm -v "$PWD/backups:/backups" cairn restore /backups/2026-08-10 /data
+```
+
+`restore` writes only into an empty directory: it refuses if the destination already holds an
+instance, since whoever is running it is usually having a bad enough day already.
+
+### Why not just `cp`
+
+The previous version of this section said to stop the instance and copy the two files, which
+is correct and rests entirely on you remembering the first step. Probing what happens when
+you do not:
+
+| Instance | Result of `cp` on a live `cairn.redb` |
+|---|---|
+| Busy | Unopenable: `Failed to repair database. All roots are corrupted` |
+| Idle | **Opens cleanly, every row present, looks like a perfectly good backup** |
+
+So `cp` is not merely unreliable — it succeeds under exactly the conditions in which you
+*test* your backup procedure, and fails under exactly the conditions in which you *need* it,
+with the failure surfacing at restore time. `cairn-server backup` opens the database instead
+of copying the file, so against a running instance it refuses and says so.
+
+### The two files are one artifact
 
 **Back up both, and keep them together.** A restore that brings back `cairn.redb` without
-`franking.key` used to start cleanly and mint a replacement key, which looked like a working
-instance while every report filed before the restore had silently stopped verifying. The
-server now refuses to start in that state and tells you to restore the key — but that only
-converts silent damage into a visible outage. The backup is still your responsibility.
+`franking.key` used to start cleanly and mint a replacement, which looked like a working
+instance while every report filed before the restore had silently stopped verifying.
 
-If you are upgrading an instance that predates this change, it will hold a `state.json`
+Both halves of that are now refused at startup:
+
+- **Key missing**, database populated → refuses, and tells you to restore the key.
+- **Key present but from a different instance** → refuses. This one used to start perfectly
+  cleanly; the database now records a hash of the key it belongs to, so a separated pair is
+  caught rather than served.
+
+One limit, stated because it is real: an instance that was *already* running on a mismatched
+pair before this change has no record of which key was the right one, so the first start
+after upgrading adopts whatever key it finds. The check protects pairs that meet each other
+from here on.
+
+If you are upgrading an instance that predates the database, it will hold a `state.json`
 instead. That is imported automatically on first start and **left in place**, so a rollback
 to the previous release still finds its data. Nothing to do.
 

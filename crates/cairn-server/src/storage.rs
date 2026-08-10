@@ -73,6 +73,20 @@ pub enum StorageError {
          every abuse report this instance has ever issued"
     )]
     FrankingKeyMissing,
+    /// The database and the key file are from different instances, or different points in
+    /// one instance's life.
+    ///
+    /// Found by probing: [`FrankingKeyMissing`](StorageError::FrankingKeyMissing) covers an
+    /// *absent* key, and a **mismatched** one used to start perfectly cleanly — the
+    /// directory loaded, the instance served traffic, and every report filed before the
+    /// restore silently stopped verifying. That is the same silent damage the missing-key
+    /// check exists to prevent, arriving through the door next to it.
+    #[error(
+        "franking.key does not belong to this database; the two must be restored as a \
+         matched pair. Starting anyway would leave the instance looking healthy while \
+         every abuse report it issued before now silently failed to verify"
+    )]
+    FrankingKeyMismatch,
 }
 
 impl From<RedbError> for StorageError {
@@ -85,6 +99,11 @@ impl From<RedbError> for StorageError {
 const SCHEMA_VERSION: u32 = 1;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// `meta` key holding the hash of the franking key this database belongs to.
+const FRANKING_FINGERPRINT: &str = "franking_fingerprint";
+/// Domain separation, so the stored hash cannot be confused with any other digest of the
+/// same key — the project's length-prefix-everything-signed rule applied to a fingerprint.
+const FINGERPRINT_DOMAIN: &[u8] = b"cairn franking key fingerprint v1\x00";
 const ROOMS: TableDefinition<&str, &[u8]> = TableDefinition::new("rooms");
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 const DEVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("devices");
@@ -106,6 +125,32 @@ const MESSAGES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("mess
 const BLOB_META: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_meta");
 /// Attachment ciphertext. Opaque to the server, which never holds the key.
 const BLOB_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_bytes");
+
+/// Every string-keyed table, so a backup copies all of them.
+///
+/// A list rather than a loop over what happens to exist: adding a table and forgetting it
+/// here produces a backup that restores *almost* everything, which is worse than one that
+/// fails, because the loss is only discovered after the restore.
+/// `every_table_is_included_in_a_backup` guards this.
+const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 10] = [
+    META,
+    ROOMS,
+    ACCOUNTS,
+    DEVICES,
+    INVITES,
+    KEY_PACKAGES,
+    USERNAMES,
+    ROOM_INVITES,
+    BLOB_META,
+    BLOB_BYTES,
+];
+
+/// How much a snapshot copied. Reported so an operator sees a number rather than "done".
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotCounts {
+    pub rows: u64,
+    pub messages: u64,
+}
 
 /// Everything an instance holds except the message log.
 ///
@@ -228,6 +273,47 @@ impl DbStorage {
         self.dir.join("franking.key")
     }
 
+    /// Which franking key this database belongs to, if it has ever recorded one.
+    fn recorded_fingerprint(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let tx = self.db.begin_read().map_err(RedbError::from)?;
+        match tx.open_table(META) {
+            Ok(t) => Ok(t
+                .get(FRANKING_FINGERPRINT)
+                .map_err(RedbError::from)?
+                .map(|v| v.value().to_vec())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(RedbError::from(e).into()),
+        }
+    }
+
+    fn record_fingerprint(&self, fingerprint: &[u8]) -> Result<(), StorageError> {
+        let tx = self.db.begin_write().map_err(RedbError::from)?;
+        {
+            let mut meta = tx.open_table(META).map_err(RedbError::from)?;
+            meta.insert(FRANKING_FINGERPRINT, fingerprint).map_err(RedbError::from)?;
+        }
+        tx.commit().map_err(RedbError::from)?;
+        Ok(())
+    }
+
+    /// Bind a database to its franking key without storing the key inside it.
+    ///
+    /// A hash rather than the key itself, because the point of keeping the key in a
+    /// separate file is that a leaked database does not hand over the ability to forge
+    /// tags — writing the key into `meta` would undo exactly that. The key is 32 random
+    /// bytes, so its hash is not open to a dictionary attack the way a password's would be.
+    pub fn fingerprint_of(key: &ServerFrankingKey) -> Vec<u8> {
+        Self::fingerprint(key)
+    }
+
+    fn fingerprint(key: &ServerFrankingKey) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(FINGERPRINT_DOMAIN);
+        hasher.update(key.to_bytes());
+        hasher.finalize().to_vec()
+    }
+
     /// Has anyone used this instance?
     ///
     /// Accounts and rooms rather than messages: an instance can hold accounts and no
@@ -247,6 +333,70 @@ impl DbStorage {
             }
         }
         Ok(false)
+    }
+
+    /// Copy every table into a fresh database at `dest`, as of one instant.
+    ///
+    /// A *logical* copy, taken inside a single read transaction, rather than a copy of the
+    /// file. Probing established why that distinction is the whole feature: copying
+    /// `cairn.redb` out from under a running instance produces a file that opens perfectly
+    /// on an idle instance and **cannot be opened at all** on a busy one, so the documented
+    /// `cp` works exactly when an operator tests it and fails exactly when they need it.
+    ///
+    /// redb's MVCC gives this transaction a consistent view, so the snapshot is a real
+    /// point in time — writes that land while it runs are simply not in it, which is what a
+    /// backup should be.
+    pub fn snapshot_into(&self, dest: &Path) -> Result<SnapshotCounts, StorageError> {
+        let tx = self.db.begin_read().map_err(RedbError::from)?;
+        let out = Database::create(dest).map_err(RedbError::from)?;
+        let wtx = out.begin_write().map_err(RedbError::from)?;
+        let mut counts = SnapshotCounts::default();
+
+        {
+            for table in STRING_KEYED_TABLES {
+                let mut dst = wtx.open_table(table).map_err(RedbError::from)?;
+                match tx.open_table(table) {
+                    Ok(src) => {
+                        for entry in src.iter().map_err(RedbError::from)? {
+                            let (k, v) = entry.map_err(RedbError::from)?;
+                            dst.insert(k.value(), v.value()).map_err(RedbError::from)?;
+                            counts.rows += 1;
+                        }
+                    }
+                    // A table nobody has written yet is an unused feature, not a failure.
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(e) => return Err(RedbError::from(e).into()),
+                }
+            }
+
+            // Messages are keyed by `(room, seq)` rather than by a string, so they do not
+            // fit the loop above.
+            let mut dst = wtx.open_table(MESSAGES).map_err(RedbError::from)?;
+            match tx.open_table(MESSAGES) {
+                Ok(src) => {
+                    for entry in src.iter().map_err(RedbError::from)? {
+                        let (k, v) = entry.map_err(RedbError::from)?;
+                        let (room, seq) = k.value();
+                        dst.insert((room, seq), v.value()).map_err(RedbError::from)?;
+                        counts.messages += 1;
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(RedbError::from(e).into()),
+            }
+        }
+
+        wtx.commit().map_err(RedbError::from)?;
+        Ok(counts)
+    }
+
+    /// The franking key's fingerprint, for a manifest that has to bind the pair together.
+    pub fn franking_fingerprint(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        self.recorded_fingerprint()
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Write via a temporary file and rename.
@@ -360,7 +510,33 @@ impl Storage for DbStorage {
                 let parsed: KeyFile = serde_json::from_str(&contents)?;
                 let bytes = hex::decode(&parsed.franking_key).map_err(|_| StorageError::BadKey)?;
                 let bytes: [u8; 32] = bytes.try_into().map_err(|_| StorageError::BadKey)?;
-                Ok(ServerFrankingKey::from_bytes(bytes))
+                let key = ServerFrankingKey::from_bytes(bytes);
+
+                // Is this the key this database was built with? Probing found that a
+                // *mismatched* pair started cleanly and served traffic while every report
+                // filed beforehand silently stopped verifying — the missing-key check above
+                // only ever covered an absent file.
+                let expected = Self::fingerprint(&key);
+                match self.recorded_fingerprint()? {
+                    Some(recorded) => {
+                        use subtle::ConstantTimeEq;
+                        let matches = recorded.len() == expected.len()
+                            && bool::from(recorded.ct_eq(&expected));
+                        if !matches {
+                            return Err(StorageError::FrankingKeyMismatch);
+                        }
+                    }
+                    // No fingerprint recorded: either a database this build has not seen
+                    // before, or one written by a build that predates the check. Adopt the
+                    // key it is sitting beside, since there is nothing to compare against.
+                    //
+                    // Stated plainly because it is a real limit: an operator who restored a
+                    // mismatched pair *before* upgrading is not protected retroactively —
+                    // this build would record the wrong key as the right one. Only pairs
+                    // that meet each other after the upgrade are checked.
+                    None => self.record_fingerprint(&expected)?,
+                }
+                Ok(key)
             }
             // Only a genuinely absent file justifies minting a new key. Any other error —
             // permissions, a corrupt file, a full disk — must surface, because silently
@@ -378,6 +554,7 @@ impl Storage for DbStorage {
                 let key = ServerFrankingKey::generate();
                 let file = KeyFile { franking_key: hex::encode(key.to_bytes()) };
                 Self::write_atomic(&path, serde_json::to_string(&file)?.as_bytes(), true)?;
+                self.record_fingerprint(&Self::fingerprint(&key))?;
                 Ok(key)
             }
             Err(e) => Err(e.into()),
@@ -716,6 +893,7 @@ impl DbStorage {
 mod tests {
     use super::*;
     use cairn_proto::{Envelope, EnvelopePayload, RoomSeal, RoomShape, Tier};
+    use redb::TableHandle;
 
     fn dm_shape() -> RoomShape {
         RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 }
@@ -744,6 +922,41 @@ mod tests {
         }
     }
 
+    /// Write one row into every table, so a test can ask what a full instance looks like.
+    fn populate_every_table(storage: &DbStorage) {
+        let room_id = RoomId::new();
+        let user = UserId::new();
+        let device = DeviceId::new();
+        let blob = BlobId::new();
+        storage
+            .commit(&[
+                Write::Room(room_id, Room::for_test(RoomSeal::new(dm_shape()).unwrap())),
+                Write::Account(user, AccountRecord { devices: vec![device] }),
+                Write::Device(device, DeviceRecord { user, public_key: "ab".into() }),
+                Write::Invite("tok".into(), InviteRecord { used_by: None, expires_at_ms: None }),
+                Write::KeyPackages(device, VecDeque::from(vec!["cd".to_string()])),
+                Write::Policy(RegistrationPolicy::Open),
+                Write::Username(Username::parse("alice").unwrap(), user),
+                Write::RoomInvite(
+                    "hash".into(),
+                    RoomInviteRecord {
+                        room: room_id,
+                        created_by: user,
+                        uses_remaining: 1,
+                        expires_at_ms: None,
+                        revoked: false,
+                    },
+                ),
+                Write::Blob(
+                    blob,
+                    BlobRecord { room: room_id, uploader: user, size: 3 },
+                    vec![1, 2, 3],
+                ),
+                Write::Message(room_id, message(1)),
+            ])
+            .unwrap();
+    }
+
     #[test]
     fn franking_key_survives_a_restart() {
         // The property this module exists for. A different key after restart means every
@@ -752,6 +965,100 @@ mod tests {
         let first = DbStorage::new(&dir).unwrap().load_or_create_franking_key().unwrap();
         let second = DbStorage::new(&dir).unwrap().load_or_create_franking_key().unwrap();
         assert_eq!(first.to_bytes(), second.to_bytes());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mismatched_franking_key_is_refused_rather_than_quietly_voiding_every_report() {
+        // Regression test for a hole found by probing. `FrankingKeyMissing` covered an
+        // *absent* key; a **wrong** one — the other half of "restore the two files as a
+        // matched pair" — started perfectly cleanly. The probe printed:
+        //
+        //     RESULT: the instance STARTS CLEANLY with a mismatched key
+        //       the report filed yesterday now verifies: false
+        //       and the rest of the instance loads fine: true
+        //
+        // An instance that looks healthy while its entire moderation history has silently
+        // stopped verifying is the exact failure the missing-key check exists to prevent.
+        let dir = temp_dir("mismatch");
+        let storage = DbStorage::new(&dir).unwrap();
+        storage.load_or_create_franking_key().unwrap();
+
+        let other = ServerFrankingKey::generate();
+        fs::write(
+            dir.join("franking.key"),
+            serde_json::to_string(&KeyFile { franking_key: hex::encode(other.to_bytes()) })
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            storage.load_or_create_franking_key(),
+            Err(StorageError::FrankingKeyMismatch)
+        ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_right_key_still_opens_after_a_restart() {
+        // Counterfactual for the test above: a check that refused every key would also pass
+        // it, and would brick every instance in existence.
+        let dir = temp_dir("rightkey");
+        let first = DbStorage::new(&dir).unwrap().load_or_create_franking_key().unwrap();
+        let second = DbStorage::new(&dir).unwrap().load_or_create_franking_key().unwrap();
+        assert_eq!(first.to_bytes(), second.to_bytes());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_key_itself_is_never_written_into_the_database() {
+        // The fingerprint binds the pair, and keeping the key in a separate file is what
+        // makes a leaked database unable to forge tags. Writing the key into `meta` to
+        // implement the check would have quietly undone that.
+        let dir = temp_dir("nokey");
+        let storage = DbStorage::new(&dir).unwrap();
+        let key = storage.load_or_create_franking_key().unwrap();
+        drop(storage);
+
+        let raw = fs::read(dir.join("cairn.redb")).unwrap();
+        let secret = key.to_bytes();
+        assert!(
+            !raw.windows(secret.len()).any(|w| w == secret),
+            "the franking key must not appear in the database file"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_table_is_included_in_a_backup() {
+        // A table added later and forgotten here would produce a backup that restores
+        // *almost* everything — and the loss would only be discovered after a restore, when
+        // the original is already gone. Asks redb what tables actually exist rather than
+        // trusting the list to have been maintained.
+        let dir = temp_dir("tables");
+        let storage = DbStorage::new(&dir).unwrap();
+        storage.load_or_create_franking_key().unwrap();
+        populate_every_table(&storage);
+
+        let tx = storage.db.begin_read().unwrap();
+        let existing: Vec<String> =
+            tx.list_tables().unwrap().map(|t| t.name().to_string()).collect();
+        drop(tx);
+
+        let covered: Vec<String> = STRING_KEYED_TABLES
+            .iter()
+            .map(|t| t.name().to_string())
+            .chain(std::iter::once(MESSAGES.name().to_string()))
+            .collect();
+
+        for table in &existing {
+            assert!(
+                covered.contains(table),
+                "table `{table}` exists but is not copied by a backup; add it to \
+                 STRING_KEYED_TABLES or handle it in snapshot_into"
+            );
+        }
+        assert!(existing.len() >= covered.len(), "populate_every_table missed a table");
         fs::remove_dir_all(&dir).ok();
     }
 
