@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use cairn_crypto::attachment::AttachmentKey;
 use cairn_crypto::franking::{self, Commitment, Opening};
 use cairn_crypto::mls::{GroupEvent, GroupHandle, GroupMember, MlsError, Session};
-use cairn_proto::{DeviceId, Envelope, EnvelopePayload, RoomId, RoomSeal, Tier, UserId};
+use cairn_proto::{BlobId, DeviceId, Envelope, EnvelopePayload, RoomId, RoomSeal, Tier, UserId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConversationError {
@@ -230,6 +231,31 @@ impl Conversation {
         card: Option<crate::embed::Card>,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(plaintext, card, None, now_ms)
+    }
+
+    /// Send with an attachment the caller has already sealed and uploaded.
+    ///
+    /// Sealing and uploading are deliberately *not* done here. This type holds the group
+    /// keys and has no transport, and giving it one so it could upload would put a network
+    /// call inside the encryption path — where a failure would leave the caller unable to
+    /// tell whether the message was sent.
+    pub fn send_with_attachment(
+        &mut self,
+        plaintext: &[u8],
+        attachment: Attachment,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(plaintext, None, Some(attachment), now_ms)
+    }
+
+    fn send_with(
+        &mut self,
+        plaintext: &[u8],
+        card: Option<crate::embed::Card>,
+        attachment: Option<Attachment>,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
         let tier = self.seal.tier();
         if !tier.is_e2ee() {
             return Err(ConversationError::NotEncrypted);
@@ -246,6 +272,7 @@ impl Conversation {
             body: plaintext.to_vec(),
             opening: opening.clone(),
             card: card.map(crate::embed::Card::clamp),
+            attachment,
         };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
@@ -332,6 +359,9 @@ impl Conversation {
                 body: body.clone().into_bytes(),
                 franking: None,
                 card: None,
+                // A T3 plaintext message carries no attachment: there is no encrypted body
+                // to put the key in, and a key beside the ciphertext protects nothing.
+                attachment: None,
             })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
@@ -368,6 +398,7 @@ impl Conversation {
                     // Clamped again on receipt. These bytes came from the sender, so the
                     // limits are a defence against a hostile one, not tidiness.
                     card: inner.card.map(crate::embed::Card::clamp),
+                    attachment: inner.attachment.map(Box::new),
                 }))
             }
         }
@@ -395,6 +426,25 @@ pub fn accept_welcome(
     Ok(Some(session.join(&parsed)?))
 }
 
+/// An attachment the sender uploaded, and everything needed to open it.
+///
+/// Travels **inside** the encrypted body, exactly like [`Opening`] and the link card, and
+/// for the same reason: the server stores the sealed bytes and must not hold the key that
+/// opens them. It also never learns which blob belongs to which message — the blob id is in
+/// here too, so an instance cannot even correlate an upload with the message that referred
+/// to it beyond what the upload itself revealed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub blob: BlobId,
+    /// Single-use, generated per attachment by [`cairn_crypto::attachment::seal`].
+    pub key: AttachmentKey,
+    /// The sender's claimed filename. **Chosen by the sender**, like everything else in a
+    /// message — a client must treat it as a label to display, never as a path to write to.
+    pub name: String,
+    /// Plaintext length, for a progress indicator before the bytes arrive.
+    pub size: usize,
+}
+
 /// What actually gets encrypted: the message and its franking opening.
 #[derive(Debug, Serialize, Deserialize)]
 struct InnerBody {
@@ -407,6 +457,9 @@ struct InnerBody {
     /// that predates cards still decodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     card: Option<crate::embed::Card>,
+    /// `default` so a message from a client that predates attachments still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachment: Option<Attachment>,
 }
 
 /// What an incoming envelope turned out to be.
@@ -458,6 +511,12 @@ pub struct ReceivedMessage {
     /// the URL visible, and derives no trust signal from its contents. It must not fetch
     /// anything to display it — see [`crate::embed`].
     pub card: Option<crate::embed::Card>,
+    /// The sender's attachment, if they sent one. Fetch the blob and open it with the key
+    /// inside; both came from the encrypted body, so the server supplied neither.
+    ///
+    /// Boxed to keep [`TimelineEvent`]'s variants a similar size — a message carrying an
+    /// attachment descriptor would otherwise make every membership event pay for it.
+    pub attachment: Option<Box<Attachment>>,
     /// Present for E2EE messages. A recipient must retain this to file a report; without
     /// it the message is unreportable.
     pub franking: Option<ReceivedFranking>,
@@ -790,5 +849,101 @@ mod tests {
         let env = convo.send_plaintext("hello world", 5).unwrap();
         assert!(!env.payload.is_opaque_to_server());
         assert_eq!(env.franking_commitment, None);
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use cairn_proto::RoomShape;
+
+    fn dm_seal() -> RoomSeal {
+        RoomSeal::new(RoomShape {
+            is_direct: true,
+            is_publicly_discoverable: false,
+            member_ceiling: 2,
+        })
+        .unwrap()
+    }
+
+    fn convo() -> Conversation {
+        Conversation::create_encrypted(
+            dm_seal(),
+            RoomId::new(),
+            UserId::new(),
+            DeviceId::new(),
+            Arc::new(Session::new(b"alice").unwrap()),
+        )
+        .unwrap()
+    }
+
+    fn descriptor() -> (Attachment, Vec<u8>, Vec<u8>) {
+        let plaintext = b"the contents of a private file".to_vec();
+        let (key, sealed) = cairn_crypto::attachment::seal(&plaintext);
+        let attachment = Attachment {
+            blob: BlobId::new(),
+            key,
+            name: "notes.txt".into(),
+            size: plaintext.len(),
+        };
+        (attachment, plaintext, sealed)
+    }
+
+    #[test]
+    fn the_attachment_key_never_appears_outside_the_ciphertext() {
+        // The property that makes the blob store worth anything. If the key is anywhere in
+        // the envelope the server receives, the server can open every attachment it holds
+        // and the encryption is theatre.
+        let mut alice = convo();
+        let (attachment, _plaintext, _sealed) = descriptor();
+
+        // Exactly the bytes the key would serialize to, so this compares like for like.
+        let key_json = serde_json::to_string(&attachment.key).unwrap();
+        let key_hex = key_json.trim_matches('"').to_string();
+        assert_eq!(key_hex.len(), 64, "a 32-byte key should serialize as 64 hex chars");
+
+        let out = alice.send_with_attachment(b"attached", attachment, 0).unwrap();
+        let wire = serde_json::to_string(&out.envelope).unwrap();
+
+        assert!(
+            !wire.contains(&key_hex),
+            "the attachment key must never appear in the envelope the server sees"
+        );
+    }
+
+    #[test]
+    fn the_descriptor_survives_the_encrypted_body_encoding() {
+        // The body is JSON inside the MLS ciphertext, so a field that fails to encode would
+        // silently drop the attachment rather than fail the send.
+        let (attachment, plaintext, sealed) = descriptor();
+        let blob = attachment.blob;
+        let inner = InnerBody {
+            body: b"here is that file".to_vec(),
+            opening: cairn_crypto::franking::Opening::generate(),
+            card: None,
+            attachment: Some(attachment),
+        };
+
+        let encoded = serde_json::to_vec(&inner).unwrap();
+        let decoded: InnerBody = serde_json::from_slice(&encoded).unwrap();
+
+        let got = decoded.attachment.expect("the attachment must survive encoding");
+        assert_eq!(got.blob, blob);
+        assert_eq!(got.name, "notes.txt");
+        // The key that came back out opens the bytes the server was holding.
+        assert_eq!(cairn_crypto::attachment::open(&got.key, &sealed).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn a_body_from_a_client_that_predates_attachments_still_decodes() {
+        // `serde(default)` is load-bearing: without it every older client's messages become
+        // undecodable the moment this field ships, which looks like data loss to the user.
+        let older = serde_json::json!({
+            "body": b"no attachment here".to_vec(),
+            "opening": cairn_crypto::franking::Opening::generate(),
+        });
+        let decoded: InnerBody = serde_json::from_value(older).unwrap();
+        assert!(decoded.attachment.is_none());
+        assert_eq!(decoded.body, b"no attachment here");
     }
 }

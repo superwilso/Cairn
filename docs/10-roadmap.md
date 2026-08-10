@@ -122,8 +122,11 @@ metadata, and these would broadcast it continuously rather than per message.
 blocked most of this list is gone: media, voice notes and history sit behind attachments,
 and attachments sat behind the storage rewrite. **Attachments are now half-built**: the server side landed — ciphertext blobs stored against
 a room, membership checked on upload and on fetch — and the encryption alongside it
-(`cairn_crypto::attachment`). What remains is the client plumbing: putting the key into the
-encrypted message body and offering a file to send.
+(`cairn_crypto::attachment`). The key now travels inside the
+encrypted body (`Conversation::send_with_attachment`), with a test asserting it never
+appears in the envelope the server sees. What remains is transport: `Transport::send` takes
+a `&str` body, so uploading bytes needs that seam widened — and a file picker in a client
+that has no UI yet.
 Usernames and disappearing messages remain the two items that can proceed in parallel,
 since neither needs attachments.
 
