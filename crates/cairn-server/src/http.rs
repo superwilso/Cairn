@@ -7,7 +7,7 @@
 //! `docs/03-protocol-evaluation.md`. It exists so the vertical slice is exercisable
 //! end to end.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -33,6 +33,21 @@ pub fn router(instance: SharedInstance) -> Router {
         .route("/v1/rooms/{room}/join", post(join_room))
         .route("/v1/devices/{device}/key-packages", post(publish_key_packages))
         .route("/v1/users/{user}/key-packages", post(claim_key_packages))
+        // The framework's default body limit is 2 MiB, which sat in front of the instance's
+        // own ceiling and rejected a 5 MiB upload before `store_blob` ever ran — so
+        // `MAX_BLOB_BYTES` was decorative and an operator raising it would have seen no
+        // effect. Found by a test that uploaded a large-but-permitted attachment; the
+        // undersized-rejection half alone would have passed against the broken behaviour.
+        //
+        // Set just above the instance's ceiling, so anything an operator would call
+        // "too large" is refused by `state.rs` with the reason, while a genuinely enormous
+        // body is still cut off before it is buffered.
+        .route(
+            "/v1/rooms/{room}/blobs",
+            post(upload_blob)
+                .layer(DefaultBodyLimit::max(crate::state::MAX_BLOB_BYTES + 64 * 1024)),
+        )
+        .route("/v1/blobs/{blob}", get(download_blob))
         .route("/v1/reports", post(submit_report))
         .with_state(instance)
 }
@@ -60,6 +75,11 @@ impl IntoResponse for ServerError {
             }
             ServerError::NoSuchAccount => StatusCode::NOT_FOUND,
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            ServerError::NoSuchBlob => StatusCode::NOT_FOUND,
+            // 413 rather than 400: the request was well-formed, the instance just will not
+            // hold something this big. An operator raising the ceiling changes the answer.
+            ServerError::BlobTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::BlobEmpty => StatusCode::BAD_REQUEST,
             // Authorization failures on device linking. Distinguishable because an honest
             // client needs to know which of its inputs was wrong, and an attacker already
             // knows what they forged.
@@ -305,6 +325,40 @@ async fn claim_key_packages(
             .map(|(device, key_package)| ClaimedKeyPackage { device, key_package })
             .collect(),
     ))
+}
+
+#[derive(Serialize)]
+struct UploadedBlob {
+    blob: String,
+}
+
+/// Store an encrypted attachment. The body is raw ciphertext.
+///
+/// Deliberately not JSON: base64 in a JSON envelope would inflate every attachment by a
+/// third for no benefit, and the server has no reason to parse bytes it cannot read.
+async fn upload_blob(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<UploadedBlob>), ServerError> {
+    let room = cairn_proto::RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "upload_blob", Some(room.into()))?;
+    let id = instance.store_blob(actor, room, body.to_vec())?;
+    Ok((StatusCode::CREATED, Json(UploadedBlob { blob: id.to_string() })))
+}
+
+/// Fetch an encrypted attachment, for a member of the room it belongs to.
+async fn download_blob(
+    State(instance): State<SharedInstance>,
+    Path(blob): Path<uuid::Uuid>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, [(axum::http::header::HeaderName, &'static str); 1], Vec<u8>), ServerError>
+{
+    let blob = cairn_proto::BlobId::from_uuid(blob);
+    let actor = signed_actor(&instance, &headers, "download_blob", Some(blob.into()))?;
+    let bytes = instance.fetch_blob(actor, blob)?;
+    Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
 }
 
 fn now_ms() -> i64 {

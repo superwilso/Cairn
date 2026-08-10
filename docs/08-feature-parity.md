@@ -73,11 +73,18 @@ question in `01-threat-model.md` §10.
 
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
-| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
+| Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ server side done |
 | GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 | Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
 | Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |
 | Large file limits | ⚠️ paywalled | ⚠️ | ⚠️ 2 GB | ⚠️ | ✅ 2 GB free | 🎯 operator-set |
+
+**Attachments exist server-side**: a client uploads ciphertext to a room, the server stores
+bytes it cannot read, and any member of that room may fetch them. Membership is checked on
+upload *and* on fetch, and evaluated at fetch time — so removing someone revokes their access
+to the room's attachments rather than leaving them a permanent read channel. What is still
+owed is the client half: encrypting the file and carrying the key inside the encrypted
+message body.
 
 Link previews are where Cairn does something none of them do — see
 [`05-embeds.md`](05-embeds.md). Signal does the unauthenticated version; the authenticated
