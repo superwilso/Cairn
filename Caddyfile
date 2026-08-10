@@ -1,0 +1,30 @@
+# TLS termination for a Cairn instance.
+#
+# Caddy obtains and renews a certificate automatically, which is the entire reason it is
+# here: `docs/01-threat-model.md` gives A1 and A2 — network observers and active network
+# attackers — to the transport. MLS protects message *bodies* regardless, but without TLS
+# every request, every user id, and every membership change is in the clear and modifiable.
+{$CAIRN_DOMAIN} {
+	# `cairn` is the compose service name, resolved on the internal network. This hop is
+	# plaintext and that is fine: it never leaves the Docker network.
+	reverse_proxy cairn:8080
+
+	encode gzip
+
+	header {
+		# This is an API, not a web app, but these cost nothing and a future admin UI
+		# would want them already in place.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Access logs record who connected and when. That is exactly the metadata
+	# `01-threat-model.md` §3 concedes an operator can see — so it is a deliberate choice,
+	# not an oversight, and an operator who does not want to hold it should comment this out.
+	log {
+		output stdout
+		format console
+	}
+}

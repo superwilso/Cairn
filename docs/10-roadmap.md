@@ -80,12 +80,23 @@ work, which the same exit condition depends on.
 
 **Goal:** the owner runs an instance and a handful of people use it for real.
 
-- [ ] Self-hosting guide, honest about what is not ready
-- [ ] Docker image and compose file
-- [ ] TLS guidance — the server has no transport security of its own
-- [ ] Invite flow that a non-technical person can follow — **M2's exit condition depends
-      on this**, not just M3's: today a joiner is handed a room id out of band and added by
-      user id
+- [x] **Self-hosting guide**, honest about what is not ready — `docs/11-self-hosting.md`,
+      with a "What is not ready" section split into what bites a small deployment and what
+      is structural.
+- [x] **Docker image and compose file.** Multi-stage build pinned to the MSRV floor,
+      unprivileged user, `--locked`. The image could not be built in the authoring
+      environment (no Docker daemon), but the Dockerfile's exact file set was verified to
+      build with `--locked` from a clean copy.
+- [x] **TLS guidance.** Caddy in the compose file terminates TLS and obtains certificates;
+      `cairn` has **no published port**, so the plaintext server is unreachable from
+      outside the Docker network. §3 of the guide explains why this is not optional: MLS
+      covers message bodies, and A1/A2 belong to the transport.
+- [x] **Registration invites work end to end.** `cairn-cli chat --invite <token>`. The
+      client claims once and records it, because the server checks the invite *before* it
+      notices the account already exists — without that, a returning user is locked out of
+      their own account.
+- [ ] **Room invite links** — a joiner is still handed a room id and a user id by hand.
+      **M2's exit condition depends on this**, not just M3's.
 - [ ] Backup and restore, including **the franking key**: losing it invalidates every
       report the instance ever issued
 - [ ] Rate limiting on registration and sending

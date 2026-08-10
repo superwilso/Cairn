@@ -56,6 +56,11 @@ pub struct Options {
     pub server: String,
     pub dir: std::path::PathBuf,
     pub name: String,
+    /// Registration invite, for an instance that is not open.
+    ///
+    /// Needed on first run only — once the account is claimed the token is spent, and a
+    /// later run finds the account already claimed and carries on without one.
+    pub invite: Option<String>,
 }
 
 impl Options {
@@ -64,12 +69,14 @@ impl Options {
         let mut server = "http://127.0.0.1:8080".to_string();
         let mut dir = None;
         let mut name = None;
+        let mut invite = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--server" => server = args.next().ok_or("--server needs a URL")?,
                 "--dir" => dir = Some(args.next().ok_or("--dir needs a path")?),
                 "--name" => name = Some(args.next().ok_or("--name needs a name")?),
+                "--invite" => invite = Some(args.next().ok_or("--invite needs a token")?),
                 other => return Err(format!("unknown argument {other}").into()),
             }
         }
@@ -79,7 +86,7 @@ impl Options {
             || std::env::temp_dir().join("cairn").join(&name),
             std::path::PathBuf::from,
         );
-        Ok(Self { server, dir, name })
+        Ok(Self { server, dir, name, invite })
     }
 }
 
@@ -112,7 +119,7 @@ pub fn run(options: Options) -> Fallible<()> {
 
     // Identity is per-directory, so a returning user must reuse their ids. Storing them
     // beside the group index keeps "who am I" and "what have I joined" in one place.
-    let (user, device) = load_or_create_identity(&options.dir)?;
+    let (user, device, already_claimed) = load_or_create_identity(&options.dir)?;
     let client = Client::new(transport, session.clone(), user, device);
 
     let mut app = App {
@@ -125,13 +132,28 @@ pub fn run(options: Options) -> Fallible<()> {
         tls,
     };
 
-    // Claiming is idempotent from the user's point of view: a second run finds the account
-    // already claimed and carries on. Only a genuinely different failure is worth showing.
-    if let Err(e) = app.client.claim_account(None) {
-        let text = e.to_string();
-        if !text.contains("already") {
-            eprintln!("could not claim an account on {}: {e}", options.server);
-            return Err(e.into());
+    // Claim exactly once, ever, and record it locally.
+    //
+    // Not an optimisation. On an invite-only instance the server checks the invite before
+    // it notices the account is already claimed, so a returning user re-running this gets
+    // `401 registration requires an invite` and cannot get back into their own account.
+    // Found by running it: the first version classified errors by substring, and the
+    // server's rejection of a *spent* invite ("invite is unknown, already used, or
+    // expired") contains the word "already" — so a spent token was read as "you are
+    // already registered" and the client carried on with no account at all.
+    if !already_claimed {
+        match app.client.claim_account(options.invite.as_deref()) {
+            Ok(()) => mark_claimed(&options.dir, user, device)?,
+            Err(e) => {
+                eprintln!("Could not register on {}: {e}", options.server);
+                if options.invite.is_none() {
+                    eprintln!(
+                        "\nIf this instance is invite-only, ask its operator for a token and \n\
+                         pass it with --invite <token>. Tokens are single-use."
+                    );
+                }
+                return Err(e.into());
+            }
         }
     }
 
@@ -176,13 +198,14 @@ pub fn run(options: Options) -> Fallible<()> {
 /// Kept next to the MLS state rather than derived from the name: a user id is claimed
 /// once, and regenerating one each run would silently create a new account every time and
 /// strand every room the old one was in.
-fn load_or_create_identity(dir: &std::path::Path) -> Fallible<(UserId, DeviceId)> {
+fn load_or_create_identity(dir: &std::path::Path) -> Fallible<(UserId, DeviceId, bool)> {
     let path = dir.join("identity.json");
     if let Ok(bytes) = std::fs::read(&path) {
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let user: UserId = serde_json::from_value(value["user"].clone())?;
         let device: DeviceId = serde_json::from_value(value["device"].clone())?;
-        return Ok((user, device));
+        let claimed = value["claimed"].as_bool().unwrap_or(false);
+        return Ok((user, device, claimed));
     }
 
     let (user, device) = (UserId::new(), DeviceId::new());
@@ -191,7 +214,18 @@ fn load_or_create_identity(dir: &std::path::Path) -> Fallible<(UserId, DeviceId)
         &path,
         serde_json::to_vec_pretty(&serde_json::json!({ "user": user, "device": device }))?,
     )?;
-    Ok((user, device))
+    Ok((user, device, false))
+}
+
+/// Remember that this account exists on the instance, so it is never claimed twice.
+fn mark_claimed(dir: &std::path::Path, user: UserId, device: DeviceId) -> Fallible<()> {
+    std::fs::write(
+        dir.join("identity.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({ "user": user, "device": device, "claimed": true }),
+        )?,
+    )?;
+    Ok(())
 }
 
 fn help() {

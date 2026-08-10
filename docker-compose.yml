@@ -1,0 +1,49 @@
+# A Cairn instance with TLS, for a small self-hosted deployment.
+#
+# The server terminates no TLS of its own and is not safe to expose directly, so this
+# publishes **only** Caddy. `cairn` has no `ports:` on purpose — it is reachable on the
+# internal network and nowhere else. Adding a `ports:` line to it would put a plaintext,
+# unauthenticated HTTP server on the public internet.
+#
+# See docs/11-self-hosting.md. Set CAIRN_DOMAIN and CAIRN_INVITES in a `.env` beside this
+# file before `docker compose up -d`.
+
+services:
+  cairn:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Invite-only by default. Open registration lets anyone claim any unused user id,
+      # including one a friend was about to take.
+      CAIRN_REGISTRATION_POLICY: invite_only
+      # Comma-separated, minted at boot. There is no admin API yet, so this is how an
+      # operator hands out access. Re-minted on every restart, so treat a spent token as
+      # spent regardless of what the server says after a reboot.
+      CAIRN_INVITES: ${CAIRN_INVITES:?set CAIRN_INVITES in .env, e.g. a couple of long random strings}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Holds the franking key. Losing it invalidates every report the instance ever
+      # issued, so this is the thing to back up.
+      - cairn-data:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CAIRN_DOMAIN: ${CAIRN_DOMAIN:?set CAIRN_DOMAIN in .env, e.g. cairn.example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account keys. Without this volume every restart re-issues,
+      # and Let's Encrypt rate-limits that.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - cairn
+
+volumes:
+  cairn-data:
+  caddy-data:
+  caddy-config:

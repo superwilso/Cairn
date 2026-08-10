@@ -117,8 +117,16 @@ real link always visible, because a card rendered on the sender's device is exac
 trustworthy as the sender (`docs/05-embeds.md` §3). Text only for now; images wait on
 attachments.
 
-**Not yet an invite flow:** the room id and user id still have to be passed between people
-by hand. See M3 in [the roadmap](docs/10-roadmap.md).
+### Running it for real
+
+`docker compose up -d --build` behind a domain gets you an invite-only instance with
+automatic TLS. **[docs/11-self-hosting.md](docs/11-self-hosting.md)** walks through it and
+is blunt about what is not ready — read that section before putting anyone's real
+conversations on it.
+
+**Not yet a room invite link:** a friend registers with an invite token, but room ids and
+user ids still have to be passed between people by hand. See M3 in
+[the roadmap](docs/10-roadmap.md).
 
 ## Documentation
 
