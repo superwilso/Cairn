@@ -78,6 +78,12 @@ struct CreateRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct RoomMemberEntryResponse {
+    user: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
 struct MintedInviteResponse {
     token: String,
 }
@@ -229,6 +235,28 @@ impl<T: Transport> Client<T> {
         body: Option<crate::transport::RequestBody<'_>>,
     ) -> Result<Response, ClientError> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
+    }
+
+    /// The room's server-side membership.
+    ///
+    /// **Not the MLS roster.** The two diverge whenever someone joins by invite: the server
+    /// admits them at once, and the encrypted group gains them only when a member commits an
+    /// Add. A caller that conflated the two would show a user as present in a conversation
+    /// they cannot actually read.
+    pub fn room_members(&self, room: RoomId) -> Result<Vec<(UserId, String)>, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/rooms/{}/members", room.as_uuid()),
+            &self.auth("list_room_members", Some(room.into()))?,
+            None,
+        )?;
+        let parsed: Vec<RoomMemberEntryResponse> = serde_json::from_slice(&response.body)?;
+        parsed
+            .into_iter()
+            .map(|m| {
+                m.user.parse().map(|u| (u, m.role)).map_err(|_| ClientError::Malformed("user id"))
+            })
+            .collect()
     }
 
     /// Mint an invite for a room. The token comes back once and is not recoverable.

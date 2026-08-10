@@ -660,12 +660,19 @@ impl Instance {
         if actor_role < RoomRole::Moderator {
             return Err(ServerError::InsufficientRole);
         }
+        // Already a member: nothing to do, and crucially *not* an error. The ceiling used to
+        // be checked first, which meant re-adding an existing member of a full room failed
+        // with RoomFull — and after invite redemption that is the normal case, because the
+        // joiner is already a server-side member and a DM at its ceiling of 2 is full. It
+        // made invite-then-add fail for exactly the situation invites exist for. Found by
+        // running the flow, not by reading the check.
+        if r.has_member(new_member) {
+            return Ok(());
+        }
         if r.members.len() as u32 >= r.seal.member_ceiling() {
             return Err(ServerError::RoomFull);
         }
-        if !r.has_member(new_member) {
-            r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
-        }
+        r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
         let updated = r.clone();
         drop(rooms);
         self.write(&[Write::Room(room, updated)])
@@ -735,6 +742,26 @@ impl Instance {
         let updated = r.clone();
         drop(rooms);
         self.write(&[Write::Room(room, updated)])
+    }
+
+    /// The room's server-side membership, for a member.
+    ///
+    /// This is the *server's* view — who may read and write — which is not the same as the
+    /// MLS group's roster. The two diverge whenever someone joins by invite: the server
+    /// admits them immediately, and the encrypted group only gains them when an existing
+    /// member commits an Add. A client showing one and calling it the other would be
+    /// telling a user they are talking to someone who cannot hear them.
+    pub fn room_members(
+        &self,
+        room: RoomId,
+        actor: UserId,
+    ) -> Result<Vec<RoomMember>, ServerError> {
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+        if !r.has_member(actor) {
+            return Err(ServerError::NotAMember);
+        }
+        Ok(r.members.clone())
     }
 
     /// An account's role in a room, if any.
@@ -3024,5 +3051,51 @@ mod room_invites {
             "a restart must not resurrect a spent invite"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod add_after_invite {
+    use super::tests::*;
+    use super::*;
+
+    #[test]
+    fn adding_someone_who_joined_by_invite_is_not_room_full() {
+        // The regression this defends. After redeeming an invite the joiner is already a
+        // server-side member, so a DM at its ceiling of 2 is full — and the ceiling check
+        // ran first, so the member's own client could never complete the MLS add. Invites
+        // were useless for the case they exist for, and every unit test passed.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let shape =
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 };
+        let (room, _) = inst.create_room(shape, alice.user).unwrap();
+
+        let token = inst.create_room_invite(alice.user, room, 1, None).unwrap();
+        inst.redeem_room_invite(bob.user, &token, 0).unwrap();
+
+        assert!(
+            inst.add_room_member(room, alice.user, bob.user).is_ok(),
+            "re-adding an existing member of a full room must be a no-op, not RoomFull"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_still_refuses_a_genuinely_new_member() {
+        // The counterfactual: the fix must not turn the ceiling off.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let carol = TestSender::registered(&inst);
+        let shape =
+            RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 };
+        let (room, _) = inst.create_room(shape, alice.user).unwrap();
+
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+        assert!(matches!(
+            inst.add_room_member(room, alice.user, carol.user),
+            Err(ServerError::RoomFull)
+        ));
     }
 }

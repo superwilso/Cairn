@@ -28,7 +28,7 @@ pub fn router(instance: SharedInstance) -> Router {
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room}", get(describe_room))
         .route("/v1/rooms/{room}/messages", post(send_message).get(fetch_messages))
-        .route("/v1/rooms/{room}/members", post(add_room_member))
+        .route("/v1/rooms/{room}/members", post(add_room_member).get(list_room_members))
         .route("/v1/rooms/{room}/members/{target}", delete(remove_room_member).put(set_room_role))
         .route("/v1/rooms/{room}/join", post(join_room))
         .route("/v1/devices/{device}/key-packages", post(publish_key_packages))
@@ -369,6 +369,32 @@ async fn download_blob(
     let actor = signed_actor(&instance, &headers, "download_blob", Some(blob.into()))?;
     let bytes = instance.fetch_blob(actor, blob)?;
     Ok((StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes))
+}
+
+#[derive(Serialize)]
+struct RoomMemberEntry {
+    user: String,
+    role: String,
+}
+
+/// The room's server-side membership. Members only.
+async fn list_room_members(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RoomMemberEntry>>, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "list_room_members", Some(room.into()))?;
+    Ok(Json(
+        instance
+            .room_members(room, actor)?
+            .into_iter()
+            .map(|m| RoomMemberEntry {
+                user: m.user.to_string(),
+                role: format!("{:?}", m.role).to_lowercase(),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]

@@ -237,6 +237,7 @@ fn help() {
     println!(
         "  /add <@name|user-id> add someone to the open room
   /username <name>     claim your handle, so people can find you without a uuid
+  /roster              server-side membership (who joined by invite, awaiting /add)
   /invite [uses] [hrs] mint an invite link for the open room (default 1 use, 24h)
   /join <token>        redeem an invite"
     );
@@ -312,6 +313,7 @@ impl App {
                 self.add_member(user)?
             }
             "/username" => self.claim_username(rest)?,
+            "/roster" => self.show_roster()?,
             "/invite" => self.create_invite(rest)?,
             "/join" => self.join_by_invite(rest)?,
             "/members" => self.list_members(),
@@ -339,6 +341,25 @@ impl App {
         let user = self.client.lookup_username(&name)?;
         println!("  {name} is {user}");
         Ok(user)
+    }
+
+    /// The room's **server-side** membership, which is not the MLS roster.
+    ///
+    /// The two diverge the moment someone joins by invite: the server admits them, and the
+    /// encrypted group does not have them until a member runs `/add`. Listing them
+    /// separately is the honest presentation — `/members` shows who can actually read the
+    /// conversation, this shows who the instance will deliver to. Anyone here but not there
+    /// is waiting to be let into the group.
+    fn show_roster(&self) -> Fallible<()> {
+        let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
+        let members = self.client.room_members(room)?;
+        println!("  server-side membership of {room}:");
+        for (user, role) in &members {
+            println!("    {user} ({role})");
+        }
+        println!("  /members shows who is in the encrypted group — anyone listed here but");
+        println!("  not there joined by invite and still needs /add <user-id>");
+        Ok(())
     }
 
     /// Mint an invite for the open room. `/invite [uses] [hours]`, defaulting to one use
