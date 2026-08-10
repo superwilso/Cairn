@@ -238,9 +238,14 @@ Honest list. Each of these is real and none is hypothetical.
   counter lives in memory, so restarting the server clears it. Keep your published supply
   topped up (`/keys 10`) rather than treating this as solved. **Registration and message
   sending are still unthrottled.**
-- **No message history on the client.** Messages arrive by polling and scroll past. A
-  restart does not replay them — it cannot, because MLS discards each message key after
-  use.
+- **Message history is stored in the clear.** A restart now replays a room rather than
+  losing it, which it could not do from the network — MLS discards each message key after
+  use, so the server holds ciphertext your device can no longer open. The copy is written
+  `0600` beside the client state that already sits there unencrypted. **Decided (owner)**,
+  and superseded by the platform keystores when the native clients land. Concretely: a
+  device that is taken is a conversation that is read. A room's disappearing-message timer
+  governs the local copy too, so an expired message is deleted from disk rather than merely
+  hidden.
 - **Polling, not push.** The client fetches when you press enter.
 - **No voice, video, or screen sharing.** Designed, unbuilt, and behind the native clients
   ([`12-realtime-media.md`](12-realtime-media.md)). Worth reading before you plan an

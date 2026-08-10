@@ -37,6 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cairn_client_core::client::{Client, CreatedRoom};
 use cairn_client_core::embed::{self, Card};
+use cairn_client_core::history::{Entry as HistoryEntry, History};
 use cairn_client_core::transport::HttpTransport;
 use cairn_client_core::{
     accept_welcome, ContactStore, Conversation, ConversationIndex, TimelineEvent,
@@ -96,6 +97,7 @@ struct App {
     session: Arc<Session>,
     index: ConversationIndex,
     contacts: ContactStore,
+    history: History,
     /// The open conversation, if any. One at a time keeps the prompt honest: a badge can
     /// only describe the room it is next to.
     open: Option<Open>,
@@ -129,6 +131,7 @@ pub fn run(options: Options) -> Fallible<()> {
         session,
         index: ConversationIndex::open(&options.dir)?,
         contacts: ContactStore::open(&options.dir)?,
+        history: History::open(&options.dir)?,
         open: None,
         identity,
         tls,
@@ -350,6 +353,60 @@ impl App {
         Ok(user)
     }
 
+    /// Remember a message this device sent.
+    ///
+    /// MLS will not decrypt our own application messages back to us, so without this the
+    /// stored transcript is half a conversation — every reply and none of the prompts.
+    fn remember_own(
+        &self,
+        room: cairn_proto::RoomId,
+        envelope: &cairn_proto::Envelope,
+        body: &[u8],
+        attachment_name: Option<String>,
+    ) {
+        let _ = self.history.append(
+            room,
+            &HistoryEntry {
+                sender: envelope.sender,
+                sent_at_ms: envelope.sent_at_ms,
+                body: body.to_vec(),
+                attachment_name,
+            },
+        );
+    }
+
+    /// Print what this device remembers of a room, before any new messages arrive.
+    ///
+    /// Failure here is reported and then ignored. A transcript that cannot be read is worth
+    /// saying out loud — it may be corruption — but it must not stop someone opening a room
+    /// they can still use.
+    fn replay_history(&self, room: cairn_proto::RoomId) {
+        // The room's own timer governs the local copy too, so a disappearing message is not
+        // quietly immortal on the one device its user controls.
+        let ttl = self.client.room_ttl(room).unwrap_or(None);
+        match self.history.replay(room, ttl, now_ms()) {
+            Ok(entries) if entries.is_empty() => {}
+            Ok(entries) => {
+                println!("  --- {} remembered message(s) ---", entries.len());
+                for entry in entries {
+                    let body = String::from_utf8_lossy(&entry.body);
+                    match entry.attachment_name {
+                        Some(name) => println!(
+                            "  [old] {}: {body} (attachment {name:?})",
+                            short(&entry.sender.as_uuid().to_string())
+                        ),
+                        None => println!(
+                            "  [old] {}: {body}",
+                            short(&entry.sender.as_uuid().to_string())
+                        ),
+                    }
+                }
+                println!("  --- end of history ---");
+            }
+            Err(e) => println!("  ! stored history could not be read: {e}"),
+        }
+    }
+
     /// Set the room's disappearing-message timer. `/ttl 60` for a minute, `/ttl off`.
     fn set_ttl(&self, rest: &str) -> Fallible<()> {
         let room = self.open.as_ref().ok_or("open a room first")?.convo.room();
@@ -394,6 +451,7 @@ impl App {
         let open = self.open.as_mut().expect("checked above");
         let out = open.convo.send_with_attachment(name.as_bytes(), attachment, now_ms())?;
         self.client.send(room, &out.envelope)?;
+        self.remember_own(room, &out.envelope, name.as_bytes(), Some(name.clone()));
         println!("  sent {name} ({} bytes, encrypted before upload)", bytes.len());
         Ok(())
     }
@@ -571,6 +629,7 @@ impl App {
         };
 
         println!("  opened {room} at tier {}", seal.tier().label());
+        self.replay_history(room);
         let cursor = self.index.cursor(&room);
         self.open = Some(Open { convo, seal, cursor });
         Ok(())
@@ -715,9 +774,11 @@ impl App {
         }
 
         let sent = open.convo.send_with_card(text.as_bytes(), card, now_ms())?;
-        let receipt = self.client.send(open.convo.room(), &sent.envelope)?;
+        let room = open.convo.room();
+        let receipt = self.client.send(room, &sent.envelope)?;
         open.cursor = open.cursor.max(receipt.server_seq);
-        self.index.advance(open.convo.room(), receipt.server_seq)?;
+        self.index.advance(room, receipt.server_seq)?;
+        self.remember_own(room, &sent.envelope, text.as_bytes(), None);
         Ok(())
     }
 
@@ -785,6 +846,17 @@ impl App {
                     if let Some(card) = &received.card {
                         print_card(card);
                     }
+                    // Remembered before the attachment is fetched, so a failed download
+                    // does not also lose the message it arrived with.
+                    let _ = self.history.append(
+                        message.envelope.room,
+                        &HistoryEntry {
+                            sender: message.envelope.sender,
+                            sent_at_ms: message.envelope.sent_at_ms,
+                            body: received.body.clone(),
+                            attachment_name: received.attachment.as_ref().map(|a| a.name.clone()),
+                        },
+                    );
                     if let Some(attachment) = &received.attachment {
                         // Fetched and opened here rather than announced and left: the key
                         // arrived inside this message and nothing else can open the blob, so

@@ -20,6 +20,7 @@ pub mod client;
 pub mod contacts;
 pub mod conversation;
 pub mod embed;
+pub mod history;
 pub mod store;
 pub mod transport;
 

@@ -22,7 +22,7 @@ Legend: ✅ has it · ⚠️ partial or qualified · ❌ lacks it · 🎯 Cairn 
 | Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ per-room, from send |
 | Read receipts (optional) | ⚠️ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Typing indicators | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
-| Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | 🎯 tiered |
+| Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | ⚠️ local history stored, search unbuilt |
 | Scheduled messages | ❌ | ❌ | ⚠️ | ❌ | ✅ | 🎯 v2 |
 | Voice messages | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 

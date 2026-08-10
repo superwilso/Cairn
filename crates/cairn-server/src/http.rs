@@ -529,6 +529,10 @@ struct CreateRoomResponse {
     /// `docs/02-encryption-tiers.md` §4 this must be surfaced in the UI at all times.
     tier: &'static str,
     e2ee: bool,
+    /// The room's disappearing-message timer, so a client can apply the same rule to its
+    /// own stored copy rather than keeping messages the server has already dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ttl_ms: Option<i64>,
 }
 
 async fn create_room(
@@ -545,7 +549,12 @@ async fn create_room(
         },
         creator,
     )?;
-    Ok(Json(CreateRoomResponse { room, tier: seal.tier().label(), e2ee: seal.tier().is_e2ee() }))
+    Ok(Json(CreateRoomResponse {
+        room,
+        tier: seal.tier().label(),
+        e2ee: seal.tier().is_e2ee(),
+        ttl_ms: instance.room_ttl(room),
+    }))
 }
 
 /// Describe a room, so a client can display its tier.
@@ -569,7 +578,12 @@ async fn describe_room(
             return Err(ServerError::NotAMember);
         }
     }
-    Ok(Json(CreateRoomResponse { room, tier: seal.tier().label(), e2ee: seal.tier().is_e2ee() }))
+    Ok(Json(CreateRoomResponse {
+        room,
+        tier: seal.tier().label(),
+        e2ee: seal.tier().is_e2ee(),
+        ttl_ms: instance.room_ttl(room),
+    }))
 }
 
 #[derive(Serialize)]

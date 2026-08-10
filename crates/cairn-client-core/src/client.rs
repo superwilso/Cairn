@@ -108,6 +108,8 @@ struct CreatedRoomResponse {
     room: RoomId,
     tier: String,
     e2ee: bool,
+    #[serde(default)]
+    ttl_ms: Option<i64>,
 }
 
 /// A room this client just created.
@@ -235,6 +237,22 @@ impl<T: Transport> Client<T> {
         body: Option<crate::transport::RequestBody<'_>>,
     ) -> Result<Response, ClientError> {
         Ok(self.transport.send(method, path, headers, body)?.ok()?)
+    }
+
+    /// The room's disappearing-message timer, as the instance holds it.
+    ///
+    /// A client applies the same value to its own stored transcript, so a message the
+    /// server has dropped does not live on in local history — the timer would otherwise be
+    /// true of the instance and false of the one device its user actually controls.
+    pub fn room_ttl(&self, room: RoomId) -> Result<Option<i64>, ClientError> {
+        let response = self.call(
+            "GET",
+            &format!("/v1/rooms/{}", room.as_uuid()),
+            &self.auth("describe", Some(room.into()))?,
+            None,
+        )?;
+        let parsed: CreatedRoomResponse = serde_json::from_slice(&response.body)?;
+        Ok(parsed.ttl_ms)
     }
 
     /// Set or clear the room's disappearing-message timer. Any member may.
