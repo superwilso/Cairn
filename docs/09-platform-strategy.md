@@ -5,7 +5,11 @@
 
 ## Target matrix
 
-**Clients — all native.** Windows, macOS, Linux, iOS, Android.
+**Clients — one web client, wrapped in Tauri for desktop.** Superseded the all-native plan;
+see [ADR-008](adr/008-client-architecture.md). WebRTC in the WebView is what puts voice and
+video within reach. Mobile is a responsive web client for now.
+
+*Superseded:* all-native on Windows, macOS, Linux, iOS, Android.
 **Servers.** Linux (primary), Windows, macOS. Old phones as low-power servers: a plausible
 later target, explicitly not a v1 goal, and not a constraint on any current decision.
 

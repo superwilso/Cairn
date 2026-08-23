@@ -1,3 +1,10 @@
+> **Amended by [ADR-009](adr/009-instance-side-unfurl.md).** The unfurl has moved from the
+> sender's device to the instance: one adapter set, a shared cache, and thumbnails, at the
+> cost of the instance seeing URLs its users send. **The recipient-fetches-nothing rule is
+> unchanged and remains the important half.** Sections below describing sender-side fetching
+> as the design describe the superseded arrangement; the privacy reasoning in them still
+> applies to the recipient.
+
 # Embeds — Authenticated On-Device Unfurl
 
 **Status:** Draft — open for comment

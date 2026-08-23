@@ -340,6 +340,30 @@ Four calls made by the owner, so a session does not re-litigate them:
 **Exit:** an external reviewer's findings are closed, and the claims in `SECURITY.md`
 survive someone else's scrutiny.
 
+## Direction change, 2026-08 (owner)
+
+The priority moved from privacy depth to **product**: automatic embedding, integrations, and
+good voice and video in a lightweight client. Three decisions, recorded so they are not
+re-litigated:
+
+- **[ADR-008](adr/008-client-architecture.md): one web client, wrapped in Tauri.** Supersedes
+  the five-native-UI plan, which was the single largest cost in the project and the main
+  thing standing between here and calls. WebRTC supplies capture, echo cancellation, jitter
+  buffering and codec negotiation. The FFI line survives — protocol logic stays in Rust.
+- **[ADR-009](adr/009-instance-side-unfurl.md): the instance unfurls links.** One adapter
+  set, a shared cache, and thumbnails, at the cost of the instance seeing URLs its users
+  send. **Recipients still fetch nothing** — that was always the important half.
+- **Calls may downgrade** (`12-realtime-media.md` §5), carrying their own badge and
+  announcing the fallback, rather than refusing to connect.
+
+Both concessions are recorded in `01-threat-model.md` §3a. The tier model, franking, and the
+honesty rule are unchanged.
+
+**What this reorders.** Calls move from M6 to roughly M4; the native-client work that used to
+gate them is gone. Attachments and the storage rewrite are already done, so instance-side
+unfurl with thumbnails is close. Key transparency and metadata protection move further out —
+they were always M5+, and this makes that explicit rather than implied.
+
 ## M6 — Finished app
 
 Only after M5. Native clients per ADR-006, mobile, communities at scale, authenticated
