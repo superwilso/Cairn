@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cairn</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--
+  Deliberately dependency-free: no framework, no build step, no npm tree. This is a
+  security product with a small supply chain as a stated value, and a chat window does not
+  need 300 transitive packages to render a list.
+
+  Everything shown here arrives as plain data from the Rust side. This file never builds an
+  envelope, never decides a tier, and never sees a key — see ../src-tauri/src/main.rs.
+-->
+<div id="signin" class="pane">
+  <h1>Cairn</h1>
+  <label>Profile <input id="profile" value="me" spellcheck="false"></label>
+  <label>Instance <input id="server" value="http://127.0.0.1:8080" spellcheck="false"></label>
+  <button id="go">Sign in</button>
+  <p id="signin-error" class="error"></p>
+</div>
+
+<div id="app" hidden>
+  <aside>
+    <div class="you">
+      <span id="whoami" class="mono"></span>
+      <!-- Not decoration. Over http:// the transport protects nothing, and the UI has to
+           say so rather than imply a protection that is not there. -->
+      <span id="transport" class="badge"></span>
+    </div>
+    <div class="actions">
+      <button id="new-group">New group</button>
+      <button id="new-direct">New DM</button>
+    </div>
+    <div class="actions">
+      <input id="invite-token" placeholder="invite token" spellcheck="false">
+      <button id="join">Join</button>
+    </div>
+    <h2>Rooms</h2>
+    <ul id="rooms"></ul>
+  </aside>
+
+  <main>
+    <header>
+      <span id="room-id" class="mono"></span>
+      <span id="room-tier" class="badge"></span>
+      <button id="invite">Invite</button>
+    </header>
+
+    <!-- The group-chat case this client was built for: people who joined the room but are
+         not in the encrypted group cannot read a word of it, and somebody has to let them
+         in. Never automatic — the list comes from the instance. -->
+    <div id="waiting" class="waiting" hidden>
+      <span id="waiting-text"></span>
+      <button id="admit">Admit them</button>
+    </div>
+
+    <ul id="timeline"></ul>
+
+    <form id="composer">
+      <input id="text" placeholder="Message" autocomplete="off" spellcheck="false">
+      <button type="submit">Send</button>
+    </form>
+    <p id="error" class="error"></p>
+  </main>
+
+  <section id="members">
+    <h2>Members</h2>
+    <ul id="member-list"></ul>
+  </section>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -51,7 +51,10 @@ if [ "$MODE" != "quick" ]; then
     # The floor is a hard requirement: the crypto tree needs edition2024, stabilised in
     # exactly 1.85. A dependency bump that quietly raises it is the failure this catches.
     if rustup toolchain list 2>/dev/null | grep -q '^1\.85'; then
-        run "msrv 1.85 check" cargo +1.85.0 check --workspace
+        # Excludes the desktop app deliberately: Tauri's tree needs rustc 1.88. The floor
+        # exists so the protocol and crypto *libraries* stay consumable at a known minimum;
+        # a desktop binary is not something anyone builds against. Same exclusion in CI.
+        run "msrv 1.85 check" cargo +1.85.0 check --workspace --exclude cairn-desktop
     else
         printf '\n\033[33mSKIPPED msrv: rustup toolchain install 1.85.0\033[0m\n'
     fi

@@ -7,3 +7,7 @@
 /.env
 *.local.toml
 /data
+
+# Tauri build output
+clients/desktop/src-tauri/target/
+clients/desktop/src-tauri/gen/

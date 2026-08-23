@@ -1,0 +1,20 @@
+[package]
+name = "cairn-desktop"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Cairn desktop client — a thin shell over cairn-client-core"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cairn-client-core = { path = "../../../crates/cairn-client-core", features = ["http"] }
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Tauri's own convention; kept so `cargo tauri build` behaves.
+custom-protocol = ["tauri/custom-protocol"]

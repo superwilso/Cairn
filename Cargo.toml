@@ -6,6 +6,7 @@ members = [
     "crates/cairn-client-core",
     "crates/cairn-server",
     "crates/cairn-cli",
+    "clients/desktop/src-tauri",
 ]
 
 [workspace.package]

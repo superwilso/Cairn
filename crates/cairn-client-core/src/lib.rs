@@ -21,6 +21,8 @@ pub mod contacts;
 pub mod conversation;
 pub mod embed;
 pub mod history;
+#[cfg(feature = "http")]
+pub mod session;
 pub mod statedir;
 pub mod store;
 pub mod transport;

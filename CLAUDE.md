@@ -91,6 +91,7 @@ cargo test --workspace                              # must pass
 cargo fmt --all
 cargo clippy --workspace --all-targets              # CI runs -D warnings
 cargo run -p cairn-cli                              # vertical slice
+cargo run -p cairn-desktop                          # desktop client (needs libwebkit2gtk-4.1-dev)
 cargo run -p cairn-crypto --example group_scaling --release
 ```
 

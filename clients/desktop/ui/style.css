@@ -1,0 +1,66 @@
+:root {
+    --bg: #16181d; --panel: #1d2027; --line: #2b2f38;
+    --text: #e6e8ec; --dim: #9aa1ad; --accent: #6ea8fe;
+    --ok: #3fb950; --warn: #d29922;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
+.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+
+.pane { max-width: 22rem; margin: 15vh auto; display: flex; flex-direction: column; gap: .75rem; }
+.pane h1 { margin: 0 0 .5rem; font-size: 1.6rem; letter-spacing: .02em; }
+label { display: flex; flex-direction: column; gap: .25rem; font-size: .8rem; color: var(--dim); }
+input { background: var(--panel); border: 1px solid var(--line); color: var(--text);
+        padding: .5rem .6rem; border-radius: 6px; font-size: .9rem; }
+input:focus { outline: 1px solid var(--accent); }
+button { background: var(--panel); border: 1px solid var(--line); color: var(--text);
+         padding: .45rem .7rem; border-radius: 6px; cursor: pointer; font-size: .85rem; }
+button:hover { border-color: var(--accent); }
+
+#app { display: grid; grid-template-columns: 15rem 1fr 13rem; height: 100vh; }
+aside, #members { background: var(--panel); border-right: 1px solid var(--line);
+                  padding: .75rem; overflow-y: auto; }
+#members { border-right: none; border-left: 1px solid var(--line); }
+h2 { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em;
+     color: var(--dim); margin: 1rem 0 .4rem; }
+.you { display: flex; flex-direction: column; gap: .3rem; font-size: .75rem; }
+.actions { display: flex; gap: .4rem; margin-top: .6rem; }
+.actions input { min-width: 0; flex: 1; }
+
+ul { list-style: none; margin: 0; padding: 0; }
+#rooms li { display: flex; align-items: center; gap: .4rem; padding: .35rem .4rem;
+            border-radius: 5px; cursor: pointer; font-size: .8rem; }
+#rooms li:hover { background: #252932; }
+#rooms li.active { background: #2c313c; }
+.room-name { color: var(--dim); }
+
+/* The badge is a claim about who can read a message. Green only when it is genuinely
+   end-to-end encrypted; amber whenever something weaker is in play. */
+.badge { font-size: .62rem; text-transform: uppercase; letter-spacing: .06em;
+         padding: .1rem .35rem; border-radius: 3px; border: 1px solid var(--line); }
+.badge.ok { color: var(--ok); border-color: #2c5a34; }
+.badge.warn { color: var(--warn); border-color: #5c4816; }
+
+main { display: flex; flex-direction: column; min-width: 0; }
+header { display: flex; align-items: center; gap: .6rem; padding: .6rem .8rem;
+         border-bottom: 1px solid var(--line); font-size: .78rem; }
+header #room-id { color: var(--dim); overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; flex: 1; }
+
+.waiting { display: flex; align-items: center; gap: .6rem; padding: .5rem .8rem;
+           background: #2a2416; border-bottom: 1px solid #5c4816; font-size: .8rem; }
+
+#timeline { flex: 1; overflow-y: auto; padding: .6rem .8rem; }
+.msg { display: flex; gap: .6rem; padding: .18rem 0; font-size: .88rem;
+       word-break: break-word; }
+.msg .who { color: var(--accent); flex-shrink: 0; font-size: .78rem; padding-top: .1rem; }
+.historic { opacity: .62; }
+.notice { color: var(--dim); font-size: .76rem; font-style: italic; padding: .25rem 0; }
+.pending { color: var(--warn); font-size: .68rem; }
+
+#composer { display: flex; gap: .5rem; padding: .6rem .8rem;
+            border-top: 1px solid var(--line); }
+#composer input { flex: 1; }
+#member-list li { font-size: .74rem; padding: .2rem 0; color: var(--dim); }
+.error { color: #f85149; font-size: .76rem; padding: 0 .8rem; min-height: 1rem; }
