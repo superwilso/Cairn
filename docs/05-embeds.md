@@ -1,3 +1,10 @@
+> **Amended by [ADR-009](adr/009-instance-side-unfurl.md).** The unfurl has moved from the
+> sender's device to the instance: one adapter set, a shared cache, and thumbnails, at the
+> cost of the instance seeing URLs its users send. **The recipient-fetches-nothing rule is
+> unchanged and remains the important half.** Sections below describing sender-side fetching
+> as the design describe the superseded arrangement; the privacy reasoning in them still
+> applies to the recipient.
+
 # Embeds — Authenticated On-Device Unfurl
 
 **Status:** Draft — open for comment
@@ -277,6 +284,32 @@ never taken silently.
    real improvement available today.
 
 Step 5 is worth doing on its own. Steps 1 and 2 are large, and neither is an embed problem.
+
+### Step 5, as built
+
+`cairn_client_core::embed::instagram`. Recognises `/p/`, `/reel/` and `/tv/` links, and
+`unfurl_with_proxy` tries a configured proxy **only after** the direct fetch has come back
+with nothing useful — a link that works without a proxy never reaches one.
+
+Four things worth knowing before extending it:
+
+- **The host is a configured list, not a name.** These proxies are volunteer-run and rotate
+  (`kkinstagram`, `ddinstagram`, `instagramez`, `fxig`, `d.vx` are all in circulation, none
+  dependable), so §2's "assume adapter breakage" applies to the host itself.
+- **Off unless switched on.** An empty policy is the default and degrades to a bare link.
+- **The rewrite is built from parsed parts**, never by substituting into the original URL,
+  and the shortcode is validated to `[A-Za-z0-9_-]`. Probing the parser with hostile inputs
+  — `instagram.com@evil.test`, `instagram.com.evil.test`, punycode lookalikes, a shortcode
+  containing `%2f` — confirmed that nothing accepted produces a URL whose authority is
+  anything but the configured proxy. That invariant is a test, not a comment.
+- **Share-tracking parameters are dropped.** An Instagram share link carries `?igsh=…`, a
+  token tied to whoever copied it; forwarding that to a proxy would hand over an identifier
+  the sender never chose to share.
+
+**Not verified against a live proxy.** The authoring environment has no outbound access to
+these hosts, so what they return in practice — whether they still serve OpenGraph, and
+whether they are up at all — is untested. The parsing and rewriting are exercised offline;
+the network rung needs one real fetch before anyone relies on it.
 
 ## Instagram: music and comments
 

@@ -38,8 +38,11 @@ becomes a regression test named after the property.
 
 These outrank velocity, tidiness, and the roadmap:
 
-1. **Never weaken an encryption tier after launch.** A room's tier is immutable — there is
-   no setter for it anywhere, and there must never be one.
+1. **A room's tier is immutable.** There is no setter for it anywhere, and there must never
+   be one. **Narrowed (owner, pre-launch):** this constrains the *room*. A **call** inside an
+   E2EE room may fall back to transport-only if a participant cannot do E2EE media — it must
+   then carry its own badge saying so, and announce the fallback to everyone in the call.
+   See [`docs/12-realtime-media.md`](docs/12-realtime-media.md) §5. Messages are unaffected.
 2. **Never ship client-side scanning as an enforcement mechanism.** As a user-controlled
    filter, yes. As a mandate, never.
 3. **Never claim a protection the threat model does not support.** This is the one that
@@ -60,9 +63,10 @@ crates/cairn-cli/          headless demo
 ```
 
 **All protocol, crypto, storage, and tier logic lives below the FFI line** — in `proto`,
-`crypto`, or `client-core`. A platform UI must never construct an envelope, decide a tier,
-or touch a key (ADR-006). Five native clients each reimplementing the protocol would mean
-five sets of security bugs.
+`crypto`, or `client-core`. A UI must never construct an envelope, decide a tier, or touch a
+key. This rule outlived the plan that motivated it: [ADR-008](docs/adr/008-client-architecture.md)
+replaced five native clients with one web client wrapped in Tauri, and the line still holds —
+a browser UI is exactly where protocol logic must not drift to.
 
 Rules live in `state.rs`; `http.rs` only maps them onto status codes. Put a rule in the
 handler and it is untested and bypassable.

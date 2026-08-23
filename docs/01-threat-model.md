@@ -111,6 +111,33 @@ claimed. Users trust *their instance operator*, plus the cryptography for E2EE t
 
 ---
 
+## 3a. Conceded by the 2026-08 direction change
+
+Two protections were given up deliberately, pre-launch, and belong here rather than in the
+documents that made the changes. Neither is a bug; both are choices, and #3 requires them to
+be as visible as the guarantees.
+
+**The instance sees URLs its users send.** [ADR-009](adr/009-instance-side-unfurl.md) moved
+link unfurling from the sender's device to the instance, so a link posted in *any* tier —
+including a T1 DM — is disclosed to the instance that hosts it. It sees the URL and which
+account asked; not the message it sits in, not who else is in the room. Bounded by three
+things: it is the user's own instance rather than the linked platform, the instance already
+holds who-talks-to-whom under §3, and answers are cached so a repeat discloses nothing. A
+client must offer to turn it off, and off means a bare link.
+
+**In a browser, the instance serves the code that does the encryption.**
+[ADR-008](adr/008-client-architecture.md) made the client a web application. An instance
+serving malicious JavaScript can read anything the client can, so **end-to-end encryption in
+the browser build is a claim against a network attacker, not against the instance operator.**
+The Tauri desktop build is materially stronger — the code is shipped and signed rather than
+fetched each session — and a user choosing between them is entitled to see that difference
+stated. This does not change what the tiers mean; it changes who the browser build's E2EE
+protects against, which is a smaller set than a reader would otherwise assume.
+
+**A call may be transport-only inside an E2EE room.** The refusal-rather-than-downgrade rule
+was dropped (`12-realtime-media.md` §5). A call now carries its own badge and announces a
+fallback to every participant. Room messages are unaffected.
+
 ## 4. The malicious server operator (A4)
 
 The most nuanced case, and the one most often overstated by messaging products.

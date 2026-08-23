@@ -376,3 +376,87 @@ fn a_hostile_card_is_clamped_before_a_recipient_renders_it() {
     assert!(card.title.unwrap().chars().count() <= 201);
     assert!(card.description.unwrap().chars().count() <= 501);
 }
+
+#[test]
+fn an_invite_joiner_can_be_admitted_without_anyone_pasting_a_uuid() {
+    // M2's exit condition, end to end. The joiner redeems a link and appears in the
+    // instance's member list; the existing member's client works out who is *in the room but
+    // not in the group* by comparing account ids, and admits them.
+    //
+    // That comparison is only possible because every MLS leaf now names its account. Under
+    // the display-name credential the roster carried labels a client chose for itself, so
+    // there was nothing to match the server's list against and a human had to carry a uuid
+    // across by hand.
+    let server = start();
+    let alice = Peer::new(&server, "admit-alice");
+    let bob = Peer::new(&server, "admit-bob");
+    bob.client.publish_key_packages(3).unwrap();
+
+    let created = alice.client.create_room(shape()).unwrap();
+    let room = created.room;
+    let seal = created.seal;
+    let mut alice_convo = alice.conversation(seal, room);
+
+    // Bob joins by invite. He is a member of the room and cannot read a word of it.
+    let token = alice.client.create_room_invite(room, 1, None).unwrap();
+    assert_eq!(bob.client.redeem_room_invite(&token).unwrap(), room);
+
+    // What alice's client can now compute, which it could not before.
+    let in_group: Vec<_> = alice_convo
+        .members()
+        .iter()
+        .filter_map(|m| DeviceIdentity::parse(&m.identity).ok().map(|id| id.user()))
+        .collect();
+    let waiting: Vec<_> = alice
+        .client
+        .room_members(room)
+        .unwrap()
+        .into_iter()
+        .map(|(user, _)| user)
+        .filter(|u| !in_group.contains(u))
+        .collect();
+    assert_eq!(waiting, vec![bob.user], "bob must be identifiable as waiting, by account id");
+
+    // Admitting him is then the ordinary MLS add.
+    let claimed = alice.client.claim_key_packages(bob.user).unwrap();
+    let key_package =
+        cairn_crypto::mls::parse_message(&hex::decode(&claimed[0].key_package).unwrap()).unwrap();
+    let commit = alice_convo.group_mut().unwrap().add_member(key_package).unwrap();
+    let bob_group = bob.session.join(&commit.welcome.expect("a welcome for bob")).unwrap();
+    let mut bob_convo = Conversation::join_encrypted(
+        seal,
+        room,
+        bob.user,
+        bob.device,
+        bob.session.clone(),
+        bob_group,
+    )
+    .unwrap();
+
+    // And he can read what follows.
+    let sent = alice_convo.send(b"admitted without a uuid", 1_000).unwrap();
+    alice.client.send(room, &sent.envelope).unwrap();
+    let fetched = bob.client.fetch_since(room, 0).unwrap();
+    let body = fetched
+        .iter()
+        .find_map(|m| bob_convo.receive(&m.envelope).ok().and_then(|e| e.message()))
+        .expect("bob must be able to read the room he was admitted to");
+    assert_eq!(body.body, b"admitted without a uuid");
+
+    // Nobody is waiting any more — the counterfactual, without which a comparison that
+    // always reported everyone would pass the assertion above.
+    let in_group: Vec<_> = alice_convo
+        .members()
+        .iter()
+        .filter_map(|m| DeviceIdentity::parse(&m.identity).ok().map(|id| id.user()))
+        .collect();
+    let still_waiting: Vec<_> = alice
+        .client
+        .room_members(room)
+        .unwrap()
+        .into_iter()
+        .map(|(user, _)| user)
+        .filter(|u| !in_group.contains(u))
+        .collect();
+    assert!(still_waiting.is_empty(), "after admission nobody should be listed as waiting");
+}

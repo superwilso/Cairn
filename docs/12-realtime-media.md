@@ -113,29 +113,41 @@ Two consequences worth writing down before anyone implements this:
   the same reason. Whatever Cairn does here should not quietly be weaker than what it does
   for messages.
 
-## 5. The downgrade path is where Cairn must diverge
+## 5. The downgrade path, and what replaced the refusal
 
 DAVE describes a **passthrough mode**: when a participant's client does not support E2EE,
 the session transitions to protocol version 0, frames flow unencrypted, and clients display
 the changed status. It is a sensible answer to a rollout problem across a fleet of clients
 Discord does not control.
 
-**Cairn cannot adopt it.** Non-negotiable #1 is that an encryption tier is never weakened
-after launch, and a T1 or T2 room whose call silently becomes plaintext because one
-participant has an old build is precisely the failure that rule exists to prevent. The badge
-would be describing the room while the call did something else.
+**Superseded (owner decision).** This section previously said Cairn would refuse rather
+than downgrade. The refusal has been dropped, because "your friend cannot join, tell them to
+update" is a worse product than a call that works and says what it is.
 
-So the rule is: **in an E2EE tier, a client that cannot do E2EE media does not join the
-call.** Not degraded — refused, with the reason shown.
+**A call may fall back to transport-only encryption.** What may *not* happen is the fallback
+going unannounced.
 
-The cost is real and should not be hidden. Someone on an old build gets locked out of a call
-rather than joining a worse one, and "your friend cannot join, tell them to update" is a
-worse experience than a warning banner. That is the correct trade here: this project's
-entire claim is that the badge means what it says.
+The rule that replaces the refusal is narrower and, unlike the old one, costs nothing in
+compatibility:
 
-T3 public communities are the exception, and consistently so — they are transport-encrypted
-by design, so a T3 voice channel is transport-encrypted too. No downgrade occurs, because
-nothing was end-to-end to begin with, and the badge already says so.
+- **A call carries its own badge, derived from the call, not from the room.** A T1 room whose
+  call fell back shows an E2EE room containing a transport-only call, and says exactly that.
+  The room's tier is still immutable; the call is simply a different thing with its own
+  protection, and conflating them is what would have made the badge lie.
+- **The fallback is announced to every participant when it happens**, not only to the person
+  who caused it. Somebody joining on an old build changes what protects everyone else's
+  audio, and everyone else is entitled to know before they keep talking.
+- **Anyone may decline.** A participant whose client would rather leave than continue on
+  transport-only can be configured to do so. What is gone is the rule that made that
+  everyone's behaviour by default.
+
+This keeps non-negotiable #3 intact — nothing claims a protection it does not have — while
+giving up the part of #1 that was doing more harm than good in a pre-launch product. Note
+what is *not* given up: a room's tier still cannot be changed, and a T1 room's **messages**
+are still E2EE regardless of what its calls do.
+
+T3 public communities are unaffected — they are transport-encrypted by design, so a T3 voice
+channel always was, and the badge already said so.
 
 ## 6. What a call still leaks
 
@@ -200,7 +212,13 @@ about it is elsewhere.
 
 ## 9. Why this comes after the native clients
 
-The CLI cannot do this. Not "would be awkward" — an SFU-connected media client needs device
+**Reachable now.** [ADR-008](adr/008-client-architecture.md) replaced five native clients
+with one web client wrapped in Tauri, which means WebRTC supplies capture, echo cancellation,
+jitter buffering, codec negotiation and simulcast rather than this project writing them five
+times. That removes most of what made this "the largest component the project has
+considered". What remains genuinely ours is the SFU choice, the MLS call group, and SFrame.
+
+The CLI still cannot do this. Not "would be awkward" — an SFU-connected media client needs device
 capture, echo cancellation, jitter buffering, and a rendering surface, none of which is a
 terminal.
 

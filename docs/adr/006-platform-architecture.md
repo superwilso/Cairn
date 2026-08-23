@@ -1,5 +1,12 @@
 # ADR-006: Shared Rust core, native UI per platform
 
+> **SUPERSEDED by [ADR-008](008-client-architecture.md).** The five-native-UI plan is not
+> being built. The *shared Rust core* and the **FFI line** survive intact and are still
+> binding: no protocol logic, no envelope construction, no tier decision and no key handling
+> above that line. What changed is what sits above it — one web client wrapped in Tauri,
+> rather than five native UIs. Kept for the reasoning, which is still the best statement of
+> what that choice costs.
+
 **Status:** Accepted
 **Date:** 2026-08-04
 

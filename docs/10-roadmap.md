@@ -69,8 +69,13 @@ window, not the native Windows client of ADR-006.
 - [x] Contact store persisting verification state, including a sticky
       `ChangedSinceVerified` warning that re-observation cannot clear.
 
-**Exit: met.** Invite links exist (`/invite`, `/join`), so a joiner is no longer told to
-paste a uuid, and usernames replace ids for addressing. Verified with two real clients:
+**Exit: met, and now without a manual step.** Invite links exist (`/invite`, `/join`), and
+`/admit` closes the loop: a member opening a room is told who joined by invite and cannot
+read yet, and one command lets them all in. No uuid is pasted anywhere in the flow.
+
+Deliberately one command rather than automatic — the waiting list comes from the instance, so
+admitting on its word alone would let a malicious one name an account and have a moderator's
+client hand it the group keys silently. What was removed is the uuid, not the decision. Verified with two real clients:
 alice mints an invite, bob redeems it, alice adds him to the encrypted group, and bob reads
 the message that follows.
 
@@ -334,6 +339,30 @@ Four calls made by the owner, so a session does not re-litigate them:
 
 **Exit:** an external reviewer's findings are closed, and the claims in `SECURITY.md`
 survive someone else's scrutiny.
+
+## Direction change, 2026-08 (owner)
+
+The priority moved from privacy depth to **product**: automatic embedding, integrations, and
+good voice and video in a lightweight client. Three decisions, recorded so they are not
+re-litigated:
+
+- **[ADR-008](adr/008-client-architecture.md): one web client, wrapped in Tauri.** Supersedes
+  the five-native-UI plan, which was the single largest cost in the project and the main
+  thing standing between here and calls. WebRTC supplies capture, echo cancellation, jitter
+  buffering and codec negotiation. The FFI line survives — protocol logic stays in Rust.
+- **[ADR-009](adr/009-instance-side-unfurl.md): the instance unfurls links.** One adapter
+  set, a shared cache, and thumbnails, at the cost of the instance seeing URLs its users
+  send. **Recipients still fetch nothing** — that was always the important half.
+- **Calls may downgrade** (`12-realtime-media.md` §5), carrying their own badge and
+  announcing the fallback, rather than refusing to connect.
+
+Both concessions are recorded in `01-threat-model.md` §3a. The tier model, franking, and the
+honesty rule are unchanged.
+
+**What this reorders.** Calls move from M6 to roughly M4; the native-client work that used to
+gate them is gone. Attachments and the storage rewrite are already done, so instance-side
+unfurl with thumbnails is close. Key transparency and metadata protection move further out —
+they were always M5+, and this makes that explicit rather than implied.
 
 ## M6 — Finished app
 

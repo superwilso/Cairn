@@ -273,7 +273,8 @@ fn help() {
     println!(
         "  /add <@name|user-id> add someone to the open room
   /username <name>     claim your handle, so people can find you without a uuid
-  /roster              server-side membership (who joined by invite, awaiting /add)
+  /roster              server-side membership (who joined by invite, awaiting /admit)
+  /admit               let everyone who joined by invite into the encrypted group
   /ttl <secs|off>      make messages in this room disappear after a while
   /send <path>         send a file, encrypted on this device before upload
   /invite [uses] [hrs] mint an invite link for the open room (default 1 use, 24h)
@@ -352,6 +353,7 @@ impl App {
             }
             "/username" => self.claim_username(rest)?,
             "/roster" => self.show_roster()?,
+            "/admit" => self.admit_waiting()?,
             "/ttl" => self.set_ttl(rest)?,
             "/send" => self.send_file(rest)?,
             "/invite" => self.create_invite(rest)?,
@@ -501,7 +503,7 @@ impl App {
             println!("    {user} ({role})");
         }
         println!("  /members shows who is in the encrypted group — anyone listed here but");
-        println!("  not there joined by invite and still needs /add <user-id>");
+        println!("  not there joined by invite and is waiting for /admit");
         Ok(())
     }
 
@@ -662,6 +664,10 @@ impl App {
         self.replay_history(room);
         let cursor = self.index.cursor(&room);
         self.open = Some(Open { convo, seal, cursor });
+        // Said on open rather than left to be discovered: someone who redeemed an invite is
+        // sitting in a room they cannot read, and the only person who can fix that is
+        // whoever opens it next.
+        self.report_waiting();
         Ok(())
     }
 
@@ -698,6 +704,115 @@ impl App {
 
         self.index.record(open.convo.room(), &open.seal, open.convo.group_id())?;
         println!("  added; they should see the room after their next poll");
+        Ok(())
+    }
+
+    /// Accounts the instance lists as members that the encrypted group does not hold.
+    ///
+    /// This comparison is what the old display-name credential made impossible: the MLS
+    /// roster carried labels a client chose for itself, so there was nothing to match the
+    /// server's member list against. Now every leaf names its account.
+    ///
+    /// A leaf this build cannot attribute is treated as **matching nobody**, which is the
+    /// safe direction: it may cause a redundant add attempt, where the opposite would
+    /// silently treat an unknown leaf as covering an account and leave someone out.
+    fn waiting_to_be_admitted(&self) -> Fallible<Vec<UserId>> {
+        let Some(open) = self.open.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let in_group: Vec<UserId> = open
+            .convo
+            .members()
+            .iter()
+            .filter_map(|m| DeviceIdentity::parse(&m.identity).ok().map(|id| id.user()))
+            .collect();
+
+        Ok(self
+            .client
+            .room_members(open.convo.room())?
+            .into_iter()
+            .map(|(user, _role)| user)
+            .filter(|user| !in_group.contains(user))
+            .collect())
+    }
+
+    /// Tell the user who is waiting, if anyone is.
+    fn report_waiting(&self) {
+        let waiting = match self.waiting_to_be_admitted() {
+            Ok(w) => w,
+            // Not fatal: a failed lookup must not stop someone reading their messages.
+            Err(e) => {
+                println!("  (could not check who is waiting to join: {e})");
+                return;
+            }
+        };
+        if waiting.is_empty() {
+            return;
+        }
+        println!(
+            "\n  {} account(s) joined by invite and cannot read this room yet:",
+            waiting.len()
+        );
+        for user in &waiting {
+            println!("    {user}");
+        }
+        println!("  run /admit to let them into the encrypted group\n");
+    }
+
+    /// Add everyone the instance lists as a member but the group does not hold.
+    ///
+    /// **Deliberately one command rather than automatic**, and the distinction is the whole
+    /// design. The list of who is waiting comes from the *instance*, so admitting on its
+    /// word alone would let a malicious one name an account of its choosing and have a
+    /// moderator's client hand it the group keys — silently. `cairn_crypto::mls` already
+    /// notes that the server cannot add a leaf itself because it never sees group state;
+    /// auto-admitting would give it that power back through the front door.
+    ///
+    /// So the friction this removes is the *uuid*, not the decision. Nobody pastes an id or
+    /// coordinates out of band any more; a human still says yes, and the timeline still
+    /// announces the join to every existing member.
+    fn admit_waiting(&mut self) -> Fallible<()> {
+        if self.open.is_none() {
+            return Err("open a room first".into());
+        }
+        let waiting = self.waiting_to_be_admitted()?;
+        if waiting.is_empty() {
+            println!("  nobody is waiting; everyone the instance lists is already in the group");
+            return Ok(());
+        }
+
+        for user in waiting {
+            // Each admission is its own commit, so one account with no published key
+            // packages does not block the rest. Reported rather than swallowed: a joiner
+            // who never published cannot be added, and they need telling.
+            match self.admit_one(user) {
+                Ok(()) => println!("  admitted {user}"),
+                Err(e) => println!("  could not admit {user}: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// The MLS half of admitting one account that is already a server-side member.
+    fn admit_one(&mut self, user: UserId) -> Fallible<()> {
+        let open = self.open.as_mut().ok_or("open a room first")?;
+        let claimed = self.client.claim_key_packages(user)?;
+
+        for package in &claimed {
+            let key_package =
+                cairn_crypto::mls::parse_message(&hex::decode(&package.key_package)?)?;
+            let group = open.convo.group_mut().ok_or("this room has no MLS group")?;
+            let output = group.add_member(key_package)?;
+
+            let commit = output.commit.to_bytes()?;
+            self.client.send(open.convo.room(), &open.convo.wrap_handshake(&commit, now_ms())?)?;
+            if let Some(welcome) = output.welcome {
+                let bytes = welcome.to_bytes()?;
+                self.client
+                    .send(open.convo.room(), &open.convo.wrap_handshake(&bytes, now_ms())?)?;
+            }
+        }
+        self.index.record(open.convo.room(), &open.seal, open.convo.group_id())?;
         Ok(())
     }
 
