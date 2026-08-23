@@ -4,6 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Documentation cannot break a build, and this repository is mostly documentation.
+    # A markdown-only commit previously spent a full matrix run proving that.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+  # So the full matrix can be demanded on a branch when it actually matters.
+  workflow_dispatch:
+
+# Pushing twice to a branch used to run the matrix twice. Only the newest commit can be
+# merged, so the older run is spent with nothing to show for it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,13 +26,28 @@ env:
 jobs:
   # The cross-platform claim in docs/09-platform-strategy.md is checked here rather than
   # assumed. Only Linux is verified locally during development.
+  #
+  # macOS is deliberately not in the pull-request matrix. GitHub bills a private repo's
+  # macOS minutes at **10x** Linux and Windows at 2x, which made a single six-job run cost
+  # roughly 49 billed minutes — about 60% of it macOS alone — against a 2000-minute monthly
+  # allowance. That is ~40 runs a month, and it ran out.
+  #
+  # The trade, stated rather than buried: an Apple-only failure is now caught when a branch
+  # merges rather than while it is in review. Accepted because nothing in the tree has an
+  # Apple-specific code path — every cfg branch is unix-vs-not — and because
+  # `scripts/ci-local.sh` cross-compiles to aarch64-apple-darwin before a push. Add the
+  # `full-matrix` label, or use workflow_dispatch, to get macOS on a pull request anyway.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(
+          (github.event_name == 'pull_request' &&
+           !contains(github.event.pull_request.labels.*.name, 'full-matrix'))
+          && '["ubuntu-latest","windows-latest"]'
+          || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,8 +76,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-audit --locked
+      # A prebuilt binary rather than `cargo install cargo-audit --locked`, which compiled
+      # the tool from source on every run — minutes spent rebuilding something that had not
+      # changed.
+      - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
   # 1.85 is a hard floor, not a preference: the crypto dependency tree pulls in crates

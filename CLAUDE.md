@@ -73,7 +73,20 @@ handler and it is untested and bypassable.
 
 ## Verification
 
+**Run `scripts/ci-local.sh` before pushing.** It is a faithful copy of
+`.github/workflows/ci.yml` and catches what ad-hoc local runs missed: CI sets
+`RUSTFLAGS=-D warnings` globally, tests with `--all-targets`, runs the vertical slice, and
+checks the MSRV floor and `cargo audit`. Running `cargo test` alone is a weaker check than
+CI, which is how a green local tree can still fail.
+
+This matters more than tidiness. GitHub bills a private repo's macOS minutes at **10x** and
+Windows at 2x, so a full matrix run costs ~49 billed minutes against a 2000/month allowance —
+about 40 runs. It has already run out once. A failure caught locally costs nothing.
+
 ```bash
+scripts/ci-local.sh                                 # everything CI runs, locally
+scripts/ci-local.sh quick                           # fmt + clippy + tests, tight loop
+
 cargo test --workspace                              # must pass
 cargo fmt --all
 cargo clippy --workspace --all-targets              # CI runs -D warnings
