@@ -41,6 +41,7 @@ $("go").onclick = async () => {
         const me = await invoke("sign_in", {
             profile: $("profile").value.trim() || "me",
             server: $("server").value.trim(),
+            invite: $("reg-invite").value.trim() || null,
         });
         myUser = me.user;
         $("whoami").textContent = short(me.user);
@@ -70,7 +71,9 @@ $("go").onclick = async () => {
     }
 };
 
-$("profile").onkeydown = $("server").onkeydown = (ev) => { if (ev.key === "Enter") $("go").click(); };
+for (const id of ["profile", "server", "reg-invite"]) {
+    $(id).onkeydown = (ev) => { if (ev.key === "Enter") $("go").click(); };
+}
 
 // ---- rooms -----------------------------------------------------------------
 

@@ -41,6 +41,19 @@ cargo run -p cairn-desktop
 Point it at an instance (`http://127.0.0.1:8080` by default; run one with
 `cargo run -p cairn-server`).
 
+**The invite code field on the sign-in card is a *registration* invite, not a room one.**
+The server's registration policy defaults to `InviteOnly` and `docs/11-self-hosting.md`
+recommends keeping it that way, so an operator hands one out per person:
+
+```bash
+CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=first-friend,second-friend \
+  cargo run -p cairn-server
+```
+
+It is ignored once a profile has registered — the instance checks the invite *before* it
+notices the account already exists, so a returning user presenting a spent token would
+otherwise be locked out of their own account.
+
 ## Building for Windows
 
 **Must happen on Windows.** Tauri packages against the platform's own webview — WebView2 on

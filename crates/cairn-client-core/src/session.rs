@@ -174,6 +174,28 @@ impl Session {
     /// credential is built from them. Building it from a display name is what let one member
     /// present another's label (`cairn_proto::identity`).
     pub fn open(profile: &str, server: &str, dir: Option<&Path>) -> Result<Self, SessionError> {
+        Self::open_with_invite(profile, server, dir, None)
+    }
+
+    /// As [`Session::open`], with a **registration** invite for an instance that requires
+    /// one.
+    ///
+    /// Distinct from a room invite, and the distinction is the whole reason this exists.
+    /// A room invite admits an existing account to a room; this one admits an account to the
+    /// *instance*. The server's default policy is `InviteOnly` and the self-hosting guide
+    /// recommends keeping it that way, so without this the client could only ever sign in to
+    /// an instance whose operator had opened registration to the whole internet — which is
+    /// exactly the configuration nobody should be running.
+    ///
+    /// Ignored when this profile has already registered. The instance checks the invite
+    /// *before* it notices the account exists, so a returning user presenting a spent token
+    /// would otherwise be locked out of their own account.
+    pub fn open_with_invite(
+        profile: &str,
+        server: &str,
+        dir: Option<&Path>,
+        invite: Option<&str>,
+    ) -> Result<Self, SessionError> {
         let dir = match dir {
             Some(explicit) => explicit.to_path_buf(),
             None => statedir::default_state_dir(profile)?,
@@ -202,7 +224,7 @@ impl Session {
             ringing: None,
         };
         if !claimed {
-            session.claim(None)?;
+            session.claim(invite)?;
         }
         Ok(session)
     }

@@ -373,3 +373,5 @@ header.topbar .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: el
   70%  { box-shadow: 0 0 0 11px rgba(110, 168, 254, 0); }
   100% { box-shadow: 0 0 0 0 rgba(110, 168, 254, 0); }
 }
+
+.hint { color: var(--dim); font-weight: 400; }

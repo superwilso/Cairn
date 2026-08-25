@@ -56,6 +56,10 @@
     <p class="tagline">A marker left for whoever comes next.</p>
     <label>Profile <input id="profile" value="me" spellcheck="false" autocomplete="off"></label>
     <label>Instance <input id="server" value="http://127.0.0.1:8080" spellcheck="false" autocomplete="off"></label>
+    <!-- A *registration* invite, not a room one. Most instances require it — that is the
+         server's default — and it is ignored once this profile has registered. -->
+    <label>Invite code <span class="hint">— if the instance needs one</span>
+      <input id="reg-invite" placeholder="optional" spellcheck="false" autocomplete="off"></label>
     <button id="go" class="primary">Sign in</button>
     <p id="signin-error" class="error"></p>
   </div>

@@ -48,8 +48,18 @@ fn with<T>(
 }
 
 #[tauri::command]
-fn sign_in(state: State<'_, AppState>, profile: String, server: String) -> CmdResult<SignedIn> {
-    let session = Session::open(&profile, &server, None).map_err(|e| e.to_string())?;
+fn sign_in(
+    state: State<'_, AppState>,
+    profile: String,
+    server: String,
+    invite: Option<String>,
+) -> CmdResult<SignedIn> {
+    // The **registration** invite, not a room one. Most instances should require it — it is
+    // the server's default and what the self-hosting guide recommends — so without it this
+    // client could only sign in to an instance that had opened registration to everyone.
+    let invite = invite.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let session = Session::open_with_invite(&profile, &server, None, invite.as_deref())
+        .map_err(|e| e.to_string())?;
     let signed = SignedIn { user: session.user_id(), tls: session.is_tls() };
     *state.0.lock().map_err(|_| "session lock poisoned".to_string())? = Some(session);
     Ok(signed)
