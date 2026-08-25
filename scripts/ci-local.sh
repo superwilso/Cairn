@@ -15,6 +15,13 @@
 #   - cargo check under 1.85          (the MSRV floor)
 #   - cargo audit
 #
+# **One thing this can never check: the runner's system packages.** `cairn-desktop` links
+# GTK and WebKitGTK on Linux, and a development machine has those installed by definition —
+# it could not have built the client otherwise. A GitHub runner does not, and every Ubuntu
+# job failed in twelve seconds on `glib-2.0 was not found` while this script and the Windows
+# job both passed. The workflow now installs them; the check below is the closest a local
+# run can get, which is to notice if that step ever disappears.
+#
 # Usage:
 #   scripts/ci-local.sh           everything that can run here
 #   scripts/ci-local.sh quick     fmt + clippy + tests only, for a tight loop
@@ -37,6 +44,16 @@ run() {
         printf '\033[31mFAILED: %s\033[0m\n' "$name"
     fi
 }
+
+# ---- what a local run structurally cannot verify --------------------------
+# Not a substitute for the real thing, just a tripwire: if the workflow stops installing the
+# Linux webview packages, a local run will still pass and CI will still fail. This at least
+# makes the omission visible here rather than after a push.
+if ! grep -q 'libwebkit2gtk-4.1-dev' .github/workflows/ci.yml; then
+    printf '\n\033[33mWARNING: ci.yml no longer installs libwebkit2gtk-4.1-dev.\n'
+    printf 'cairn-desktop will fail to build on the Ubuntu runners, and this machine\n'
+    printf 'cannot reproduce that because it already has the package.\033[0m\n'
+fi
 
 # ---- lint job -------------------------------------------------------------
 run "fmt --check"          cargo fmt --all --check

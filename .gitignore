@@ -11,3 +11,6 @@
 # Tauri build output
 clients/desktop/src-tauri/target/
 clients/desktop/src-tauri/gen/
+
+# Playwright, installed by the CI desktop job for the browser call test.
+node_modules/

@@ -15,10 +15,24 @@
 # Shipping a Linux bundle with a call button that silently fails is worse than shipping none.
 # The Linux leg is commented out rather than deleted so turning it on is one line.
 #
-# **Nothing in this file has been executed.** It was written on Linux, and a Windows
-# installer cannot be produced or verified from there. What *was* verified locally is the
-# thing most likely to break it: `tauri-build` hard-errors without `icons/icon.ico`, so
-# `ci.yml` now checks every icon the bundle config names before a runner is ever started.
+# ## What has and has not been exercised
+#
+# **This workflow has never run.** It was written on Linux, and it cannot run until the
+# repository's Actions quota is restored.
+#
+# What *was* exercised locally, because a first run on a billed Windows runner is an
+# expensive place to discover a typo:
+#
+#   - `cargo tauri build` against this exact config, through to a finished bundle
+#     (`--bundles deb` on Linux). That covers config parsing, `frontendDist` resolution, the
+#     icon set, the CSP, and the bundler's output layout.
+#   - `icons/icon.ico` compiled by `llvm-rc` into a Windows resource — the step `tauri-build`
+#     runs, and the one it **hard-errors** on if the file is missing. `ci.yml` now checks
+#     every icon the bundle config names before a runner is ever started.
+#   - The built release binary starts and serves its embedded frontend.
+#
+# What remains genuinely unverified is the Windows-only half: NSIS and WiX packaging, and
+# WebView2 at runtime.
 
 name: Release
 
