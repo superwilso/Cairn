@@ -52,6 +52,13 @@ What the mesh does not have:
 - **Every participant learns every other participant's IP address.** Inherent to
   peer-to-peer media, stated in §6 already, and stated in the client's own UI. A relay is
   the only thing that changes it, and a relay costs an operator bandwidth.
+- **A call has no roster of its own**, so it cannot tell a participant from a room member who
+  is merely nearby. In the window between joining and the first offer, any member of the room
+  can rename a device's call and split the call in two, each half waiting for answers the
+  other will never send. It buys an attacker nothing — they are already in the room and could
+  disrupt a call by joining it — but the failure is silent and looks like a network fault, so
+  it is written down rather than left to be discovered. §2's per-call MLS group is what
+  supplies the roster that closes it.
 
 Three layers of test cover it, because each catches what the others cannot: the transport in
 `group_chat_session.rs`, the mesh's decisions against a fake `RTCPeerConnection` in

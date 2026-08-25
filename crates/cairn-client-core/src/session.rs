@@ -593,6 +593,15 @@ impl Session {
     /// deterministic tie-break the frontend uses to decide who offers, needing no extra
     /// round trip. Renaming stops once anything has been negotiated, because by then a
     /// rename would orphan live peer connections.
+    ///
+    /// **What this does not defend against, stated rather than implied.** Between joining a
+    /// call and exchanging the first offer, any *member of the room* can rename this device's
+    /// call by sending an addressed join — splitting a call in two so each half waits for
+    /// answers the other will never send. It is a denial of service by somebody who is
+    /// already inside the room and could disrupt a call by simply joining it, so it buys an
+    /// attacker nothing they did not have; it is recorded because the failure is silent and
+    /// looks like a network fault. Closing it needs a roster the call does not have —
+    /// `docs/12-realtime-media.md` §2's per-call MLS group is where that comes from.
     fn reconcile(&mut self, mut signal: CallSignal) -> Option<CallSignal> {
         let Some(mine) = self.call.clone() else {
             // Not in the call. Arrival and departure announcements are still worth
@@ -607,7 +616,15 @@ impl Session {
                     self.ringing = Some(signal.call.clone());
                     Some(signal)
                 }
-                SignalKind::Leave => Some(signal),
+                SignalKind::Leave => {
+                    // Whoever was calling has given up. Forgetting the id stops a later
+                    // `call_join` adopting a call nobody is in; if somebody else is still in
+                    // it, their acknowledgement renames this device into it anyway.
+                    if self.ringing.as_deref() == Some(signal.call.as_str()) {
+                        self.ringing = None;
+                    }
+                    Some(signal)
+                }
                 _ => None,
             };
         };
@@ -644,15 +661,18 @@ impl Session {
         if let Some(call) = &self.call {
             signal.call = call.clone();
         }
-        if matches!(signal.kind, SignalKind::Offer | SignalKind::Answer) {
-            self.negotiated = true;
-        }
+        let negotiating = matches!(signal.kind, SignalKind::Offer | SignalKind::Answer);
         let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
         if open.convo.group_id().is_none() {
             return Err(SessionError::NoGroupYet);
         }
         let outbound = open.convo.send_signal(signal, now_ms())?;
         self.client.send(open.convo.room(), &outbound.envelope)?;
+        // Only after it is actually on the wire. Marking it beforehand would let a send that
+        // failed lock out a rename that is still legitimate.
+        if negotiating {
+            self.negotiated = true;
+        }
         Ok(())
     }
 
