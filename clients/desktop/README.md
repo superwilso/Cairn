@@ -83,8 +83,13 @@ not in the encrypted group is marked, because they cannot read a word of it.
 Voice, video and screen sharing, as a **mesh**: every participant holds a direct peer
 connection to every other, and media never touches the instance. There is no SFU to deploy
 and nothing for an operator to pay for. The cost is why an SFU exists — everyone uploads
-their stream once per other participant — so `MAX_MESH_PARTICIPANTS` (6) refuses past the
-point where a call would stop degrading gracefully. See
+their stream once per other participant — so a call is capped at `MAX_MESH_PARTICIPANTS`
+(6) and says so out loud rather than letting everyone blame their broadband.
+
+The cap is enforced per *peer connection*, in the frontend, because that is the only place
+the number is real. An earlier version checked the room's size in Rust instead, which meant a
+group chat of eight could not hold a call between two of them — and the error blamed the
+room. See
 [`docs/12-realtime-media.md`](../../docs/12-realtime-media.md) for where this goes next.
 
 **Signalling rides inside the encrypted message body.** An SDP offer names your codecs, your

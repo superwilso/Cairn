@@ -174,6 +174,19 @@ const CairnCall = (() => {
                 // Tell the newcomer we are here, so they can apply the same offer rule.
                 // Addressed, so it does not loop: an ack never triggers another ack.
                 if (!signal.to) await send({ kind: "join", to: from });
+
+                // The mesh ceiling, enforced where the count is real: not "how many people
+                // are in this room" — a group of eight can hold a call between two — but how
+                // many peer connections this device is holding. Each participant uploads once
+                // per peer, so this is the number that runs out of upstream.
+                const ceiling = (config && config.max_participants) || 6;
+                if (!peers.has(from) && peers.size >= ceiling - 1) {
+                    ui.onNotice(
+                        "This call is full at " + ceiling + " people, so " + shortId(from) +
+                        " could not be connected. A larger call needs a server to mix it."
+                    );
+                    return;
+                }
                 // Offer once per peer, on the first join seen from them. A joiner sends a
                 // broadcast and then acknowledges the replies, so without this a peer gets
                 // an offer per join announcement and the second tears down the first.

@@ -1,7 +1,7 @@
 # Voice, video, and screen sharing
 
-**Status:** Design. Nothing here is built, and nothing here should be built before the
-native clients exist — see §9.
+**Status:** Design, with a **smaller rung of it now shipped** — see §0. Everything from §2
+onward is still design: no SFU, no SFrame, no per-call MLS group.
 
 Discord's voice channels are, along with its bot ecosystem, the reason communities stay on
 Discord. `08-feature-parity.md` §2 lists drop-in voice channels and screen share as v2
@@ -14,6 +14,51 @@ protocol, published as a whitepaper with an accompanying Trail of Bits audit. It
 closest thing to prior art that exists — an MLS-keyed, SFU-compatible E2EE media stack
 shipped to a community-messaging product at scale. Most of what follows either adopts it or
 says precisely why Cairn diverges.
+
+---
+
+## 0. What is actually built
+
+`clients/desktop` makes voice, video and screen-sharing calls today. It is **not** the design
+below; it is the rung underneath, and the distinction matters because a reader who takes this
+document as a description of the product would credit the client with protections it does not
+have.
+
+| | Built (mesh) | Designed (§2–§4) |
+|---|---|---|
+| Topology | **Mesh**, capped at 6 | SFU |
+| Media encryption | **DTLS-SRTP**, hop-free — peer to peer | SFrame over an MLS-derived key |
+| Call keying | **None of its own** | A per-call MLS group, rotated on removal |
+| Signalling | **Inside the encrypted message body** | The same |
+| Media path | **Never touches the instance** | Through the SFU, which cannot read it |
+
+What the two share is the property that mattered most: the instance sees ciphertext. In the
+mesh it never sees the media at all, and the SDP handshake rides inside the encrypted body
+rather than beside it — an offer names the sender's codecs, ICE candidates and addresses, and
+the instance has no use for any of it. `crates/cairn-server/tests/group_chat_session.rs` reads
+what the instance actually stored and asserts the SDP is not in it.
+
+What the mesh does not have:
+
+- **No SFU**, so nothing to deploy and nothing for an operator to pay for — but every
+  participant uploads their stream once *per other participant*. `MAX_MESH_PARTICIPANTS` is
+  six, which is where refusing beats degrading and blaming the network.
+- **No SFrame and no call MLS group.** Media is protected by DTLS-SRTP between the two peers,
+  which is end-to-end *because there is no middle*, not because of anything Cairn built.
+  Adding an SFU is exactly what makes §4 necessary.
+- **No downgrade badge** (§5). Nothing can downgrade yet, because there is only one mode.
+- **No TURN relay**, so STUN-only traversal fails on some home networks. The client says so
+  rather than leaving a user to conclude their connection is broken.
+- **Every participant learns every other participant's IP address.** Inherent to
+  peer-to-peer media, stated in §6 already, and stated in the client's own UI. A relay is
+  the only thing that changes it, and a relay costs an operator bandwidth.
+
+Three layers of test cover it, because each catches what the others cannot: the transport in
+`group_chat_session.rs`, the mesh's decisions against a fake `RTCPeerConnection` in
+`clients/desktop/tests/mesh.test.js`, and a real call between two Chromium pages in
+`call.browser.test.js`. The last found a bug nothing else could: a transceiver the answering
+side pre-created that a remote offer will not reuse, which left every call reporting
+"connected" while carrying video in one direction only.
 
 ---
 
@@ -230,6 +275,13 @@ feature where the native clients are a hard prerequisite rather than a quality b
 The sequencing is therefore: storage (ADR-007) → attachments → native clients → **this**.
 It is a v2 item at the earliest, and it is honestly the largest single component the project
 has considered — larger than the server.
+
+**Overtaken by events, and worth recording why.** The mesh in §0 shipped without any of that
+sequence, because dropping the SFU drops nearly all of it: no server component, no SFrame, no
+call MLS group, no simulcast. What is left is signalling and `RTCPeerConnection`, and the
+browser supplies the second. That is not an argument against the design below — six
+participants is a real ceiling and the reason an SFU exists — but it does mean the
+prerequisite chain was for the *SFU*, not for calls.
 
 ## 10. What it costs a self-hoster
 

@@ -35,7 +35,7 @@ use cairn_crypto::mls::Session as MlsSession;
 use cairn_crypto::verification::VerificationState;
 use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, Tier, UserId};
 
-use crate::call::{CallSignal, SignalKind, MAX_MESH_PARTICIPANTS};
+use crate::call::{CallSignal, SignalKind};
 use crate::client::{Client, ClientError};
 use crate::contacts::{ContactError, ContactStore};
 use crate::conversation::{Conversation, ConversationError, TimelineEvent};
@@ -68,12 +68,6 @@ pub enum SessionError {
     NoGroupYet,
     #[error("identity file is unreadable: {0}")]
     Identity(String),
-    #[error(
-        "this call has {participants} people and a mesh call is capped at \
-         {MAX_MESH_PARTICIPANTS}: every participant sends their video to every other, so \
-         upstream runs out before the encryption does. A larger call needs an SFU"
-    )]
-    CallTooLarge { participants: usize },
 }
 
 /// A room as a frontend needs to show it.
@@ -521,14 +515,17 @@ impl Session {
         if open.convo.group_id().is_none() {
             return Err(SessionError::NoGroupYet);
         }
-        // Mesh, so every participant uploads to every other. Refusing beyond the ceiling is
-        // honest — past it a call does not fail, it degrades, and everyone blames their
-        // connection instead of the design.
-        let participants = open.convo.members().len();
-        if participants > MAX_MESH_PARTICIPANTS {
-            return Err(SessionError::CallTooLarge { participants });
-        }
-
+        // **No room-size check here, deliberately.** There used to be one, counting the
+        // devices in the encrypted group — the wrong thing entirely. A group chat of eight
+        // could not hold a call between two of them, and the refusal named the room's size
+        // as the reason, which reads as "calls are broken in big groups".
+        //
+        // The mesh ceiling is about how many people are *in the call*, and nobody knows that
+        // at the moment of joining: a call starts with one person and grows as arrivals
+        // announce themselves. What every device does know is how many peer connections it
+        // is holding, and that is exactly the thing the ceiling bounds — so it is enforced
+        // in the frontend, per connection, where the count is real. `call_config` hands it
+        // `MAX_MESH_PARTICIPANTS` so the number still lives here.
         // Joining a call that has been announced must join *that* call. Minting a fresh id
         // here is what made two people pressing the button a race rather than a meeting.
         let call = self

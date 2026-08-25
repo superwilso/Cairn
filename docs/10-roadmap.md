@@ -302,6 +302,46 @@ Four calls made by the owner, so a session does not re-litigate them:
       Unblocks auto-adding invite joiners, since a client can finally map the MLS roster
       onto the server's member list. **Breaking**: a client too old to name its account
       cannot publish key packages or be added to a room.
+- [x] **A desktop client people can actually be handed.** `clients/desktop` — one web UI
+      wrapped in Tauri, per ADR-008. Group chats, invites, admission, the tier badge, the
+      member list, and the transport badge that says *plaintext* over `http://` rather than
+      implying a protection that is not there.
+- [x] **Voice, video and screen sharing**, with microphone / camera / output selection.
+      A WebRTC **mesh** capped at six: media is DTLS-SRTP directly between participants and
+      never reaches the instance, and there is no SFU to deploy. Signalling rides *inside*
+      the encrypted message body, so the instance relays a blob rather than reading an SDP
+      offer full of the sender's codecs, candidates and addresses.
+
+      **Four defects, every one found by probing and none by reading**, and every one of
+      them would have been blamed on somebody's network:
+
+      - Each participant minted its own call id and discarded signals carrying anyone
+        else's, so two people pressing "call" in the same second ended up in two calls of
+        one person each. `Session::reconcile` settles it with the same tie-break the mesh
+        uses to pick who offers.
+      - There was no way to be *told* a call had started. Arrival and departure now ring a
+        device that is not in the call — and only those, because handing an offer to
+        somebody who has not accepted turns their camera light on unasked.
+      - The answering side pre-created its video transceiver, which a remote offer will not
+        reuse. The call reached "connected", looked healthy, and carried video one way only.
+        Found by running two real browsers against each other; nothing below that layer
+        could have seen it.
+      - A repeated join announcement re-offered to a peer, tearing down the connection that
+        was already working.
+
+      **Stated rather than hidden**, per the honesty rule: STUN alone cannot cross some home
+      networks, and a mesh call shows every participant every other participant's IP address.
+      Both appear in the UI, the client README and the release notes.
+
+      **Not done:** an SFU, SFrame, a TURN relay, the per-call MLS group, or the downgrade
+      badge of `12-realtime-media.md` §5. This is the rung below that design, and it is what
+      makes a call work at all.
+- [x] **A Windows release build.** `.github/workflows/release.yml` bundles the client on
+      `windows-latest` and publishes it as a prerelease. **Unrun** — it was written on Linux,
+      where a Windows installer cannot be produced or verified. What *was* caught locally is
+      the likeliest way it would have failed: `tauri-build` hard-errors without
+      `icons/icon.ico`, and the icon that existed was a placeholder of 512x512 identical
+      pixels. `scripts/make-icon.py` draws both, and CI checks every icon the bundle names.
 - [ ] Rate limiting on registration and sending. Both need the caller's address, which
       `state.rs` never sees — so unlike the claim limit, this one genuinely cannot live
       entirely where the other rules do, and that boundary needs designing rather than

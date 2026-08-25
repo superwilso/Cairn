@@ -246,6 +246,15 @@ function client(user, room, stats, built) {
     return call;
 }
 
+function group(users) {
+    const room = new Room();
+    const stats = { offers: 0, answers: 0, connections: 0 };
+    const built = Object.fromEntries(users.map((u) => [u, []]));
+    const calls = users.map((u) => client(u, room, stats, built[u]));
+    const senders = (user) => built[user].flatMap((pc) => pc.getSenders());
+    return { room, stats, calls, built, senders };
+}
+
 function pair() {
     const room = new Room();
     const stats = { offers: 0, answers: 0, connections: 0 };
@@ -396,6 +405,42 @@ test("the answering side does not pre-create the video line", async () => {
     );
     assert.strictEqual(video[0].direction, "sendrecv", "and it must be claimed for sending too");
     assert.ok(video[0].sender.track, "with our own camera track put into it");
+});
+
+test("a call refuses the person who would exceed the mesh ceiling", async () => {
+    // Not "how many people are in this room" — a group chat of eight can hold a call
+    // between two of them, and an earlier version refused exactly that, naming the room's
+    // size as the reason. The ceiling is about peer connections, because that is what runs
+    // out of upstream, so it is checked where the count is real.
+    const users = ["usr_1", "usr_2", "usr_3", "usr_4", "usr_5", "usr_6", "usr_7"];
+    const { room, calls } = group(users);
+
+    const notices = [];
+    calls[0].bind({ onNotice: (t) => notices.push(t) });
+
+    for (let i = 0; i < users.length; i++) {
+        await calls[i].join({ video: false, myUser: users[i] });
+        await room.settle();
+    }
+
+    // Six people means five peers each. The seventh is refused, and told so.
+    assert.strictEqual(calls[0].peerCount, 5, "five peers, which is a call of six");
+    assert.ok(
+        notices.some((t) => t.includes("full at 6")),
+        "and the refusal is said out loud rather than looking like a dropped call: " +
+            JSON.stringify(notices)
+    );
+});
+
+test("a small call in a large room is not refused", async () => {
+    // The counterfactual, and the bug that was actually there: the ceiling used to count the
+    // room's members, so two people in a group of eight could not call each other at all.
+    const { room, calls } = group(["usr_1", "usr_2"]);
+    await calls[0].join({ video: false, myUser: "usr_1" });
+    await calls[1].join({ video: false, myUser: "usr_2" });
+    await room.settle();
+
+    assert.strictEqual(calls[0].peerCount, 1, "two people in a call, connected");
 });
 
 test("leaving tells the peer, who tears the connection down", async () => {
