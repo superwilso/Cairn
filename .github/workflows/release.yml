@@ -17,15 +17,18 @@
 #
 # ## What has and has not been exercised
 #
-# **This workflow has never run.** It was written on Linux, and it cannot run until the
-# repository's Actions quota is restored.
+# **This workflow has never run.** It was written on Linux, where a Windows installer cannot
+# be produced or verified.
 #
 # What *was* exercised locally, because a first run on a billed Windows runner is an
 # expensive place to discover a typo:
 #
-#   - `cargo tauri build` against this exact config, through to a finished bundle
-#     (`--bundles deb` on Linux). That covers config parsing, `frontendDist` resolution, the
-#     icon set, the CSP, and the bundler's output layout.
+#   - **The exact build command below**, `cargo tauri build --bundles <type>`, against this
+#     exact config, through to a finished bundle (`--bundles deb` on Linux). That covers
+#     config parsing, `frontendDist` resolution, the icon set, the CSP, and where the
+#     bundler puts its output — which is the workspace target directory at the repository
+#     root, not under `src-tauri`. The collect step below was written from that observed
+#     path rather than a guess, and lists what it found either way.
 #   - `icons/icon.ico` compiled by `llvm-rc` into a Windows resource — the step `tauri-build`
 #     runs, and the one it **hard-errors** on if the file is missing. `ci.yml` now checks
 #     every icon the bundle config names before a runner is ever started.
@@ -95,36 +98,51 @@ jobs:
       - name: Check the client compiles
         run: cargo check -p cairn-desktop
 
-      # There is deliberately no package.json anywhere in this repository, so the Tauri
-      # action falls back to `cargo tauri` — and installs the CLI *from source* if it is
-      # missing, which costs more billed runner minutes than the build it exists to run.
-      # A prebuilt binary avoids that. Not fatal if it fails: the action's own fallback
-      # still works, it is just slower.
+      # `cargo install tauri-cli` compiles the CLI from source, which costs more billed
+      # runner minutes than the build it exists to run. binstall fetches the prebuilt one.
       - uses: cargo-bins/cargo-binstall@main
-        continue-on-error: true
-      - name: Install the Tauri CLI as a prebuilt binary
-        continue-on-error: true
-        run: cargo binstall --no-confirm "tauri-cli@^2"
+      - name: Install the Tauri CLI
+        run: cargo binstall --no-confirm --locked "tauri-cli@^2"
 
-      # The official action rather than `cargo install tauri-cli` — installing the CLI from
-      # source cost more runner minutes than the build it was there to run.
-      #
-      # `--bundles` overrides the config's target list, which names Linux formats too;
-      # asking a Windows runner for a .deb is a confusing way to fail.
-      - name: Build and publish
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the bundle
+        working-directory: clients/desktop/src-tauri
+        # `--bundles` overrides the config's target list, which names Linux formats too:
+        # asking a Windows runner for a .deb is a confusing way to fail. This exact command
+        # was run locally against this exact config, through to a finished bundle.
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
+
+      # The bundle lands in the *workspace* target directory at the repository root, not
+      # under src-tauri — verified locally rather than assumed. The listing is deliberate:
+      # if the layout ever moves, the log says where to.
+      - name: Collect the installers
+        shell: bash
+        run: |
+          echo "--- everything the bundler produced ---"
+          find target/release/bundle -type f -print
+          mkdir -p dist
+          find target/release/bundle -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} dist/ \;
+          echo "--- to be published ---"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
         with:
-          projectPath: clients/desktop
-          args: --bundles ${{ matrix.bundles }}
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: Cairn ${{ github.event.inputs.tag || github.ref_name }}
-          releaseDraft: false
+          name: cairn-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Cairn ${{ github.event.inputs.tag || github.ref_name }}
           # Pre-alpha, and it says so where somebody will actually read it. Marking it
           # otherwise would be the first dishonest thing this project shipped.
           prerelease: true
-          releaseBody: |
+          draft: false
+          files: dist/*
+          fail_on_unmatched_files: true
+          body: |
             ## Cairn desktop — pre-alpha
 
             **Not audited. Not reviewed. Do not use this for anything that matters yet.**
