@@ -60,6 +60,7 @@ crates/cairn-crypto/       MLS sessions, franking, safety numbers
 crates/cairn-client-core/  conversation logic — never gains a UI dependency
 crates/cairn-server/       instance server: state.rs holds the rules, http.rs translates
 crates/cairn-cli/          headless demo
+clients/desktop/           Tauri shell (src-tauri/) + the web UI (ui/) + JS tests (tests/)
 ```
 
 **All protocol, crypto, storage, and tier logic lives below the FFI line** — in `proto`,
@@ -73,11 +74,25 @@ handler and it is untested and bypassable.
 
 ## Verification
 
+**Run `scripts/ci-local.sh` before pushing.** It is a faithful copy of
+`.github/workflows/ci.yml` and catches what ad-hoc local runs missed: CI sets
+`RUSTFLAGS=-D warnings` globally, tests with `--all-targets`, runs the vertical slice, and
+checks the MSRV floor and `cargo audit`. Running `cargo test` alone is a weaker check than
+CI, which is how a green local tree can still fail.
+
+This matters more than tidiness. GitHub bills a private repo's macOS minutes at **10x** and
+Windows at 2x, so a full matrix run costs ~49 billed minutes against a 2000/month allowance —
+about 40 runs. It has already run out once. A failure caught locally costs nothing.
+
 ```bash
+scripts/ci-local.sh                                 # everything CI runs, locally
+scripts/ci-local.sh quick                           # fmt + clippy + tests, tight loop
+
 cargo test --workspace                              # must pass
 cargo fmt --all
 cargo clippy --workspace --all-targets              # CI runs -D warnings
 cargo run -p cairn-cli                              # vertical slice
+cargo run -p cairn-desktop                          # desktop client (needs libwebkit2gtk-4.1-dev)
 cargo run -p cairn-crypto --example group_scaling --release
 ```
 
@@ -86,6 +101,26 @@ the crypto tree needs `edition2024`), and runs `cargo audit`.
 
 **Verify over HTTP, not only in unit tests.** Both room bugs looked fine in unit tests
 written against the same wrong mental model. Start the server and make the actual request.
+
+**`cargo test` cannot see the client's JavaScript, and the call mesh lives there.** Who
+offers, whether an early ICE candidate survives, whether the answering side claims the video
+transceiver — all decided in `ui/call.js`, and every failure there presents as a network
+fault. Two layers cover it, both run by `ci-local.sh` and by CI:
+
+```bash
+node --test clients/desktop/tests/mesh.test.js          # against a fake RTCPeerConnection
+node --test clients/desktop/tests/call.browser.test.js  # two real Chromium pages, fake devices
+```
+
+The browser one earns its cost: it found a transceiver the answering side pre-created that a
+remote offer will not reuse, which made every call report "connected" while carrying video
+one way only. No stub could have caught that, because a stub agrees with the code.
+
+**Screenshot the UI rather than reasoning about it.** Playwright and a Chromium are in the
+container (`/opt/pw-browsers`); serve `ui/` over `http://localhost` — `getUserMedia` needs a
+secure context — stub `window.__TAURI__.core.invoke`, and look. That is how the sign-in pane
+was found still on screen after signing in, pushing the whole app below the fold: `display:
+grid` in a rule beats the user-agent rule for the `hidden` attribute.
 
 ## Conventions
 

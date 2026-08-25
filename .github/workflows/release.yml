@@ -1,0 +1,197 @@
+# Build the desktop client and publish it to GitHub Releases.
+#
+# ## Cost, because it is the reason this is not on every push
+#
+# GitHub bills a private repository's Windows minutes at **2x** and macOS at **10x**. A Tauri
+# build compiles the whole workspace plus the webview bindings and then runs an installer
+# packager, so it is not cheap. This runs only on a version tag or when somebody asks for it
+# by hand. `ci.yml` carries the same reasoning for its matrix.
+#
+# ## Windows only, for now
+#
+# That is where the client is. WebView2 is the only webview it has been exercised against,
+# and the Linux build has a known gap — WebKitGTK denies the microphone permission because
+# `wry` only handles the clipboard one, so calls cannot start (clients/desktop/README.md).
+# Shipping a Linux bundle with a call button that silently fails is worse than shipping none.
+# The Linux leg is commented out rather than deleted so turning it on is one line.
+#
+# ## What has and has not been exercised
+#
+# **This workflow has never run.** It was written on Linux, where a Windows installer cannot
+# be produced or verified.
+#
+# What *was* exercised locally, because a first run on a billed Windows runner is an
+# expensive place to discover a typo:
+#
+#   - **The exact build command below**, `cargo tauri build --bundles <type>`, against this
+#     exact config, through to a finished bundle (`--bundles deb` on Linux). That covers
+#     config parsing, `frontendDist` resolution, the icon set, the CSP, and where the
+#     bundler puts its output — which is the workspace target directory at the repository
+#     root, not under `src-tauri`. The collect step below was written from that observed
+#     path rather than a guess, and lists what it found either way.
+#   - `icons/icon.ico` compiled by `llvm-rc` into a Windows resource — the step `tauri-build`
+#     runs, and the one it **hard-errors** on if the file is missing. `ci.yml` now checks
+#     every icon the bundle config names before a runner is ever started.
+#   - The built release binary starts and serves its embedded frontend.
+#
+# What remains genuinely unverified is the Windows-only half: NSIS and WiX packaging, and
+# WebView2 at runtime.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # So a build can be produced from a branch without cutting a version tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish under (e.g. v0.0.1-alpha.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not discard the artefacts of one that succeeded.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows (x86_64)
+            bundles: nsis,msi
+          # - os: ubuntu-22.04
+          #   name: Linux (x86_64)
+          #   bundles: deb,appimage
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Tauri needs the system webview and its build tooling on Linux. Nothing to do on
+      # Windows, where WebView2 ships with the OS and Tauri's installer bootstraps it where
+      # it is missing.
+      - name: Install Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fail on a compile error here rather than 15 minutes into the bundler, where it would
+      # be buried in installer output.
+      - name: Check the client compiles
+        run: cargo check -p cairn-desktop
+
+      # `cargo install tauri-cli` compiles the CLI from source, which costs more billed
+      # runner minutes than the build it exists to run. binstall fetches the prebuilt one.
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install the Tauri CLI
+        run: cargo binstall --no-confirm --locked "tauri-cli@^2"
+
+      - name: Build the bundle
+        working-directory: clients/desktop/src-tauri
+        # `--bundles` overrides the config's target list, which names Linux formats too:
+        # asking a Windows runner for a .deb is a confusing way to fail. This exact command
+        # was run locally against this exact config, through to a finished bundle.
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
+
+      # The bundle lands in the *workspace* target directory at the repository root, not
+      # under src-tauri — verified locally rather than assumed. The listing is deliberate:
+      # if the layout ever moves, the log says where to.
+      - name: Collect the installers
+        shell: bash
+        run: |
+          echo "--- everything the bundler produced ---"
+          find target/release/bundle -type f -print
+          mkdir -p dist
+          find target/release/bundle -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} dist/ \;
+          echo "--- to be published ---"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cairn-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Cairn ${{ github.event.inputs.tag || github.ref_name }}
+          # Pre-alpha, and it says so where somebody will actually read it. Marking it
+          # otherwise would be the first dishonest thing this project shipped.
+          prerelease: true
+          draft: false
+          files: dist/*
+          fail_on_unmatched_files: true
+          body: |
+            ## Cairn desktop — pre-alpha
+
+            **Not audited. Not reviewed. Do not use this for anything that matters yet.**
+
+            ### What works
+
+            - **Group chats**, end-to-end encrypted with MLS (RFC 9420). A private group is
+              T2: the instance stores ciphertext it cannot read, and a bigger room is not a
+              weaker one — only public discoverability drops a room to a server-readable tier.
+            - **Invites**, of two kinds, and the sign-in card labels which is which. A
+              *registration* invite admits an account to the instance — most instances should
+              require one. A *room* invite carries an existing account into a room: redeeming
+              joins the room, and a member still has to **admit** them into the encrypted
+              group, so nothing is readable until somebody chooses to share it.
+            - **Voice and video calls**, peer-to-peer. Media never touches the instance, and
+              the SDP handshake travels inside the encrypted message body rather than beside
+              it — so the instance never sees your codecs, candidates or addresses.
+            - **Screen sharing**, and microphone / camera / output device selection.
+
+            ### What does not
+
+            - **Calls are a mesh, capped at 6 people.** Everyone sends their stream to
+              everyone else, so a larger call would saturate a domestic upload rather than
+              fail cleanly.
+            - **No TURN relay is configured.** Calls use STUN only, which cannot cross some
+              home networks. When that happens the client says so instead of leaving you to
+              blame your broadband.
+            - **A call shows every participant every other participant's IP address.** That
+              is what peer-to-peer media means. A relay is the only thing that changes it,
+              and a relay costs an operator bandwidth.
+            - **Windows only.** The client builds on Linux too, but calls cannot start there:
+              WebKitGTK denies the microphone permission, because the webview wrapper only
+              handles the clipboard one. No macOS build is produced yet.
+            - **No key backup.** Losing the profile directory loses that device's history.
+
+            ### Running it
+
+            You also need an instance to connect to, and both people must point at the same
+            one. For a local instance use `http://127.0.0.1:8080`:
+
+            ```bash
+            CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=for-alice,for-bob \
+              cargo run -p cairn-server
+            ```
+
+            Hand each person one of those tokens for the **Invite code** field. Registration
+            is invite-only by default and should stay that way on anything reachable from the
+            internet.
+
+            Over plain `http://` the client shows a **plaintext** badge, and it means it:
+            message bodies are still end-to-end encrypted, but account ids, membership
+            changes and request timing are in the clear on the wire.

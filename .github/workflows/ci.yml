@@ -4,6 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+    # Documentation cannot break a build, and this repository is mostly documentation.
+    # A markdown-only commit previously spent a full matrix run proving that.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+  # So the full matrix can be demanded on a branch when it actually matters.
+  workflow_dispatch:
+
+# Pushing twice to a branch used to run the matrix twice. Only the newest commit can be
+# merged, so the older run is spent with nothing to show for it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,20 +26,88 @@ env:
 jobs:
   # The cross-platform claim in docs/09-platform-strategy.md is checked here rather than
   # assumed. Only Linux is verified locally during development.
+  #
+  # macOS is deliberately not in the pull-request matrix. GitHub bills a private repo's
+  # macOS minutes at **10x** Linux and Windows at 2x, which made a single six-job run cost
+  # roughly 49 billed minutes — about 60% of it macOS alone — against a 2000-minute monthly
+  # allowance. That is ~40 runs a month, and it ran out.
+  #
+  # The trade, stated rather than buried: an Apple-only failure is now caught when a branch
+  # merges rather than while it is in review. Accepted because nothing in the tree has an
+  # Apple-specific code path — every cfg branch is unix-vs-not — and because
+  # `scripts/ci-local.sh` cross-compiles to aarch64-apple-darwin before a push. Add the
+  # `full-matrix` label, or use workflow_dispatch, to get macOS on a pull request anyway.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(
+          (github.event_name == 'pull_request' &&
+           !contains(github.event.pull_request.labels.*.name, 'full-matrix'))
+          && '["ubuntu-latest","windows-latest"]'
+          || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
+      # `cairn-desktop` links the platform webview, and on Linux that means GTK and
+      # WebKitGTK development packages. Windows needs nothing — WebView2 ships with the OS —
+      # which is why this looked fine there while every Ubuntu job failed in twelve seconds
+      # on `glib-2.0 was not found`. `scripts/ci-local.sh` could not have caught it: the
+      # development machine already had them installed.
+      - name: Install the Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
       - name: Run the vertical slice
         run: cargo run -p cairn-cli
+
+  # The call mesh is JavaScript, so `cargo test` cannot see a line of it — who offers,
+  # whether an early ICE candidate survives, whether the answering side claims the video
+  # transceiver rather than stranding it. Every failure there presents as a network fault.
+  #
+  # Ubuntu only, and cheap: node ships on the runner, and the browser leg installs one
+  # Chromium. Nothing here is platform-specific — it is the same JavaScript WebView2 runs.
+  desktop:
+    name: desktop client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every icon the bundle config names must exist. `tauri-build` hard-errors on Windows
+      # without icons/icon.ico, so a missing file does not fail here — it fails partway
+      # through a billed Windows runner in the release workflow.
+      - name: Bundle icons present
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          from pathlib import Path
+          root = Path("clients/desktop/src-tauri")
+          config = json.loads((root / "tauri.conf.json").read_text())
+          missing = [i for i in config["bundle"]["icon"] if not (root / i).is_file()]
+          if missing:
+              sys.exit("missing bundle icons: " + ", ".join(missing))
+          print("all", len(config["bundle"]["icon"]), "bundle icons present")
+          EOF
+
+      - run: node --test clients/desktop/tests/mesh.test.js
+
+      - name: Install Chromium for the browser test
+        run: npm install --no-save playwright && npx playwright install --with-deps chromium
+
+      - name: A real call between two browsers
+        # Without this the job would report green when the browser failed to install, which
+        # is the worst outcome available: a test that cannot run, reported as one that passed.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/call.browser.test.js
 
   lint:
     name: fmt + clippy
@@ -35,6 +117,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # Same reason as the test job: clippy has to build `cairn-desktop` to lint it.
+      - name: Install the Linux webview dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
@@ -47,12 +137,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-audit --locked
+      # A prebuilt binary rather than `cargo install cargo-audit --locked`, which compiled
+      # the tool from source on every run — minutes spent rebuilding something that had not
+      # changed.
+      - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
   # 1.85 is a hard floor, not a preference: the crypto dependency tree pulls in crates
   # that require edition2024, which stabilized in exactly that release.
+  #
+  # `cairn-desktop` is excluded. Tauri's dependency tree requires rustc 1.88, and raising the
+  # floor to suit it would push the cost onto everyone consuming the protocol and crypto
+  # crates. The floor exists for *those* — a desktop application is shipped as a binary we
+  # build ourselves, and nobody compiles against it. The libraries still hold the line.
   msrv:
     name: minimum supported rust version
     runs-on: ubuntu-latest
@@ -60,4 +157,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - run: cargo check --workspace --exclude cairn-desktop

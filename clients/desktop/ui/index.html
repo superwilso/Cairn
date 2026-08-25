@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cairn</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--
+  Deliberately dependency-free: no framework, no build step, no npm tree. This is a
+  security product with a small supply chain as a stated value, and a chat window does not
+  need 300 transitive packages to render a list.
+
+  Everything shown here arrives as plain data from the Rust side. This file never builds an
+  envelope, never decides a tier, and never sees a key — see ../src-tauri/src/main.rs.
+  Icons are inline SVG rather than a font or a sprite fetch, so the CSP stays at 'self'.
+-->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- A cairn: stones stacked by many hands to mark a trail. -->
+    <symbol id="i-cairn" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M9.4 3.2h5.2a1 1 0 0 1 .84 1.55l-1.3 2A1 1 0 0 1 13.3 7.2h-2.6a1 1 0 0 1-.84-.45l-1.3-2A1 1 0 0 1 9.4 3.2Z"/>
+      <path fill="currentColor" opacity=".85" d="M6.6 8.4h10.8a1 1 0 0 1 .96 1.28l-.7 2.4a1 1 0 0 1-.96.72H7.3a1 1 0 0 1-.96-.72l-.7-2.4A1 1 0 0 1 6.6 8.4Z"/>
+      <path fill="currentColor" opacity=".7" d="M4.6 14h14.8a1 1 0 0 1 .98 1.2l-.6 3A1 1 0 0 1 18.8 19H5.2a1 1 0 0 1-.98-.8l-.6-3A1 1 0 0 1 4.6 14Z"/>
+    </symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>
+    </symbol>
+    <symbol id="i-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M9 9V6a3 3 0 0 1 6 0v5M5 11a7 7 0 0 0 11 5.5M12 18v3M4 3l16 18"/>
+    </symbol>
+    <symbol id="i-cam" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <rect x="2.5" y="6" width="12" height="12" rx="2.5"/><path d="M14.5 11l7-3.5v9L14.5 13z"/>
+    </symbol>
+    <symbol id="i-cam-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M14.5 11l7-3.5v9l-4-2M13 6H5a2.5 2.5 0 0 0-2.5 2.5V16A2 2 0 0 0 4.5 18h9M4 3l16 18"/>
+    </symbol>
+    <symbol id="i-screen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4M12 13V8m0 0-2.5 2.5M12 8l2.5 2.5"/>
+    </symbol>
+    <symbol id="i-hangup" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M3 12.5c5-4.5 13-4.5 18 0l-2.7 2.4a1.6 1.6 0 0 1-2 .1l-1.6-1.2a1.6 1.6 0 0 1-.6-1.3v-1a10 10 0 0 0-4.2 0v1a1.6 1.6 0 0 1-.6 1.3l-1.6 1.2a1.6 1.6 0 0 1-2-.1Z"/>
+    </symbol>
+    <symbol id="i-call" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M4.5 4.5h3l1.5 4-2 1.5a12 12 0 0 0 5.5 5.5l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A15.5 15.5 0 0 1 2.5 6.7 2 2 0 0 1 4.5 4.5Z"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div id="signin">
+  <div class="card">
+    <div class="brand">
+      <svg class="stones"><use href="#i-cairn"/></svg>
+      <h1>Cairn</h1>
+    </div>
+    <p class="tagline">A marker left for whoever comes next.</p>
+    <label>Profile <input id="profile" value="me" spellcheck="false" autocomplete="off"></label>
+    <label>Instance <input id="server" value="http://127.0.0.1:8080" spellcheck="false" autocomplete="off"></label>
+    <!-- A *registration* invite, not a room one. Most instances require it — that is the
+         server's default — and it is ignored once this profile has registered. -->
+    <label>Invite code <span class="hint">— if the instance needs one</span>
+      <input id="reg-invite" placeholder="optional" spellcheck="false" autocomplete="off"></label>
+    <button id="go" class="primary">Sign in</button>
+    <p id="signin-error" class="error"></p>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <aside>
+    <div class="you">
+      <span id="avatar" class="avatar"></span>
+      <span id="whoami" class="mono"></span>
+      <!-- Not decoration. Over http:// the transport protects nothing, and the UI has to
+           say so rather than imply a protection that is not there. -->
+      <span id="transport" class="badge"></span>
+    </div>
+    <div class="actions">
+      <button id="new-group">New group</button>
+      <button id="new-direct">New DM</button>
+    </div>
+    <div class="actions">
+      <input id="invite-token" placeholder="invite token" spellcheck="false" autocomplete="off">
+      <button id="join">Join</button>
+    </div>
+    <h2 class="section">Rooms</h2>
+    <ul id="rooms"></ul>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <span id="room-id" class="mono grow"></span>
+      <span id="room-tier" class="badge"></span>
+      <button id="invite" class="ghost">Invite</button>
+      <button id="start-voice" class="icon" title="Voice call">
+        <svg width="15" height="15"><use href="#i-call"/></svg> Voice
+      </button>
+      <button id="start-video" class="icon primary" title="Video call">
+        <svg width="15" height="15"><use href="#i-cam"/></svg> Video
+      </button>
+    </header>
+
+    <!-- The ring. Somebody started a call in this room and this device has not joined it.
+         Without this the only way in was for both people to press the button independently
+         and hope, which is not a call — it is a coincidence. -->
+    <div id="ringing" class="ringing" hidden>
+      <span class="pip"></span>
+      <span id="ringing-text" class="grow"></span>
+      <button id="accept-voice" class="icon">
+        <svg width="15" height="15"><use href="#i-call"/></svg> Join
+      </button>
+      <button id="accept-video" class="icon primary">
+        <svg width="15" height="15"><use href="#i-cam"/></svg> Join with video
+      </button>
+      <button id="decline" class="ghost">Dismiss</button>
+    </div>
+
+    <!-- Appears only during a call. Media is peer-to-peer: it never reaches the instance. -->
+    <section id="stage" hidden>
+      <div id="tiles" class="tiles"></div>
+      <div class="callbar">
+        <button id="mute" class="icon" title="Mute (M)">
+          <svg width="15" height="15"><use href="#i-mic"/></svg> <span id="mute-text">Mute</span>
+        </button>
+        <button id="camera" class="icon" title="Camera">
+          <svg width="15" height="15"><use href="#i-cam"/></svg> <span id="camera-text">Camera on</span>
+        </button>
+        <button id="share" class="icon" title="Share a screen or window">
+          <svg width="15" height="15"><use href="#i-screen"/></svg> <span id="share-text">Share screen</span>
+        </button>
+        <span class="grow"></span>
+        <span id="elapsed" class="elapsed">00:00</span>
+        <button id="hangup" class="icon danger" title="Leave the call">
+          <svg width="15" height="15"><use href="#i-hangup"/></svg> Leave
+        </button>
+      </div>
+    </section>
+
+    <!-- The group-chat case this client was built for: people who joined the room but are
+         not in the encrypted group cannot read a word of it, and somebody has to let them
+         in. Never automatic — the list comes from the instance. -->
+    <div id="waiting" class="waiting" hidden>
+      <span id="waiting-text"></span>
+      <button id="admit" class="primary">Admit them</button>
+    </div>
+
+    <ul id="timeline"></ul>
+
+    <form id="composer">
+      <input id="text" placeholder="Message" autocomplete="off" spellcheck="false">
+      <button type="submit" class="primary">Send</button>
+    </form>
+    <p id="error" class="error" style="padding: 0 16px 10px"></p>
+  </main>
+
+  <section class="people">
+    <h2 class="section">Members</h2>
+    <ul id="member-list"></ul>
+
+    <div class="devices">
+      <h2 class="section" style="margin-left: 0">Devices</h2>
+      <label for="dev-mic">Microphone</label>
+      <select id="dev-mic"></select>
+      <label for="dev-cam">Camera</label>
+      <select id="dev-cam"></select>
+      <label for="dev-out">Output</label>
+      <select id="dev-out"></select>
+      <p id="device-note" class="note">Device names appear after the first call.</p>
+      <p id="relay-note" class="note"></p>
+    </div>
+  </section>
+</div>
+
+<script src="call.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

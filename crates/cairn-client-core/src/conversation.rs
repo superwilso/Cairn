@@ -231,7 +231,7 @@ impl Conversation {
         card: Option<crate::embed::Card>,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        self.send_with(plaintext, card, None, now_ms)
+        self.send_with(plaintext, card, None, None, now_ms)
     }
 
     /// Send with an attachment the caller has already sealed and uploaded.
@@ -246,7 +246,20 @@ impl Conversation {
         attachment: Attachment,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        self.send_with(plaintext, None, Some(attachment), now_ms)
+        self.send_with(plaintext, None, Some(attachment), None, now_ms)
+    }
+
+    /// Send a call signal. The body is empty: this is not a message anyone reads.
+    ///
+    /// It still goes through the ordinary encrypted path, so an instance cannot tell a
+    /// signalling message from a chat message by looking — only that traffic happened,
+    /// which it already knew.
+    pub fn send_signal(
+        &mut self,
+        signal: crate::call::CallSignal,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(b"", None, None, Some(signal), now_ms)
     }
 
     fn send_with(
@@ -254,6 +267,7 @@ impl Conversation {
         plaintext: &[u8],
         card: Option<crate::embed::Card>,
         attachment: Option<Attachment>,
+        signal: Option<crate::call::CallSignal>,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
         let tier = self.seal.tier();
@@ -273,6 +287,7 @@ impl Conversation {
             opening: opening.clone(),
             card: card.map(crate::embed::Card::clamp),
             attachment,
+            signal,
         };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
@@ -356,6 +371,9 @@ impl Conversation {
     pub fn receive(&mut self, envelope: &Envelope) -> Result<TimelineEvent, ConversationError> {
         match &envelope.payload {
             EnvelopePayload::Plaintext { body } => Ok(TimelineEvent::Message(ReceivedMessage {
+                // A T3 room carries no signalling: a call there would be transport-only and
+                // its setup has nowhere private to travel.
+                signal: None,
                 body: body.clone().into_bytes(),
                 franking: None,
                 card: None,
@@ -399,6 +417,7 @@ impl Conversation {
                     // limits are a defence against a hostile one, not tidiness.
                     card: inner.card.map(crate::embed::Card::clamp),
                     attachment: inner.attachment.map(Box::new),
+                    signal: inner.signal.map(Box::new),
                 }))
             }
         }
@@ -460,6 +479,14 @@ struct InnerBody {
     /// `default` so a message from a client that predates attachments still decodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attachment: Option<Attachment>,
+    /// Call signalling — an SDP offer, an answer, or an ICE candidate.
+    ///
+    /// **Inside the encrypted body deliberately.** An offer describes the sender's codecs,
+    /// network candidates and IP addresses; carrying it beside the ciphertext would hand
+    /// all of that to the instance, which relays the message and has no need for any of it.
+    /// `default` so a message from a client that predates calls still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal: Option<crate::call::CallSignal>,
 }
 
 /// What an incoming envelope turned out to be.
@@ -520,6 +547,15 @@ pub struct ReceivedMessage {
     /// Present for E2EE messages. A recipient must retain this to file a report; without
     /// it the message is unreportable.
     pub franking: Option<ReceivedFranking>,
+    /// Call signalling, if this message carried some rather than text.
+    ///
+    /// A client routes this to its WebRTC layer instead of the timeline — nobody wants an
+    /// SDP blob rendered as a chat message.
+    ///
+    /// Boxed for the same reason the attachment above is: an SDP offer is not small, and
+    /// without the box every membership event would carry room for one.
+    #[allow(clippy::doc_markdown)]
+    pub signal: Option<Box<crate::call::CallSignal>>,
 }
 
 /// Franking material a recipient retains so a message can be reported later.
@@ -922,6 +958,7 @@ mod attachment_tests {
             opening: cairn_crypto::franking::Opening::generate(),
             card: None,
             attachment: Some(attachment),
+            signal: None,
         };
 
         let encoded = serde_json::to_vec(&inner).unwrap();
