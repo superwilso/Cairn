@@ -35,6 +35,7 @@ use cairn_crypto::mls::Session as MlsSession;
 use cairn_crypto::verification::VerificationState;
 use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, Tier, UserId};
 
+use crate::call::{CallSignal, SignalKind, MAX_MESH_PARTICIPANTS};
 use crate::client::{Client, ClientError};
 use crate::contacts::{ContactError, ContactStore};
 use crate::conversation::{Conversation, ConversationError, TimelineEvent};
@@ -67,6 +68,12 @@ pub enum SessionError {
     NoGroupYet,
     #[error("identity file is unreadable: {0}")]
     Identity(String),
+    #[error(
+        "this call has {participants} people and a mesh call is capped at \
+         {MAX_MESH_PARTICIPANTS}: every participant sends their video to every other, so \
+         upstream runs out before the encryption does. A larger call needs an SFU"
+    )]
+    CallTooLarge { participants: usize },
 }
 
 /// A room as a frontend needs to show it.
@@ -118,6 +125,12 @@ pub enum Event {
     },
     /// This device was removed. The frontend must close the room.
     Removed,
+    /// Call signalling addressed to this device, for the WebRTC layer rather than the
+    /// timeline. Already filtered: signals meant for somebody else never reach a frontend.
+    Signal {
+        from: String,
+        signal: CallSignal,
+    },
 }
 
 struct OpenRoom {
@@ -136,6 +149,19 @@ pub struct Session {
     open: Option<OpenRoom>,
     dir: PathBuf,
     tls: bool,
+    /// The call this device is in, if any. One per room.
+    call: Option<String>,
+    /// Whether an offer or an answer has crossed under the current call id.
+    ///
+    /// It gates renaming the call. Before anything is negotiated a rename costs nothing;
+    /// after it, adopting a different id would orphan every peer connection already built.
+    negotiated: bool,
+    /// A call announced in the open room that this device has not joined.
+    ///
+    /// This is what makes a call *ring*. Without it the only way into a call was for both
+    /// people to press the button independently and hope their minted ids reconciled —
+    /// there was no way to be told a call had started at all.
+    ringing: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -177,6 +203,9 @@ impl Session {
             open: None,
             dir: dir.clone(),
             tls,
+            call: None,
+            negotiated: false,
+            ringing: None,
         };
         if !claimed {
             session.claim(None)?;
@@ -277,6 +306,11 @@ impl Session {
     /// Open a room, resuming its encrypted group if this device holds one.
     pub fn open_room(&mut self, room: &str) -> Result<Vec<MessageView>, SessionError> {
         let room: RoomId = room.parse().map_err(|_| SessionError::NoRoomOpen)?;
+        // Calls belong to a room. Carrying one across would have this device signalling into
+        // a call whose participants are no longer being polled.
+        self.call = None;
+        self.negotiated = false;
+        self.ringing = None;
         let record = self.index.get(&room);
         let seal = match record {
             Some(record) => RoomSeal::new(RoomShape {
@@ -422,6 +456,21 @@ impl Session {
 
             match open.convo.receive(&message.envelope) {
                 Ok(TimelineEvent::Message(received)) => {
+                    // Signalling first: it arrives as an ordinary encrypted message with an
+                    // empty body, and rendering that in the timeline would show every
+                    // participant a stream of blank lines during a call.
+                    if let Some(signal) = received.signal {
+                        let me = self.client.user().to_string();
+                        let from = message.envelope.sender.to_string();
+                        // Own signals come back through the room; applying one to yourself
+                        // would have a peer negotiating with itself.
+                        if from != me && signal.is_for(&me) {
+                            if let Some(signal) = self.reconcile(*signal) {
+                                events.push(Event::Signal { from, signal });
+                            }
+                        }
+                        continue;
+                    }
                     let body = String::from_utf8_lossy(&received.body).to_string();
                     let _ = self.history.append(
                         room,
@@ -461,6 +510,135 @@ impl Session {
         let _ = self.index.advance(room, open.cursor);
         self.open = Some(open);
         Ok(events)
+    }
+
+    /// Join the call in the open room, announcing arrival to everyone already in it.
+    ///
+    /// Returns the call id. A room hosts one call at a time; the id exists so a signal left
+    /// over from a previous call cannot be applied to this one.
+    pub fn call_join(&mut self) -> Result<String, SessionError> {
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        // Mesh, so every participant uploads to every other. Refusing beyond the ceiling is
+        // honest — past it a call does not fail, it degrades, and everyone blames their
+        // connection instead of the design.
+        let participants = open.convo.members().len();
+        if participants > MAX_MESH_PARTICIPANTS {
+            return Err(SessionError::CallTooLarge { participants });
+        }
+
+        // Joining a call that has been announced must join *that* call. Minting a fresh id
+        // here is what made two people pressing the button a race rather than a meeting.
+        let call = self
+            .call
+            .clone()
+            .or_else(|| self.ringing.take())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.call = Some(call.clone());
+        self.signal(CallSignal {
+            call: call.clone(),
+            kind: SignalKind::Join,
+            to: None,
+            payload: String::new(),
+        })?;
+        Ok(call)
+    }
+
+    /// Leave the call, telling peers so they tear down rather than waiting for a timeout.
+    pub fn call_leave(&mut self) -> Result<(), SessionError> {
+        let Some(call) = self.call.take() else { return Ok(()) };
+        self.negotiated = false;
+        // `signal` stamps `self.call`, which has just been cleared, so the id is passed
+        // explicitly here — a leave has to name the call it is leaving.
+        let announcement =
+            CallSignal { call, kind: SignalKind::Leave, to: None, payload: String::new() };
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        let outbound = open.convo.send_signal(announcement, now_ms())?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+        Ok(())
+    }
+
+    /// Decide whether an incoming signal belongs to the call this device is in — and, when
+    /// two devices disagree about which call that is, settle it.
+    ///
+    /// **Found by a test, not by reading.** Every participant minted their own call id on
+    /// joining, and every participant discarded signals that did not carry *their* id. Two
+    /// people pressing "call" in the same second therefore ended up in two calls of one
+    /// person each, both showing a connecting spinner and neither ever connecting. The
+    /// symptom is indistinguishable from a network fault.
+    ///
+    /// The rule: an **addressed** join comes from somebody already in a call, so their id
+    /// wins. Two **broadcast** joins are a race, so the smaller id wins — the same
+    /// deterministic tie-break the frontend uses to decide who offers, needing no extra
+    /// round trip. Renaming stops once anything has been negotiated, because by then a
+    /// rename would orphan live peer connections.
+    fn reconcile(&mut self, mut signal: CallSignal) -> Option<CallSignal> {
+        let Some(mine) = self.call.clone() else {
+            // Not in the call. Arrival and departure announcements are still worth
+            // surfacing: the first is the only way this device learns a call is happening —
+            // `call_join` picks the id up from here so accepting lands in *that* call rather
+            // than starting a rival one — and the second is how a ring stops when the caller
+            // gives up. Everything else describes a negotiation between two other devices,
+            // and handing it to a frontend would have it build a peer connection for a call
+            // its user has not accepted.
+            return match signal.kind {
+                SignalKind::Join => {
+                    self.ringing = Some(signal.call.clone());
+                    Some(signal)
+                }
+                SignalKind::Leave => Some(signal),
+                _ => None,
+            };
+        };
+
+        if signal.call != mine
+            && signal.kind == SignalKind::Join
+            && !self.negotiated
+            && (signal.to.is_some() || signal.call < mine)
+        {
+            self.call = Some(signal.call.clone());
+        }
+        let current = self.call.clone().unwrap_or(mine);
+
+        // A join under a different id is still a real arrival — the two sides converge as
+        // the acknowledgements cross. Anything else is a call this device is not in.
+        if signal.call != current && signal.kind != SignalKind::Join {
+            return None;
+        }
+        if matches!(signal.kind, SignalKind::Offer | SignalKind::Answer) {
+            self.negotiated = true;
+        }
+        // Hand the frontend the agreed id rather than the one on the wire, so it cannot go
+        // on signalling under a name the rest of the call has stopped using.
+        signal.call = current;
+        Some(signal)
+    }
+
+    /// Send one signalling message. Rides inside the encrypted body, so the instance sees
+    /// ciphertext rather than an SDP offer full of the sender's network addresses.
+    pub fn signal(&mut self, mut signal: CallSignal) -> Result<(), SessionError> {
+        // The call id is this layer's to decide, not a frontend's. `reconcile` renames the
+        // call when two people start one at the same moment, and a frontend that had cached
+        // the old id would go on signalling into a call nobody else is in.
+        if let Some(call) = &self.call {
+            signal.call = call.clone();
+        }
+        if matches!(signal.kind, SignalKind::Offer | SignalKind::Answer) {
+            self.negotiated = true;
+        }
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let outbound = open.convo.send_signal(signal, now_ms())?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+        Ok(())
+    }
+
+    pub fn call_id(&self) -> Option<String> {
+        self.call.clone()
     }
 
     /// Everyone in the room, from both the instance's list and the encrypted group.

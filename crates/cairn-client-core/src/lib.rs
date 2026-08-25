@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod call;
 pub mod client;
 pub mod contacts;
 pub mod conversation;

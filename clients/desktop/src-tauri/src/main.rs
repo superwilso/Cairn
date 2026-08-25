@@ -19,6 +19,7 @@
 
 use std::sync::Mutex;
 
+use cairn_client_core::call::{self, CallSignal, IceServer};
 use cairn_client_core::session::{Event, MemberView, MessageView, RoomSummary, Session};
 use tauri::State;
 
@@ -89,6 +90,17 @@ fn open_room(state: State<'_, AppState>, room: String) -> CmdResult<Vec<MessageV
     with(&state, |s| s.open_room(&room))
 }
 
+/// The open room's tier, derived locally from its sealed shape.
+///
+/// Never the instance's word for it: a badge taken from the server is a badge the server can
+/// lie about, and users calibrate what they say to what the badge claims.
+#[tauri::command]
+fn open_room_tier(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let guard = state.0.lock().map_err(|_| "session lock poisoned".to_string())?;
+    let session = guard.as_ref().ok_or("not signed in yet")?;
+    Ok(session.open_room_tier())
+}
+
 #[tauri::command]
 fn send(state: State<'_, AppState>, text: String) -> CmdResult<()> {
     with(&state, |s| s.send(&text))
@@ -119,6 +131,53 @@ fn redeem_invite(state: State<'_, AppState>, token: String) -> CmdResult<String>
     with(&state, |s| s.redeem_invite(&token))
 }
 
+#[tauri::command]
+fn call_join(state: State<'_, AppState>) -> CmdResult<String> {
+    with(&state, |s| s.call_join())
+}
+
+#[tauri::command]
+fn call_leave(state: State<'_, AppState>) -> CmdResult<()> {
+    with(&state, |s| s.call_leave())
+}
+
+#[tauri::command]
+fn signal(state: State<'_, AppState>, signal: CallSignal) -> CmdResult<()> {
+    with(&state, |s| s.signal(signal))
+}
+
+#[tauri::command]
+fn call_id(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let mut guard = state.0.lock().map_err(|_| "session lock poisoned".to_string())?;
+    let session = guard.as_mut().ok_or("not signed in yet")?;
+    Ok(session.call_id())
+}
+
+/// What the WebRTC layer needs before it can build a peer connection.
+///
+/// Sent as data rather than baked into the JavaScript so a self-hosted instance can point
+/// calls at its own STUN/TURN later without a frontend change — and so the honest caveat
+/// travels with the config instead of living in a comment nobody reads.
+#[derive(serde::Serialize)]
+struct CallConfig {
+    ice_servers: Vec<IceServer>,
+    /// False on STUN alone. The UI says so: without a relay a minority of users behind
+    /// symmetric NATs will find calls simply do not connect, and "it is your network" is
+    /// not something a client should leave them to work out themselves.
+    has_relay: bool,
+    max_participants: usize,
+}
+
+#[tauri::command]
+fn call_config() -> CallConfig {
+    let ice_servers = call::default_ice_servers();
+    CallConfig {
+        has_relay: call::has_relay(&ice_servers),
+        ice_servers,
+        max_participants: call::MAX_MESH_PARTICIPANTS,
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -129,12 +188,18 @@ fn main() {
             create_direct,
             rooms,
             open_room,
+            open_room_tier,
             send,
             poll,
             members,
             admit_waiting,
             create_invite,
             redeem_invite,
+            call_join,
+            call_leave,
+            signal,
+            call_id,
+            call_config,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

@@ -16,6 +16,8 @@ use cairn_server::state::{Instance, RegistrationPolicy};
 
 struct Server {
     addr: SocketAddr,
+    /// Held so a test can read what the instance *stored*, not only what it serves.
+    instance: Arc<Instance>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -26,12 +28,12 @@ fn start() -> Server {
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-    let router = cairn_server::http::router(instance);
+    let router = cairn_server::http::router(Arc::clone(&instance));
     runtime.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         axum::serve(listener, router).await.unwrap();
     });
-    Server { addr, _runtime: runtime }
+    Server { addr, instance, _runtime: runtime }
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -143,4 +145,325 @@ fn a_member_who_has_not_been_admitted_cannot_send() {
     bob.open_room(&room).unwrap();
 
     assert!(bob.send("can anyone hear me").is_err(), "an unadmitted member cannot send");
+}
+
+/// Call signalling, which is the only part of a call that can be tested without a device.
+///
+/// Media cannot be exercised here — there is no microphone, no camera and no display — so
+/// what is proven is the seam WebRTC sits on: that an offer reaches the peer it was
+/// addressed to, that it does not reach anyone else, and that the instance never sees it.
+mod calls {
+    use super::*;
+    use cairn_client_core::call::{CallSignal, SignalKind};
+
+    fn two_in_a_group() -> (Server, Session, Session, String) {
+        let server = start();
+        let mut alice = session(&server, "call-alice");
+        let mut bob = session(&server, "call-bob");
+        bob.publish_key_packages(3).unwrap();
+
+        let room = alice.create_group(10).unwrap();
+        let token = alice.create_invite(1, 24).unwrap();
+        bob.redeem_invite(&token).unwrap();
+        alice.admit_waiting().unwrap();
+        bob.open_room(&room).unwrap();
+        bob.poll().unwrap();
+        (server, alice, bob, room)
+    }
+
+    /// Alice starts a call; bob is told, and joins it.
+    ///
+    /// This is the flow the product has: one person presses the button, the other is *rung*
+    /// and accepts. It is here as a helper because getting it wrong is invisible — before
+    /// `ringing` existed, bob had no way to learn a call was happening and joining meant
+    /// starting a second one.
+    fn ring_then_join() -> (Server, Session, Session, String, String) {
+        let (server, mut alice, mut bob, room) = two_in_a_group();
+        let call = alice.call_join().unwrap();
+
+        let mut rang = false;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    if signal.kind == SignalKind::Join {
+                        rang = true;
+                    }
+                }
+            }
+        }
+        assert!(rang, "bob must be told a call started — otherwise he cannot join it");
+
+        let joined = bob.call_join().unwrap();
+        assert_eq!(joined, call, "accepting a ring joins that call, it does not start another");
+        for _ in 0..4 {
+            alice.poll().unwrap();
+            bob.poll().unwrap();
+        }
+        (server, alice, bob, room, call)
+    }
+
+    #[test]
+    fn an_offer_reaches_the_peer_it_was_addressed_to() {
+        let (_server, mut alice, mut bob, _room, call) = ring_then_join();
+
+        alice
+            .signal(CallSignal {
+                call: call.clone(),
+                kind: SignalKind::Offer,
+                to: Some(bob.user_id()),
+                payload: "v=0 fake sdp".into(),
+            })
+            .unwrap();
+
+        let mut got = None;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    if signal.kind == SignalKind::Offer {
+                        got = Some(signal);
+                    }
+                }
+            }
+            if got.is_some() {
+                break;
+            }
+        }
+        let got = got.expect("bob must receive the offer addressed to him");
+        assert_eq!(got.payload, "v=0 fake sdp");
+        assert_eq!(got.call, call, "and it must name the call it belongs to");
+    }
+
+    #[test]
+    fn a_signal_addressed_to_someone_else_is_not_delivered() {
+        // Every signal rides the room, so every participant receives the envelope. The
+        // filtering has to happen before a frontend sees it — applying another pair's offer
+        // would replace a working peer connection with a broken one, and it would look like
+        // a network fault rather than a bug.
+        let (_server, mut alice, mut bob, _room, call) = ring_then_join();
+
+        alice
+            .signal(CallSignal {
+                call: call.clone(),
+                kind: SignalKind::Offer,
+                to: Some("usr_00000000000000000000000000000000".into()),
+                payload: "not for bob".into(),
+            })
+            .unwrap();
+
+        // A second signal, this one addressed to bob, sent after the misdirected one. Without
+        // it the test would pass just as happily if bob's polling were broken and he
+        // received nothing at all — which is how a filtering test becomes a test of nothing.
+        alice
+            .signal(CallSignal {
+                call: call.clone(),
+                kind: SignalKind::Offer,
+                to: Some(bob.user_id()),
+                payload: "this one is for bob".into(),
+            })
+            .unwrap();
+
+        let mut delivery_works = false;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    assert_ne!(
+                        signal.payload, "not for bob",
+                        "a signal addressed to a third party must not reach bob"
+                    );
+                    if signal.payload == "this one is for bob" {
+                        delivery_works = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            delivery_works,
+            "bob's signal delivery must be working for the check above to mean anything"
+        );
+    }
+
+    #[test]
+    fn a_join_announcement_reaches_everyone() {
+        // Counterfactual for the test above: if filtering dropped unaddressed signals too,
+        // nobody would ever learn that a participant had arrived and no call could start.
+        let (_server, mut alice, mut bob, _room) = two_in_a_group();
+        alice.call_join().unwrap();
+
+        let mut announced = false;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    if signal.kind == SignalKind::Join {
+                        announced = true;
+                    }
+                }
+            }
+            if announced {
+                break;
+            }
+        }
+        assert!(announced, "bob must learn that alice joined the call");
+    }
+
+    #[test]
+    fn signalling_does_not_appear_in_the_timeline_as_a_message() {
+        // An SDP blob rendered as chat is the obvious failure, and the empty body makes it
+        // worse: participants would see a blank line for every ICE candidate.
+        let (_server, mut alice, mut bob, _room, call) = ring_then_join();
+        alice
+            .signal(CallSignal {
+                call,
+                kind: SignalKind::Ice,
+                to: Some(bob.user_id()),
+                payload: "candidate:1 1 UDP".into(),
+            })
+            .unwrap();
+
+        let mut saw_the_candidate = false;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                match event {
+                    Event::Message(_) => panic!("signalling must never surface as a chat message"),
+                    Event::Signal { signal, .. } if signal.kind == SignalKind::Ice => {
+                        saw_the_candidate = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Same trap as above: "no message appeared" is trivially true if nothing appeared.
+        assert!(
+            saw_the_candidate,
+            "the candidate must have arrived, as a signal rather than a message"
+        );
+    }
+
+    #[test]
+    fn two_people_starting_a_call_at_the_same_moment_end_up_in_one_call() {
+        // Found by a test of the frontend mesh, never by reading either side. Every
+        // participant minted its own call id on joining and discarded every signal that did
+        // not carry *its* id, so two people pressing "call" within the same second sat in
+        // two calls of one person each — both showing a connecting spinner, neither ever
+        // connecting, and indistinguishable from a network fault.
+        let (_server, mut alice, mut bob, _room) = two_in_a_group();
+        let a_call = alice.call_join().unwrap();
+        let b_call = bob.call_join().unwrap();
+        assert_ne!(a_call, b_call, "each side really does mint its own id to begin with");
+
+        for _ in 0..8 {
+            alice.poll().unwrap();
+            bob.poll().unwrap();
+        }
+        assert_eq!(alice.call_id(), bob.call_id(), "both must converge on one call");
+
+        // Convergence that does not carry signalling would be a matching pair of strings and
+        // nothing else. An offer sent after it has to actually arrive.
+        alice
+            .signal(CallSignal {
+                call: String::from("whatever the frontend last saw"),
+                kind: SignalKind::Offer,
+                to: Some(bob.user_id()),
+                payload: "v=0 after converging".into(),
+            })
+            .unwrap();
+
+        let mut got = None;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    if signal.kind == SignalKind::Offer {
+                        got = Some(signal);
+                    }
+                }
+            }
+        }
+        let got = got.expect("the offer must reach bob once both are in the same call");
+        assert_eq!(got.payload, "v=0 after converging");
+        assert_eq!(
+            Some(got.call),
+            alice.call_id(),
+            "and it must be stamped with the agreed id, not the one the frontend passed in"
+        );
+    }
+
+    #[test]
+    fn only_arrival_and_departure_reach_a_device_that_is_not_in_the_call() {
+        // Counterfactual for the ring, and the reason it is narrow. A device has to be able
+        // to learn that a call started, and that it stopped — but only that. Delivering an
+        // offer to somebody who never joined would have their client build a peer connection
+        // for a call its user has not accepted, which is a camera light coming on without
+        // being asked.
+        let (_server, mut alice, mut bob, _room) = two_in_a_group();
+        let call = alice.call_join().unwrap();
+        alice
+            .signal(CallSignal {
+                call,
+                kind: SignalKind::Offer,
+                to: Some(bob.user_id()),
+                payload: "unsolicited".into(),
+            })
+            .unwrap();
+
+        let mut rang = false;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    assert_ne!(
+                        signal.payload, "unsolicited",
+                        "an offer must not reach a device that has not joined the call"
+                    );
+                    if signal.kind == SignalKind::Join {
+                        rang = true;
+                    }
+                }
+            }
+        }
+        assert!(rang, "the arrival announcement itself must still get through");
+        assert!(bob.call_id().is_none(), "and being rung is not the same as being in a call");
+
+        // A ring that cannot stop is worse than no ring: the caller gives up and the callee
+        // is left with a banner for a call nobody is in.
+        alice.call_leave().unwrap();
+        let mut stopped = false;
+        for _ in 0..8 {
+            for event in bob.poll().unwrap() {
+                if let Event::Signal { signal, .. } = event {
+                    if signal.kind == SignalKind::Leave {
+                        stopped = true;
+                    }
+                }
+            }
+        }
+        assert!(stopped, "bob must be told the caller hung up");
+    }
+
+    #[test]
+    fn the_instance_never_sees_the_sdp() {
+        // The reason signalling rides inside the encrypted body. An offer names the sender's
+        // codecs, candidates and IP addresses; beside the ciphertext all of it would be the
+        // instance's to read.
+        let (server, mut alice, mut _bob, room, call) = ring_then_join();
+        let secret = "v=0 SDP-THE-SERVER-MUST-NOT-SEE";
+        alice
+            .signal(CallSignal {
+                call,
+                kind: SignalKind::Offer,
+                to: Some(_bob.user_id()),
+                payload: secret.into(),
+            })
+            .unwrap();
+
+        // Read the stored records themselves — envelope included — rather than trusting
+        // that a serving endpoint would have redacted anything.
+        let stored = server
+            .instance
+            .messages_since(room.parse().unwrap(), alice.user_id().parse().unwrap(), 0, 0)
+            .unwrap();
+        assert!(!stored.is_empty(), "the signal must have reached the instance at all");
+        let raw = serde_json::to_string(&stored).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "the SDP must not appear anywhere in what the instance holds"
+        );
+    }
 }

@@ -1,0 +1,186 @@
+# Build the desktop client and publish it to GitHub Releases.
+#
+# ## Cost, because it is the reason this is not on every push
+#
+# GitHub bills a private repository's Windows minutes at **2x** and macOS at **10x**. A
+# Tauri build is not cheap — it compiles the whole workspace plus the webview bindings — so
+# this runs only on a version tag or when somebody asks for it by hand. `ci.yml` carries the
+# same reasoning for its matrix.
+#
+# ## What is actually produced
+#
+# Windows only, for now. That matches where the client is: WebView2 is the only webview this
+# has been exercised against, and shipping a Linux bundle whose microphone permission is
+# known not to work (see clients/desktop/README.md) would be shipping a broken call button.
+# The Linux job is here and commented out rather than deleted, so turning it on is a one-line
+# change once that gap closes.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # So a build can be produced from a branch without cutting a version tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name to publish under (e.g. v0.0.1-alpha.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not delete the artefacts of one that succeeded.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows (x86_64)
+            target: x86_64-pc-windows-msvc
+          # - os: ubuntu-22.04
+          #   name: Linux (x86_64)
+          #   target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Tauri needs system webkit and its build tooling on Linux. No-op on Windows, where
+      # WebView2 ships with the OS.
+      - name: Install Linux webview dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      # The bundler is a separate binary from cargo. Pinned to the v2 line to match the
+      # `tauri = "2"` dependency: a v1 CLI against a v2 config fails with a confusing
+      # schema error rather than a clear one.
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      # Fail here rather than in the bundler. A compile error inside a 15-minute bundle step
+      # is buried in installer noise.
+      - name: Check the client compiles
+        run: cargo check -p cairn-desktop --target ${{ matrix.target }}
+
+      - name: Build the bundle
+        run: cargo tauri build --target ${{ matrix.target }}
+        working-directory: clients/desktop/src-tauri
+
+      # Named per-platform so two matrix legs cannot overwrite each other's upload.
+      - name: Collect Windows installers
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Both bundle targets are configured. The NSIS .exe is the one to hand someone —
+          # it does not need administrator rights; the .msi is for managed deployment.
+          find target/${{ matrix.target }}/release/bundle -type f \( -name '*.exe' -o -name '*.msi' \) -exec cp {} dist/ \;
+          ls -l dist
+
+      - name: Collect Linux bundles
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          find target/${{ matrix.target }}/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' \) -exec cp {} dist/ \;
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cairn-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten the artifact directories
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -l dist
+
+      # A pre-alpha build handed to a friend needs to say what it is *in the place they will
+      # read it*, which is the release page — not a doc they will never open. Every claim
+      # here is one the code actually supports; see docs/01-threat-model.md.
+      - name: Write the release notes
+        run: |
+          cat > NOTES.md <<'EOF'
+          ## Cairn desktop — pre-alpha
+
+          **Not audited. Not reviewed. Do not use this for anything that matters yet.**
+
+          ### What works
+
+          - Group chats, end-to-end encrypted with MLS (RFC 9420). A private group is T2:
+            the instance stores ciphertext and cannot read it.
+          - Invites: create a token, send it however you like, the other person pastes it in.
+            Redeeming joins the *room* — a member still has to **admit** them into the
+            encrypted group, so nothing is readable until somebody chooses to share it.
+          - Voice and video calls, peer-to-peer. Media never touches the instance, and the
+            SDP handshake travels inside the encrypted message body rather than beside it.
+          - Screen sharing, and microphone / camera / output device selection.
+
+          ### What does not
+
+          - **Calls are a mesh, capped at 6 people.** Everyone sends their video to everyone
+            else, so a large call will saturate a domestic upload.
+          - **No TURN relay is configured.** Calls fall back to STUN only, which cannot cross
+            some home networks. When that happens the client says so rather than leaving you
+            guessing.
+          - A call shows every participant every other participant's IP address. That is
+            what peer-to-peer media means; a relay is the only thing that changes it.
+          - Windows only for now.
+          - There is no key backup. Losing the profile directory loses the message history
+            on that device.
+
+          ### Running it
+
+          You also need an instance to connect to — `cargo run -p cairn-server`. Point the
+          client at `http://127.0.0.1:8080` for a local one. Over plain `http://` the client
+          shows a **plaintext** badge, and it means it: message bodies are still encrypted,
+          but ids and membership changes are in the clear on the wire.
+          EOF
+          cat NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Cairn ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: NOTES.md
+          # Pre-alpha, and the tag says so. Marking it otherwise would be the first dishonest
+          # thing this project shipped.
+          prerelease: true
+          draft: false
+          files: dist/*
+          fail_on_unmatched_files: true

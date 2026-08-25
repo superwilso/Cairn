@@ -6,7 +6,10 @@ Tauri. Windows is the first target.
 ## Shape
 
 ```
-ui/                 the interface — plain HTML, CSS and JS, no build step and no npm tree
+ui/index.html       structure, and the inline SVG icon set
+ui/style.css        the whole design, hand-written, no framework
+ui/app.js           the DOM — rooms, timeline, members, call controls
+ui/call.js          WebRTC: peer connections, devices, screen share
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -75,10 +78,52 @@ CLI hardcoded `is_direct: true, member_ceiling: 2`, so every room was a two-pers
 The member panel shows the distinction rather than flattening it: someone in the room but
 not in the encrypted group is marked, because they cannot read a word of it.
 
-## What it does not do yet
+## Calls
 
-Voice and video. WebRTC is the reason ADR-008 chose this architecture, and it is the next
-piece — nothing here touches media yet.
+Voice, video and screen sharing, as a **mesh**: every participant holds a direct peer
+connection to every other, and media never touches the instance. There is no SFU to deploy
+and nothing for an operator to pay for. The cost is why an SFU exists — everyone uploads
+their stream once per other participant — so `MAX_MESH_PARTICIPANTS` (6) refuses past the
+point where a call would stop degrading gracefully. See
+[`docs/12-realtime-media.md`](../../docs/12-realtime-media.md) for where this goes next.
+
+**Signalling rides inside the encrypted message body.** An SDP offer names your codecs, your
+ICE candidates and your IP addresses; carrying it beside the ciphertext would hand all of
+that to an instance that only needs to relay a blob. `crates/cairn-server/tests/group_chat_session.rs`
+has a test that reads what the instance actually stored and asserts the SDP is not in it.
+
+Two things the UI states rather than hides, because both are real:
+
+- **No TURN relay is configured**, so calls fall back to STUN alone and will fail to connect
+  across some home networks. The client says so when a connection fails instead of leaving
+  someone to blame their broadband.
+- **A mesh call shows every participant every other participant's IP address.** That is what
+  peer-to-peer media means. A relay is the only thing that changes it, and a relay costs an
+  operator bandwidth.
+
+### Known gap: microphone permission on Linux
+
+`wry` registers a WebView2 permission handler for the clipboard only, so on Windows a call
+raises WebView2's own microphone/camera prompt and works. On Linux, WebKitGTK's
+`permission-request` signal is unhandled and its default is **deny** — so `getUserMedia`
+fails and calls cannot start. Chat is unaffected.
+
+The fix is a `permission-request` handler reached through `with_webview`, which means a
+Linux-only `webkit2gtk` dependency on this crate. Not taken yet because Windows is the
+target; recorded here so it is a decision rather than a mystery.
+
+## What it does not do yet
 
 Attachments, link cards, safety-number comparison and disappearing-message controls all
 exist in `client-core` and are not yet surfaced in this UI.
+
+## The icon
+
+Drawn by [`scripts/make-icon.py`](../../scripts/make-icon.py) — a rasteriser, PNG encoder and
+ICO writer on zlib and struct alone, because the development container has neither Pillow nor
+ImageMagick. Run it after changing the mark.
+
+It exists because of two things found by probing. The `icon.png` that was here was a
+placeholder: 512x512 pixels of a single colour, which reads as an icon in a file listing and
+ships as a flat blue square. And `tauri-build` **hard-errors** on Windows without
+`icons/icon.ico` — so the release build would have failed on the runner rather than here.

@@ -56,6 +56,46 @@ jobs:
       - name: Run the vertical slice
         run: cargo run -p cairn-cli
 
+  # The call mesh is JavaScript, so `cargo test` cannot see a line of it — who offers,
+  # whether an early ICE candidate survives, whether the answering side claims the video
+  # transceiver rather than stranding it. Every failure there presents as a network fault.
+  #
+  # Ubuntu only, and cheap: node ships on the runner, and the browser leg installs one
+  # Chromium. Nothing here is platform-specific — it is the same JavaScript WebView2 runs.
+  desktop:
+    name: desktop client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every icon the bundle config names must exist. `tauri-build` hard-errors on Windows
+      # without icons/icon.ico, so a missing file does not fail here — it fails partway
+      # through a billed Windows runner in the release workflow.
+      - name: Bundle icons present
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          from pathlib import Path
+          root = Path("clients/desktop/src-tauri")
+          config = json.loads((root / "tauri.conf.json").read_text())
+          missing = [i for i in config["bundle"]["icon"] if not (root / i).is_file()]
+          if missing:
+              sys.exit("missing bundle icons: " + ", ".join(missing))
+          print("all", len(config["bundle"]["icon"]), "bundle icons present")
+          EOF
+
+      - run: node --test clients/desktop/tests/mesh.test.js
+
+      - name: Install Chromium for the browser test
+        run: npm install --no-save playwright && npx playwright install --with-deps chromium
+
+      - name: A real call between two browsers
+        # Without this the job would report green when the browser failed to install, which
+        # is the worst outcome available: a test that cannot run, reported as one that passed.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/call.browser.test.js
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

@@ -46,6 +46,41 @@ run "clippy --all-targets" cargo clippy --workspace --all-targets
 run "test --all-targets"   cargo test --workspace --all-targets
 run "vertical slice"       cargo run -p cairn-cli
 
+# ---- desktop job ----------------------------------------------------------
+# The call mesh is JavaScript, and `cargo test` cannot see a line of it. Who offers, whether
+# an early ICE candidate survives, whether turning a camera on renegotiates -- all decided in
+# ui/call.js, and every failure there looks like a network fault rather than a bug.
+if command -v node >/dev/null 2>&1; then
+    run "desktop mesh tests" node --test clients/desktop/tests/mesh.test.js
+
+    # And the same code against two real browsers, which is the only thing that catches an
+    # SDP-level fault: a transceiver the answering side pre-created and the offer would not
+    # reuse made every call connect cleanly and carry video one way only. Skips itself, with
+    # a note, when Playwright's Chromium is not present.
+    if [ "$MODE" != "quick" ]; then
+        run "desktop call in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/call.browser.test.js
+    fi
+else
+    printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'
+fi
+
+# Every icon the bundle config names must exist. `tauri-build` hard-errors on Windows
+# without icons/icon.ico -- so a missing file does not fail here, it fails 20 minutes into a
+# billed Windows runner.
+run "bundle icons present" python3 - <<'PYCHECK'
+import json, sys
+from pathlib import Path
+root = Path("clients/desktop/src-tauri")
+config = json.loads((root / "tauri.conf.json").read_text())
+missing = [i for i in config["bundle"]["icon"] if not (root / i).is_file()]
+if missing:
+    sys.exit("missing bundle icons: " + ", ".join(missing))
+print("all", len(config["bundle"]["icon"]), "bundle icons present")
+PYCHECK
+
 if [ "$MODE" != "quick" ]; then
     # ---- msrv job ---------------------------------------------------------
     # The floor is a hard requirement: the crypto tree needs edition2024, stabilised in
