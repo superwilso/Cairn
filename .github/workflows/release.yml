@@ -152,9 +152,11 @@ jobs:
             - **Group chats**, end-to-end encrypted with MLS (RFC 9420). A private group is
               T2: the instance stores ciphertext it cannot read, and a bigger room is not a
               weaker one — only public discoverability drops a room to a server-readable tier.
-            - **Invites.** Create a token, send it however you like, the other person pastes
-              it in. Redeeming joins the *room*; a member still has to **admit** them into the
-              encrypted group, so nothing is readable until somebody chooses to share it.
+            - **Invites**, of two kinds, and the sign-in card labels which is which. A
+              *registration* invite admits an account to the instance — most instances should
+              require one. A *room* invite carries an existing account into a room: redeeming
+              joins the room, and a member still has to **admit** them into the encrypted
+              group, so nothing is readable until somebody chooses to share it.
             - **Voice and video calls**, peer-to-peer. Media never touches the instance, and
               the SDP handshake travels inside the encrypted message body rather than beside
               it — so the instance never sees your codecs, candidates or addresses.
@@ -171,14 +173,24 @@ jobs:
             - **A call shows every participant every other participant's IP address.** That
               is what peer-to-peer media means. A relay is the only thing that changes it,
               and a relay costs an operator bandwidth.
-            - Windows only. macOS and Linux builds exist but calls do not work on Linux yet.
+            - **Windows only.** The client builds on Linux too, but calls cannot start there:
+              WebKitGTK denies the microphone permission, because the webview wrapper only
+              handles the clipboard one. No macOS build is produced yet.
             - **No key backup.** Losing the profile directory loses that device's history.
 
             ### Running it
 
-            You also need an instance to connect to — `cargo run -p cairn-server` — and both
-            people must point at the same one. For a local instance use
-            `http://127.0.0.1:8080`.
+            You also need an instance to connect to, and both people must point at the same
+            one. For a local instance use `http://127.0.0.1:8080`:
+
+            ```bash
+            CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=for-alice,for-bob \
+              cargo run -p cairn-server
+            ```
+
+            Hand each person one of those tokens for the **Invite code** field. Registration
+            is invite-only by default and should stay that way on anything reachable from the
+            internet.
 
             Over plain `http://` the client shows a **plaintext** badge, and it means it:
             message bodies are still end-to-end encrypted, but account ids, membership
