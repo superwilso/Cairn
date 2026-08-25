@@ -90,6 +90,23 @@ type Getter<'a> = dyn Fn(&str) -> Option<PathBuf> + 'a;
 /// The per-account directory was already `0700`; the **parent** was not, so `ls` on it
 /// listed every account name on the machine. Restricting both means the enumeration stops
 /// at a directory the caller cannot open.
+///
+/// ## The two restrictions are not equally load-bearing
+///
+/// `0700` on `dir` is the confidentiality control: it is what stops another user on the
+/// machine reading the MLS state and the identity. `0700` on the parent hides *which
+/// profiles exist* — worth having, but it protects a name, not a key.
+///
+/// So the parent is **best effort**, and it has to be. A parent this process does not own
+/// cannot be chmod'ed, and `/tmp` is the ordinary case: a state directory beneath it (a
+/// test, or `CAIRN_HOME=/tmp/…`) made every client refuse to start with `EPERM`. Refusing
+/// to open an account because a shared parent could not be tightened trades a working
+/// client for a protection that was never confidentiality in the first place.
+///
+/// **Found on CI, and it could not have been found locally**: the development container runs
+/// as root, and root's `chmod` on `/tmp` succeeds. The same asymmetry — a privileged local
+/// machine against an unprivileged runner — is worth suspecting whenever CI disagrees with
+/// a green local tree.
 pub fn prepare(dir: &Path) -> Result<(), StateDirError> {
     let create = |p: &Path| -> Result<(), StateDirError> {
         fs::create_dir_all(p)
@@ -97,9 +114,12 @@ pub fn prepare(dir: &Path) -> Result<(), StateDirError> {
     };
     if let Some(parent) = dir.parent() {
         create(parent)?;
-        restrict(parent)?;
+        let _ = restrict(parent);
     }
     create(dir)?;
+    // Not best effort. If this fails the state is readable by other users on the machine,
+    // and starting anyway would be exactly the kind of silent downgrade the threat model
+    // forbids claiming around.
     restrict(dir)?;
     Ok(())
 }
@@ -164,6 +184,42 @@ fn restrict(_path: &Path) -> Result<(), StateDirError> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cairn-statedir-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_state_directory_opens_even_when_its_parent_is_not_ours_to_lock_down() {
+        // The whole test suite for the session layer died on this: every state directory
+        // used in a test sits under `/tmp`, which belongs to root, and `prepare` insisted on
+        // chmod'ing the parent. Thirteen tests failed in ten milliseconds with `EPERM`, and
+        // a real user setting `CAIRN_HOME=/tmp/...` would have hit exactly the same wall.
+        //
+        // **This assertion only reproduces the failure when the test is not run as root**,
+        // which is CI and not the development container. That asymmetry is the reason the
+        // bug reached `main` at all, so it is worth saying rather than assuming the next
+        // reader will infer it.
+        let dir = scratch("shared-parent");
+        prepare(&dir).expect("a shared parent must not stop an account from opening");
+        assert!(dir.is_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_itself_is_still_locked_down() {
+        // The counterfactual for the test above, and the line that must not move. Making the
+        // *parent* best-effort is defensible because it protects a name; making the
+        // directory itself best-effort would leave the device key and the whole message
+        // history readable by anyone else on the machine.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        prepare(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the account directory must be readable only by its owner");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// A fake environment, so these test the branch logic rather than the machine they run on.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

@@ -46,6 +46,22 @@ run() {
 }
 
 # ---- what a local run structurally cannot verify --------------------------
+# Two failures have now reached `main` green from here and red on CI, both from the same
+# shape of gap: this machine is more privileged and better equipped than the runner.
+#
+#   1. Missing system packages. `cairn-desktop` links WebKitGTK; a machine that can build it
+#      has the headers by definition, and the runner does not.
+#   2. Running as root. `statedir::prepare` chmod'ed the state directory's *parent*, which
+#      for a test is `/tmp` — root can chmod it, an ordinary user cannot, and thirteen tests
+#      died on EPERM.
+#
+# Neither is fixable by running more checks here. What is fixable is noticing.
+if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    printf '\n\033[33mNOTE: running as root. CI does not.\n'
+    printf 'Anything gated on file ownership or permissions — chmod on a shared directory,\n'
+    printf 'writing outside the workspace — will succeed here and can still fail there.\033[0m\n'
+fi
+
 # Not a substitute for the real thing, just a tripwire: if the workflow stops installing the
 # Linux webview packages, a local run will still pass and CI will still fail. This at least
 # makes the omission visible here rather than after a push.
