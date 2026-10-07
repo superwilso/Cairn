@@ -42,7 +42,10 @@ pub enum HistoryError {
 }
 
 /// One remembered message.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Not `PartialEq`: an entry can carry an attachment key, and a key type that offered
+/// equality would invite comparing secrets with `==` rather than in constant time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub sender: UserId,
     /// The sender's clock, which is what a room's disappearing timer is measured against —
@@ -52,6 +55,21 @@ pub struct Entry {
     /// The attachment's claimed filename, if the message carried one. A label, not a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_name: Option<String>,
+    /// Everything needed to fetch and open the attachment again: blob id, key, claimed
+    /// name, size and type.
+    ///
+    /// **The key is on disk here, and that is the decision, not an oversight.** Without it
+    /// an image received yesterday is a grey box today: the key arrived once, inside a
+    /// message MLS will not decrypt twice. It sits beside the plaintext transcript, at the
+    /// same `0600`, and opens a file exactly as sensitive as that transcript — so it widens
+    /// nothing the module note above has not already conceded. It also means a disappearing
+    /// timer that drops this entry drops the only local key to the blob, which is what makes
+    /// the timer true of attachments on this device even though the instance does not yet
+    /// delete blobs at all.
+    ///
+    /// `default` so a transcript written before attachments existed still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<crate::conversation::Attachment>,
 }
 
 /// Per-room transcripts under a client's state directory.
@@ -170,6 +188,7 @@ mod tests {
             sent_at_ms: at,
             body: body.as_bytes().to_vec(),
             attachment_name: None,
+            attachment: None,
         }
     }
 
@@ -270,6 +289,22 @@ mod tests {
         history.append(room, &entry(1, "private")).unwrap();
         let mode = fs::metadata(history.path(room)).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "a transcript must not be readable by other users");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_transcript_written_before_attachments_existed_still_loads() {
+        // The `attachment` field is `serde(default)`. Without that, every transcript on
+        // every existing install would read as corrupt the day it shipped.
+        let dir = scratch("pre-attachments");
+        let room = RoomId::new();
+        let history = History::open(&dir).unwrap();
+        let old =
+            serde_json::json!({ "sender": UserId::new(), "sent_at_ms": 1, "body": [104, 105] });
+        fs::write(history.path(room), format!("{old}\n")).unwrap();
+        let replayed = history.replay(room, None, 0).unwrap();
+        assert_eq!(replayed[0].body, b"hi");
+        assert!(replayed[0].attachment.is_none());
         fs::remove_dir_all(&dir).ok();
     }
 

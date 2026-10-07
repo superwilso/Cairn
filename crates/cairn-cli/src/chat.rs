@@ -403,6 +403,9 @@ impl App {
                 sent_at_ms: envelope.sent_at_ms,
                 body: body.to_vec(),
                 attachment_name,
+                // The CLI writes the opened file to disk on receipt rather than keeping the
+                // key to fetch it again, so there is nothing to remember here.
+                attachment: None,
             },
         );
     }
@@ -478,6 +481,9 @@ impl App {
             key,
             name: name.clone(),
             size: bytes.len(),
+            // The CLI does not guess types. A recipient shows an untyped file as a download,
+            // which is the safe reading of "unknown".
+            mime: None,
         };
 
         let open = self.open.as_mut().expect("checked above");
@@ -1000,6 +1006,7 @@ impl App {
                             sent_at_ms: message.envelope.sent_at_ms,
                             body: received.body.clone(),
                             attachment_name: received.attachment.as_ref().map(|a| a.name.clone()),
+                            attachment: None,
                         },
                     );
                     if let Some(attachment) = &received.attachment {

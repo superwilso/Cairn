@@ -109,6 +109,11 @@ jobs:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/call.browser.test.js
 
+      - name: Attachments in the real UI
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/attachments.browser.test.js
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

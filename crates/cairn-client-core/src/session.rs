@@ -44,6 +44,12 @@ use crate::statedir::{self, StateDirError};
 use crate::store::{ConversationIndex, IndexError};
 use crate::transport::HttpTransport;
 
+mod attachments;
+pub use attachments::{
+    kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
+    PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]
@@ -68,6 +74,22 @@ pub enum SessionError {
     NoGroupYet,
     #[error("identity file is unreadable: {0}")]
     Identity(String),
+    #[error(transparent)]
+    Attachment(#[from] cairn_crypto::attachment::AttachmentError),
+    #[error("that file is empty; there is nothing to send")]
+    EmptyAttachment,
+    #[error(
+        "that file is {} — attachments are limited to {}",
+        human_bytes(*size),
+        human_bytes(*max)
+    )]
+    AttachmentTooLarge { size: usize, max: usize },
+    #[error("that attachment is not one this device received in the open room")]
+    UnknownAttachment,
+    #[error("the room changed while the file was uploading, so it was not sent")]
+    RoomChangedDuringUpload,
+    #[error("could not save the attachment: {0}")]
+    Save(std::io::Error),
 }
 
 /// A room as a frontend needs to show it.
@@ -105,6 +127,10 @@ pub struct MessageView {
     pub sent_at_ms: i64,
     /// True when replayed from the local transcript rather than just received.
     pub historic: bool,
+    /// The file, photo or voice note this message carried. No key: a frontend fetches the
+    /// bytes by id through [`Session::fetch_attachment`].
+    #[serde(default)]
+    pub attachment: Option<AttachmentView>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -156,6 +182,9 @@ pub struct Session {
     /// people to press the button independently and hope their minted ids reconciled —
     /// there was no way to be told a call had started at all.
     ringing: Option<String>,
+    /// Attachments seen in the open room, with the keys that open them. Never handed to a
+    /// frontend; see `attachments.rs` for why a frontend can only fetch what is in here.
+    attachments: attachments::Known,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -222,6 +251,7 @@ impl Session {
             call: None,
             negotiated: false,
             ringing: None,
+            attachments: attachments::Known::new(),
         };
         if !claimed {
             session.claim(invite)?;
@@ -303,6 +333,9 @@ impl Session {
         self.index.record(created.room, &created.seal, convo.group_id())?;
         let cursor = self.index.cursor(&created.room);
         self.open = Some(OpenRoom { convo, seal: created.seal, cursor });
+        // Found by a probe: without this, creating a room left the previous room's
+        // attachments fetchable from the new one.
+        self.attachments.clear();
         Ok(created.room.to_string())
     }
 
@@ -371,21 +404,30 @@ impl Session {
 
         let cursor = self.index.cursor(&room);
         self.open = Some(OpenRoom { convo, seal, cursor });
+        // A room's attachments are fetchable only while it is open.
+        self.attachments.clear();
         self.replay(room)
     }
 
     /// The local transcript for a room, with the room's disappearing timer applied.
-    fn replay(&self, room: RoomId) -> Result<Vec<MessageView>, SessionError> {
+    fn replay(&mut self, room: RoomId) -> Result<Vec<MessageView>, SessionError> {
         let ttl = self.client.room_ttl(room).ok().flatten();
-        Ok(self
-            .history
-            .replay(room, ttl, now_ms())?
+        let entries = self.history.replay(room, ttl, now_ms())?;
+        Ok(entries
             .into_iter()
-            .map(|e| MessageView {
-                sender: e.sender.to_string(),
-                body: String::from_utf8_lossy(&e.body).to_string(),
-                sent_at_ms: e.sent_at_ms,
-                historic: true,
+            .map(|e| {
+                let attachment = e.attachment.map(|a| {
+                    let view = AttachmentView::of(&a);
+                    self.attachments.insert(a.blob, a);
+                    view
+                });
+                MessageView {
+                    sender: e.sender.to_string(),
+                    body: String::from_utf8_lossy(&e.body).to_string(),
+                    sent_at_ms: e.sent_at_ms,
+                    historic: true,
+                    attachment,
+                }
             })
             .collect())
     }
@@ -418,6 +460,7 @@ impl Session {
                 sent_at_ms: at,
                 body: text.as_bytes().to_vec(),
                 attachment_name: None,
+                attachment: None,
             },
         )?;
         Ok(())
@@ -488,20 +531,28 @@ impl Session {
                         continue;
                     }
                     let body = String::from_utf8_lossy(&received.body).to_string();
+                    let attachment = received.attachment.map(|a| *a);
                     let _ = self.history.append(
                         room,
                         &HistoryEntry {
                             sender: message.envelope.sender,
                             sent_at_ms: message.envelope.sent_at_ms,
                             body: received.body.clone(),
-                            attachment_name: None,
+                            attachment_name: attachment.as_ref().map(|a| a.name.clone()),
+                            attachment: attachment.clone(),
                         },
                     );
+                    let view = attachment.map(|a| {
+                        let view = AttachmentView::of(&a);
+                        self.attachments.insert(a.blob, a);
+                        view
+                    });
                     events.push(Event::Message(MessageView {
                         sender: message.envelope.sender.to_string(),
                         body,
                         sent_at_ms: message.envelope.sent_at_ms,
                         historic: false,
+                        attachment: view,
                     }));
                 }
                 Ok(TimelineEvent::Membership { added, removed, .. }) => {
@@ -800,6 +851,18 @@ fn load_or_create_identity(dir: &Path) -> Result<(UserId, DeviceId, bool), Sessi
             Ok((UserId::new(), DeviceId::new(), false))
         }
         Err(e) => Err(SessionError::Identity(e.to_string())),
+    }
+}
+
+/// `12.3 MB`-style sizes for error messages a person reads. Binary units, labelled as such.
+fn human_bytes(n: usize) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if n >= 1024 * 1024 {
+        format!("{:.1} MiB", n as f64 / MIB)
+    } else if n >= 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} bytes")
     }
 }
 

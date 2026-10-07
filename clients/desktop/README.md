@@ -130,10 +130,32 @@ The fix is a `permission-request` handler reached through `with_webview`, which 
 Linux-only `webkit2gtk` dependency on this crate. Not taken yet because Windows is the
 target; recorded here so it is a decision rather than a mystery.
 
+## Attachments
+
+Photos and files go through the paperclip, a drop onto the conversation, or a paste. The
+bytes cross the IPC boundary as a raw body — not a JSON array, which would make a 25 MiB
+photo about 100 MB of text — and Rust seals, uploads and sends them; `ui/attachments.js`
+never sees a key. A sender's claimed type decides nothing on its own: Rust maps it to
+`image` (PNG, JPEG, GIF, WebP — never SVG), `audio`, or `file`, and only the first two are
+ever turned into something the webview renders. A file is only offered as **Save**, which
+Rust writes into Downloads under a sanitised name without overwriting anything.
+
+Two settings in `tauri.conf.json` exist for this and are easy to undo by accident:
+
+- `connect-src ipc: http://ipc.localhost` — Tauri's own local IPC endpoints, not remote
+  origins. Without them the webview cannot reach the `ipc:` protocol, Tauri silently falls
+  back to `postMessage`, and every binary payload is re-encoded as JSON numbers.
+- `dragDropEnabled: false` — hands file drops to the page. With it on, Tauri consumes them.
+
+Honest limits: one request per file, up to 25 MiB, no resume. The attachment key is stored
+beside the local transcript (same file, same `0600`) so yesterday's photo still opens; the
+instance does not yet delete blobs, so a disappearing timer removes this device's key but
+not the server's ciphertext.
+
 ## What it does not do yet
 
-Attachments, link cards, safety-number comparison and disappearing-message controls all
-exist in `client-core` and are not yet surfaced in this UI.
+Link cards, safety-number comparison and disappearing-message controls all exist in
+`client-core` and are not yet surfaced in this UI.
 
 ## The icon
 
