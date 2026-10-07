@@ -102,6 +102,21 @@ the crypto tree needs `edition2024`), and runs `cargo audit`.
 **Verify over HTTP, not only in unit tests.** Both room bugs looked fine in unit tests
 written against the same wrong mental model. Start the server and make the actual request.
 
+**This container is more privileged than CI, and `ci-local.sh` cannot close that gap.** Two
+failures have now gone in green from here and come back red from a runner, both the same
+shape:
+
+- **Missing system packages.** `cairn-desktop` links WebKitGTK. A machine that can build it
+  has the headers by definition; the Ubuntu runner does not, and every job died in twelve
+  seconds on `glib-2.0 was not found`.
+- **Running as root.** `statedir::prepare` chmod'ed the state directory's *parent*, which in
+  a test is `/tmp`. Root can chmod `/tmp`; an ordinary user gets `EPERM`, and thirteen tests
+  failed in ten milliseconds.
+
+So when CI disagrees with a green local tree, suspect privilege and environment before
+suspecting flakiness. The script now warns when it is running as root, and carries a tripwire
+for the package list, but noticing is all it can do.
+
 **`cargo test` cannot see the client's JavaScript, and the call mesh lives there.** Who
 offers, whether an early ICE candidate survives, whether the answering side claims the video
 transceiver — all decided in `ui/call.js`, and every failure there presents as a network

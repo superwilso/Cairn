@@ -11,7 +11,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cairn_client_core::session::{Event, Session};
+use cairn_client_core::session::{Event, Session, SessionError};
 use cairn_server::state::{Instance, RegistrationPolicy};
 
 struct Server {
@@ -75,27 +75,43 @@ fn a_client_can_register_against_an_invite_only_instance() {
     assert!(session.user_id().starts_with("usr_"));
 }
 
+/// Assert a sign-in was refused **by the instance**, not by anything local.
+///
+/// The two tests below assert a failure, and for one CI run that made them the only tests in
+/// this file that passed — every other one died on a state directory the runner would not let
+/// the process chmod, and `is_err()` is satisfied by that too. A negative test that accepts
+/// any error certifies a client which cannot start at all.
+fn refused_by_the_instance(result: Result<Session, SessionError>) {
+    match result {
+        Ok(_) => panic!("the instance must not have admitted this account"),
+        Err(SessionError::Client(_)) => {}
+        Err(other) => panic!("expected a refusal from the instance, got a local failure: {other}"),
+    }
+}
+
 #[test]
 fn registration_without_an_invite_is_refused_when_the_instance_requires_one() {
     // Counterfactual, and the one that matters: if the invite were being ignored rather than
     // honoured, the test above would pass on an instance that admits anybody.
     let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in-please"]);
     let dir = scratch("uninvited");
-    let refused = Session::open("uninvited", &format!("http://{}", server.addr), Some(&dir));
-    assert!(refused.is_err(), "an invite-only instance must refuse an unclaimed account");
+    refused_by_the_instance(Session::open(
+        "uninvited",
+        &format!("http://{}", server.addr),
+        Some(&dir),
+    ));
 }
 
 #[test]
 fn a_wrong_invite_is_refused() {
     let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in-please"]);
     let dir = scratch("guesser");
-    let refused = Session::open_with_invite(
+    refused_by_the_instance(Session::open_with_invite(
         "guesser",
         &format!("http://{}", server.addr),
         Some(&dir),
         Some("let-me-in-please-too"),
-    );
-    assert!(refused.is_err(), "a token the instance never minted must not admit anybody");
+    ));
 }
 
 #[test]
