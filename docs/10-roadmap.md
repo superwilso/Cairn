@@ -180,6 +180,14 @@ Four calls made deliberately in advance, so an unattended session does not guess
   to report having read a message, which is a read receipt wearing a different name — and
   read receipts were already excluded for broadcasting presence. "Any member" rather than
   moderators-only because a DM has no moderator and both parties are equals.
+
+  **"Future messages only" is not what the instance does.** `purge_expired` measures every
+  stored message against the *current* timer on each read, so turning one on deletes what
+  is already older than it — on the instance and, by the same rule, in every honest client's
+  local history. The desktop client exposes the timer (header dropdown) and says this in the
+  dropdown itself rather than repeating the decision as if it held;
+  `crates/cairn-server/tests/disappearing_session.rs` fails when the instance changes, so
+  the warning cannot outlive the behaviour it describes.
 - **Local message history is stored now, unencrypted, and said so plainly.** `0600`, beside
   the client state that already sits there in the clear. This is strictly no worse than
   today — the group keys are already on disk — and without it the client cannot hold a real

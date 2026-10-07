@@ -375,3 +375,27 @@ header.topbar .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: el
 }
 
 .hint { color: var(--dim); font-weight: 400; }
+
+/* ---- disappearing messages --------------------------------------------- */
+
+label.timer {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 4px 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--dim);
+}
+label.timer.on { color: var(--accent); border-color: rgba(110, 168, 254, 0.4); background: var(--accent-soft); }
+label.timer select {
+  width: auto;
+  border: 0;
+  background: transparent;
+  padding: 5px 4px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+label.timer select:focus { outline: none; }
+label.timer:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+label.timer select option, label.timer select optgroup { background: var(--surface); color: var(--text); }

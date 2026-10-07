@@ -109,6 +109,13 @@ jobs:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/call.browser.test.js
 
+      - name: The messaging UI in a browser
+        # Against a stand-in for the Rust session. The Rust side of each feature is tested in
+        # cargo; this is the half a user actually looks at.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/messaging.browser.test.js
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

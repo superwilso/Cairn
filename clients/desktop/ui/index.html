@@ -41,6 +41,9 @@
     <symbol id="i-hangup" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <path d="M3 12.5c5-4.5 13-4.5 18 0l-2.7 2.4a1.6 1.6 0 0 1-2 .1l-1.6-1.2a1.6 1.6 0 0 1-.6-1.3v-1a10 10 0 0 0-4.2 0v1a1.6 1.6 0 0 1-.6 1.3l-1.6 1.2a1.6 1.6 0 0 1-2-.1Z"/>
     </symbol>
+    <symbol id="i-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="13.5" r="7.5"/><path d="M12 13.5V9.5M10 2.5h4M18.5 6.5l1.5-1.5"/>
+    </symbol>
     <symbol id="i-call" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <path d="M4.5 4.5h3l1.5 4-2 1.5a12 12 0 0 0 5.5 5.5l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A15.5 15.5 0 0 1 2.5 6.7 2 2 0 0 1 4.5 4.5Z"/>
     </symbol>
@@ -90,6 +93,12 @@
     <header class="topbar">
       <span id="room-id" class="mono grow"></span>
       <span id="room-tier" class="badge"></span>
+      <!-- Disappearing messages. Any member may set it; timer.js says what it does to
+           messages already sent, because the answer is not "nothing". -->
+      <label class="timer" title="Disappearing messages">
+        <svg width="14" height="14"><use href="#i-timer"/></svg>
+        <select id="room-timer" aria-label="Disappearing messages"></select>
+      </label>
       <button id="invite" class="ghost">Invite</button>
       <button id="start-voice" class="icon" title="Voice call">
         <svg width="15" height="15"><use href="#i-call"/></svg> Voice
@@ -171,6 +180,7 @@
 </div>
 
 <script src="call.js"></script>
+<script src="timer.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

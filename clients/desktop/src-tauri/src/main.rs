@@ -188,6 +188,18 @@ fn call_config() -> CallConfig {
     }
 }
 
+/// The open room's disappearing-message timer, in milliseconds; `None` is off.
+#[tauri::command]
+fn room_timer(state: State<'_, AppState>) -> CmdResult<Option<i64>> {
+    with(&state, |s| s.room_timer())
+}
+
+/// Set it. Returns what the instance holds afterwards, which is what the UI shows.
+#[tauri::command]
+fn set_room_timer(state: State<'_, AppState>, ttl_ms: Option<i64>) -> CmdResult<Option<i64>> {
+    with(&state, |s| s.set_room_timer(ttl_ms))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -210,6 +222,8 @@ fn main() {
             signal,
             call_id,
             call_config,
+            room_timer,
+            set_room_timer,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

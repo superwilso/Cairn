@@ -173,6 +173,7 @@ async function selectRoom(room) {
             ? "Transport-encrypted. The instance can read this room."
             : "End-to-end encrypted. The instance stores ciphertext it cannot read.";
     } catch (_) {}
+    await CairnTimer.load();
     await refreshRooms();
     await refreshMembers();
     startPolling();
@@ -558,6 +559,7 @@ async function tick() {
     let membershipChanged = false;
 
     for (const ev of events) {
+        if (CairnTimer.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -588,6 +590,8 @@ async function tick() {
 function addMessage(m) {
     const li = document.createElement("li");
     li.className = m.historic ? "msg historic" : "msg";
+    // What an `expired` event is measured against; see timer.js.
+    li.dataset.sent = m.sent_at_ms;
     const who = document.createElement("span");
     who.className = "mono who";
     who.textContent = short(m.sender);

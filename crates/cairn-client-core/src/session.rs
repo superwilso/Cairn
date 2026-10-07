@@ -68,6 +68,8 @@ pub enum SessionError {
     NoGroupYet,
     #[error("identity file is unreadable: {0}")]
     Identity(String),
+    #[error("a disappearing-message timer must be longer than zero")]
+    BadTimer,
 }
 
 /// A room as a frontend needs to show it.
@@ -119,6 +121,22 @@ pub enum Event {
     },
     /// This device was removed. The frontend must close the room.
     Removed,
+    /// The room's disappearing-message timer changed, as the instance now holds it.
+    ///
+    /// Read back from the instance rather than taken from anybody's announcement, because
+    /// the instance's value is the one that actually deletes things — both its own copy and,
+    /// through [`History::replay`], this device's. Unattributed for the same reason: the
+    /// instance does not say who set it, and a name supplied by a message would be a claim.
+    Timer {
+        ttl_ms: Option<i64>,
+    },
+    /// Messages sent at or before `before_ms` are past the room's timer and have been
+    /// deleted from this device's transcript. A frontend removes them from the screen too;
+    /// a message still displayed after its timer has disappeared from everywhere except the
+    /// place its user is looking.
+    Expired {
+        before_ms: i64,
+    },
     /// Call signalling addressed to this device, for the WebRTC layer rather than the
     /// timeline. Already filtered: signals meant for somebody else never reach a frontend.
     Signal {
@@ -131,7 +149,20 @@ struct OpenRoom {
     convo: Conversation,
     seal: RoomSeal,
     cursor: u64,
+    /// The disappearing-message timer as last read from the instance.
+    ttl: Option<i64>,
+    /// When `ttl` was last read, so polling re-reads it on a slower clock than messages.
+    ttl_checked_ms: i64,
 }
+
+/// How often an open room re-reads its timer and sweeps its transcript.
+///
+/// Any member may change the timer (`docs/10-roadmap.md`), from any client — the CLI's `/ttl`
+/// announces nothing — so the only reliable way to notice is to ask. Asking on every poll
+/// would double the requests an idle room makes; ten seconds bounds how long a stale timer
+/// can be shown, and how long an expired message can outlive its timer on this disk while
+/// the room stays open.
+const TIMER_RECHECK_MS: i64 = 10_000;
 
 /// One signed-in client.
 pub struct Session {
@@ -156,6 +187,8 @@ pub struct Session {
     /// people to press the button independently and hope their minted ids reconciled —
     /// there was no way to be told a call had started at all.
     ringing: Option<String>,
+    /// How often polling re-reads the open room's timer. [`TIMER_RECHECK_MS`] outside tests.
+    timer_recheck_ms: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -222,6 +255,7 @@ impl Session {
             call: None,
             negotiated: false,
             ringing: None,
+            timer_recheck_ms: TIMER_RECHECK_MS,
         };
         if !claimed {
             session.claim(invite)?;
@@ -302,7 +336,14 @@ impl Session {
         )?;
         self.index.record(created.room, &created.seal, convo.group_id())?;
         let cursor = self.index.cursor(&created.room);
-        self.open = Some(OpenRoom { convo, seal: created.seal, cursor });
+        // A room is created without a timer; nobody has had the chance to set one.
+        self.open = Some(OpenRoom {
+            convo,
+            seal: created.seal,
+            cursor,
+            ttl: None,
+            ttl_checked_ms: now_ms(),
+        });
         Ok(created.room.to_string())
     }
 
@@ -370,13 +411,13 @@ impl Session {
         };
 
         let cursor = self.index.cursor(&room);
-        self.open = Some(OpenRoom { convo, seal, cursor });
-        self.replay(room)
+        let ttl = self.client.room_ttl(room).ok().flatten();
+        self.open = Some(OpenRoom { convo, seal, cursor, ttl, ttl_checked_ms: now_ms() });
+        self.replay(room, ttl)
     }
 
     /// The local transcript for a room, with the room's disappearing timer applied.
-    fn replay(&self, room: RoomId) -> Result<Vec<MessageView>, SessionError> {
-        let ttl = self.client.room_ttl(room).ok().flatten();
+    fn replay(&self, room: RoomId, ttl: Option<i64>) -> Result<Vec<MessageView>, SessionError> {
         Ok(self
             .history
             .replay(room, ttl, now_ms())?
@@ -523,9 +564,80 @@ impl Session {
             }
         }
 
+        self.recheck_timer(&mut open, &mut events);
         let _ = self.index.advance(room, open.cursor);
         self.open = Some(open);
         Ok(events)
+    }
+
+    /// The open room's disappearing-message timer, in milliseconds. `None` is off.
+    ///
+    /// As last read from the instance — on opening the room, and every
+    /// [`TIMER_RECHECK_MS`] while polling.
+    pub fn room_timer(&self) -> Result<Option<i64>, SessionError> {
+        Ok(self.open.as_ref().ok_or(SessionError::NoRoomOpen)?.ttl)
+    }
+
+    /// Shorten how often polling re-reads the timer. For tests, which cannot wait out
+    /// [`TIMER_RECHECK_MS`] on every assertion.
+    #[doc(hidden)]
+    pub fn set_timer_recheck_ms(&mut self, ms: i64) {
+        self.timer_recheck_ms = ms;
+    }
+
+    /// Set or clear the open room's disappearing-message timer. Any member may.
+    ///
+    /// Returns the timer the instance reports *afterwards*, not the one asked for: the
+    /// frontend shows what is in force, and the two only differ if something went wrong.
+    ///
+    /// **It reaches back.** The instance measures every stored message against the current
+    /// setting each time the room is read (`Instance::purge_expired`), so turning a timer on
+    /// deletes messages already older than it — not only future ones — and this device does
+    /// the same to its own transcript here, immediately. `docs/10-roadmap.md` records the
+    /// owner's decision as "applies to future messages only"; the instance does not implement
+    /// that, and a client telling its user otherwise would be promising them a history the
+    /// instance is about to delete. The frontend says so before anyone picks a value, and
+    /// `crates/cairn-server/tests/disappearing_session.rs` fails the moment it stops being
+    /// true.
+    pub fn set_room_timer(&mut self, ttl_ms: Option<i64>) -> Result<Option<i64>, SessionError> {
+        // The instance refuses these too. Refusing here as well means the user gets a
+        // sentence rather than a status code.
+        if ttl_ms.is_some_and(|t| t <= 0) {
+            return Err(SessionError::BadTimer);
+        }
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        let room = open.convo.room();
+        self.client.set_room_ttl(room, ttl_ms)?;
+        let confirmed = self.client.room_ttl(room)?;
+        open.ttl = confirmed;
+        // Forces the next poll to sweep, so a frontend learns at once which messages on its
+        // screen the new timer has just ended.
+        open.ttl_checked_ms = i64::MIN;
+        self.history.replay(room, confirmed, now_ms())?;
+        Ok(confirmed)
+    }
+
+    /// Re-read the timer, announce a change, and delete whatever has expired since the last
+    /// sweep. Failures are swallowed: a missed recheck is retried on the next poll, and
+    /// failing the poll over it would drop the messages it had already fetched.
+    fn recheck_timer(&self, open: &mut OpenRoom, events: &mut Vec<Event>) {
+        let now = now_ms();
+        if now.saturating_sub(open.ttl_checked_ms) < self.timer_recheck_ms {
+            return;
+        }
+        let room = open.convo.room();
+        let Ok(current) = self.client.room_ttl(room) else { return };
+        open.ttl_checked_ms = now;
+        if current != open.ttl {
+            open.ttl = current;
+            events.push(Event::Timer { ttl_ms: current });
+        }
+        if let Some(ttl) = current {
+            // Rewrites the transcript without anything past the timer — deletion, not a
+            // filter on what is shown.
+            let _ = self.history.replay(room, Some(ttl), now);
+            events.push(Event::Expired { before_ms: now.saturating_sub(ttl) });
+        }
     }
 
     /// Join the call in the open room, announcing arrival to everyone already in it.

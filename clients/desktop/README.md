@@ -10,6 +10,7 @@ ui/index.html       structure, and the inline SVG icon set
 ui/style.css        the whole design, hand-written, no framework
 ui/app.js           the DOM — rooms, timeline, members, call controls
 ui/call.js          WebRTC: peer connections, devices, screen share
+ui/timer.js         the disappearing-message control and its notices
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -27,7 +28,7 @@ upward and it belongs in `client-core`.
 
 Deliberate. This is a security product with a small supply chain as a stated value, and a
 chat window does not need a framework and 300 transitive packages to render a list. There is
-no `package.json`, no bundler, and nothing to audit but the three files in `ui/`.
+no `package.json`, no bundler, and nothing to audit but the files in `ui/`.
 
 ## Running it
 
@@ -130,10 +131,27 @@ The fix is a `permission-request` handler reached through `with_webview`, which 
 Linux-only `webkit2gtk` dependency on this crate. Not taken yet because Windows is the
 target; recorded here so it is a decision rather than a mystery.
 
+## Disappearing messages
+
+The clock in the room header is the room's timer: off, 5 minutes, 1 hour, 1 day or 1 week.
+Any member may set it (`docs/10-roadmap.md`), and `ui/timer.js` only displays and forwards —
+`Session::set_room_timer` sets it, and `Session::poll` re-reads it every ten seconds, because
+another member may change it from any client and the instance does not push. A change is
+announced in the timeline, unattributed: the instance does not say who made it, and a name
+taken from a message would be that sender's claim.
+
+While the room is open, polling also sweeps the transcript on disk and tells the UI which
+messages to take off the screen. Before this, an expired message was only deleted locally
+the next time the room was opened.
+
+**A new timer reaches back.** The instance measures every stored message against the
+current setting, so turning a timer on deletes messages already older than it — not only
+future ones. The dropdown says so before a value is picked.
+
 ## What it does not do yet
 
-Attachments, link cards, safety-number comparison and disappearing-message controls all
-exist in `client-core` and are not yet surfaced in this UI.
+Attachments, link cards and safety-number comparison all exist in `client-core` and are not
+yet surfaced in this UI.
 
 ## The icon
 
