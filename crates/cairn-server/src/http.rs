@@ -7,7 +7,11 @@
 //! `docs/03-protocol-evaluation.md`. It exists so the vertical slice is exercisable
 //! end to end.
 
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRef, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -18,9 +22,42 @@ use serde::{Deserialize, Serialize};
 use cairn_crypto::TranscriptReport;
 use cairn_proto::{Envelope, RoomId, RoomShape};
 
+use crate::address::{AddressBucket, TrustedProxies};
 use crate::state::{ServerError, SharedInstance};
 
+/// What the handlers share. Most of them only want the instance, and get it via
+/// [`FromRef`]; registration also needs to know which proxies to believe.
+#[derive(Clone)]
+struct AppState {
+    instance: SharedInstance,
+    proxies: Arc<TrustedProxies>,
+    /// Set after the first misconfiguration warning, so a busy instance logs it once.
+    warned_untrusted_forwarding: Arc<AtomicBool>,
+}
+
+impl FromRef<AppState> for SharedInstance {
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.instance)
+    }
+}
+
+/// The instance's HTTP surface, trusting no proxy: the socket address is the client.
+///
+/// **Must be served with connect info** —
+/// `axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())` — or
+/// registration fails with a 500. That failure is deliberate: a server that could not see
+/// addresses would otherwise register without any limit at all.
 pub fn router(instance: SharedInstance) -> Router {
+    router_behind(instance, TrustedProxies::default())
+}
+
+/// As [`router`], believing `X-Forwarded-For` from the given reverse proxies only.
+pub fn router_behind(instance: SharedInstance, proxies: TrustedProxies) -> Router {
+    let state = AppState {
+        instance,
+        proxies: Arc::new(proxies),
+        warned_untrusted_forwarding: Arc::new(AtomicBool::new(false)),
+    };
     Router::new()
         .route("/health", get(health))
         .route("/v1/accounts", post(claim_account))
@@ -54,7 +91,7 @@ pub fn router(instance: SharedInstance) -> Router {
         .route("/v1/usernames", post(claim_username))
         .route("/v1/usernames/{name}", get(lookup_username))
         .route("/v1/reports", post(submit_report))
-        .with_state(instance)
+        .with_state(state)
 }
 
 impl IntoResponse for ServerError {
@@ -93,6 +130,9 @@ impl IntoResponse for ServerError {
             // hold something this big. An operator raising the ceiling changes the answer.
             ServerError::BlobTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ServerError::BlobEmpty => StatusCode::BAD_REQUEST,
+            // Only reachable from the operator's own startup path, never from a request,
+            // but the mapping must be total.
+            ServerError::InviteTooShort => StatusCode::BAD_REQUEST,
             // Authorization failures on device linking. Distinguishable because an honest
             // client needs to know which of its inputs was wrong, and an attacker already
             // knows what they forged.
@@ -151,11 +191,15 @@ struct ClaimAccountRequest {
 /// only point at which one becomes owned. Once claimed, adding further devices requires
 /// authorization from a device already on the account.
 async fn claim_account(
-    State(instance): State<SharedInstance>,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ClaimAccountRequest>,
 ) -> Result<StatusCode, ServerError> {
+    let from = AddressBucket::of(client_address(&state, peer, &headers));
     let public_key = hex::decode(&req.public_key).map_err(|_| ServerError::BadSignature)?;
-    instance.claim_account(
+    state.instance.register(
+        from,
         cairn_proto::UserId::from_uuid(req.user),
         cairn_proto::DeviceId::from_uuid(req.device),
         &public_key,
@@ -192,6 +236,25 @@ async fn link_device(
         &authorization,
     )?;
     Ok(StatusCode::CREATED)
+}
+
+/// The address a request is charged to, per the operator's trusted proxies.
+fn client_address(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
+    let values = headers.get_all("x-forwarded-for");
+    if !state.proxies.trusts(peer.ip())
+        && values.iter().next().is_some()
+        && !state.warned_untrusted_forwarding.swap(true, Ordering::Relaxed)
+    {
+        // The likeliest cause is a reverse proxy the operator has not named, which leaves
+        // every client sharing the proxy's one registration budget. It could also be a
+        // client setting the header itself, which is exactly why it is ignored either way.
+        tracing::warn!(
+            %peer,
+            "ignoring X-Forwarded-For from an untrusted peer. If this is your reverse proxy, \
+             add it to CAIRN_TRUSTED_PROXIES, or every client will share its rate limits"
+        );
+    }
+    state.proxies.client_address(peer.ip(), values.iter().filter_map(|v| v.to_str().ok()))
 }
 
 /// Authenticate a non-message request from its headers and return the acting account.
@@ -325,8 +388,8 @@ struct ClaimedKeyPackage {
 ///
 /// Authenticated, because an anonymous caller could otherwise drain any account's supply
 /// and make it unaddable. Authentication bounds that to accounts on the instance rather
-/// than preventing it — a hostile member can still drain another member, and there is no
-/// rate limiting yet (`docs/10-roadmap.md` M3).
+/// than preventing it — a hostile member can still drain another member, slowly:
+/// `MAX_CLAIMS_PER_TARGET` bounds the rate, not the total.
 async fn claim_key_packages(
     State(instance): State<SharedInstance>,
     Path(user): Path<uuid::Uuid>,

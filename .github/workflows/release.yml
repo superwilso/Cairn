@@ -184,7 +184,7 @@ jobs:
             one. For a local instance use `http://127.0.0.1:8080`:
 
             ```bash
-            CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=for-alice,for-bob \
+            CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=alice-7f3k9q2m4x8w,bob-2n6v1r5t9z3c \
               cargo run -p cairn-server
             ```
 

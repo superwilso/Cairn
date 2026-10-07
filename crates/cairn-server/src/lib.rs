@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod address;
 pub mod backup;
 pub mod http;
 pub mod state;

@@ -342,10 +342,24 @@ Four calls made by the owner, so a session does not re-litigate them:
       the likeliest way it would have failed: `tauri-build` hard-errors without
       `icons/icon.ico`, and the icon that existed was a placeholder of 512x512 identical
       pixels. `scripts/make-icon.py` draws both, and CI checks every icon the bundle names.
-- [ ] Rate limiting on registration and sending. Both need the caller's address, which
-      `state.rs` never sees — so unlike the claim limit, this one genuinely cannot live
-      entirely where the other rules do, and that boundary needs designing rather than
-      assuming.
+- [x] **Rate limiting on registration and sending.** Sending turned out not to need an
+      address at all — `accept` authenticates the envelope first, so it is capped per
+      account alongside uploads. Registration did, and probing showed what was at stake:
+      one address made **2,000 invite guesses in under a second** with no refusal, and
+      under open registration minted 2,000 accounts, each arriving with a fresh send and
+      upload budget.
+
+      **The boundary, as designed:** `state.rs` owns the rule
+      (`MAX_REGISTRATION_ATTEMPTS_PER_ADDRESS`, failures included) and takes an opaque
+      `AddressBucket`; `address.rs` decides which address that is. `X-Forwarded-For` is
+      believed only from proxies the operator names in `CAIRN_TRUSTED_PROXIES`, walked
+      right to left so only entries the proxy wrote count. Unconfigured, it fails toward
+      one shared, over-strict budget, never toward a client choosing its own address.
+      IPv6 is bucketed by `/64`. Served without connect info, registration fails closed.
+
+      Registration invites shorter than 16 characters are now refused at startup, because
+      against a guesser with many addresses the token is the defence and the limit is not.
+      **Not bounded:** an attacker with many addresses, and anything after a restart.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.

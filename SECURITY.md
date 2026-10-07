@@ -8,22 +8,20 @@ need a secure messenger today, use Signal.
 
 Specifically, and non-exhaustively:
 
-- **No key transparency, and safety numbers are not yet surfaced in any UI.**
-  Safety-number verification is implemented and tested in `cairn-crypto::verification`,
-  but nothing displays it to a user yet, and there is no contact store persisting
-  verification state. Until a client shows the number and a user compares it out of band,
-  the end-to-end encryption still holds only against an honest-but-curious server, **not
-  a malicious one**. Key transparency — which makes server equivocation detectable without
+- **No key transparency, and safety numbers are only in the terminal client.**
+  `cairn-cli chat` shows and compares them (`/safety`, `/verify`) and persists the result,
+  including a sticky warning when a verified contact's keys change. The desktop client
+  displays whether a contact was verified but cannot show or compare the number itself.
+  Until a user compares numbers out of band, the end-to-end encryption holds only against
+  an honest-but-curious server, **not a malicious one**. Key transparency — which makes server equivocation detectable without
   manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
-- **No sessions, passwords, or rate limits.** Accounts are claimed and invite-gated by
-  default, and adding a device to an existing account requires authorization from a device
-  already on it. What is still missing: rate limiting on registration and sending, any
-  notion of a login session, and account recovery. Losing every device on an account
-  currently means losing the account.
-- **Storage is a JSON snapshot rewritten on every message.** State and the franking key
-  now survive restarts, but the whole file is rewritten per write, and a crash between
-  writes loses everything since the last one (never a partial file — writes are atomic).
-  Adequate for a scaffold, not for real load.
+- **No sessions or passwords, and rate limits that bound one actor, not many.** Accounts
+  are claimed and invite-gated by default, and adding a device to an existing account
+  requires authorization from a device already on it. Registration is limited per address
+  and sending, uploads, key package claims and username lookups per account — but every
+  counter is in memory, so a restart clears them, and an attacker with many addresses gets
+  many budgets. There is no login session and no account recovery: losing every device on
+  an account means losing the account.
 - **Franking is unaudited.** It now handles groups correctly (the server anchors the
   ordering chain, so concurrent senders stay reportable), but no cryptographer outside
   the project has reviewed the construction.

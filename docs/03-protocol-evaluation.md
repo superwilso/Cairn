@@ -167,7 +167,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
 | No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
 | Client state stored unencrypted | Group state and key package secrets sit on disk in the clear, 0600 on Unix and default ACLs on Windows. Consistent with `01-threat-model.md` §3.4, but weaker than the platform keystores a shipping client needs |
-| No sessions or rate limits | Accounts are claimed, invite-gated, and device linking is authorized — but there is no session concept, no rate limiting, and no account recovery. Concretely: an authenticated account can drain another account's key packages and make it unaddable until it republishes |
+| No sessions; rate limits bound one actor | Accounts are claimed, invite-gated, and device linking is authorized. Registration is limited per address, and sending, uploads, key package claims and lookups per account — all in memory, so a restart clears them, and many addresses or accounts still add up. There is no session concept and no account recovery. Concretely: several accounts together can still drain another account's key packages and make it unaddable until it republishes |
 | Franking unreviewed | Groups are handled, but no external cryptographic review yet |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
 | Replay window, not nonces | Signed requests carry a timestamp checked against a 60s window; replay inside that window is possible |

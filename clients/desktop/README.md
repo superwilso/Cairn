@@ -46,7 +46,7 @@ The server's registration policy defaults to `InviteOnly` and `docs/11-self-host
 recommends keeping it that way, so an operator hands one out per person:
 
 ```bash
-CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=first-friend,second-friend \
+CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=first-friend-q8w2e7r4,second-friend-z5x1c9v3 \
   cargo run -p cairn-server
 ```
 

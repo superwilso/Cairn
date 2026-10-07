@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-use cairn_server::{backup, http, state, storage};
+use cairn_server::{address, backup, http, state, storage};
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -112,7 +112,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(token, "invite created");
         }
     }
-    let app = http::router(instance);
+    // Read before anything is served: a proxy list that half-parsed would quietly trust
+    // the wrong hosts, so a typo stops the instance instead.
+    let proxies = match std::env::var("CAIRN_TRUSTED_PROXIES") {
+        Ok(list) => address::TrustedProxies::parse(&list)
+            .map_err(|e| format!("CAIRN_TRUSTED_PROXIES: {e}"))?,
+        Err(_) => address::TrustedProxies::default(),
+    };
+    if proxies.is_empty() {
+        tracing::info!(
+            "no trusted proxies: registration is limited by socket address. Behind a reverse \
+             proxy, set CAIRN_TRUSTED_PROXIES to its address or every client shares one limit"
+        );
+    } else {
+        tracing::info!(?proxies, "believing X-Forwarded-For from these proxies only");
+    }
+    let app =
+        http::router_behind(instance, proxies).into_make_service_with_connect_info::<SocketAddr>();
 
     tracing::warn!("pre-alpha scaffold: no auth, no TLS. Do not expose this.");
     tracing::info!(%data_dir, "state directory");

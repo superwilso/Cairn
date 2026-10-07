@@ -38,7 +38,9 @@ fn start_with(policy: RegistrationPolicy, invites: &[&str]) -> Server {
     let router = cairn_server::http::router(Arc::clone(&instance));
     runtime.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
     Server { addr, instance, _runtime: runtime }
 }
@@ -61,13 +63,13 @@ fn session(server: &Server, name: &str) -> Session {
 /// whose operator had opened registration to the entire internet.
 #[test]
 fn a_client_can_register_against_an_invite_only_instance() {
-    let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in"]);
+    let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in-please"]);
     let dir = scratch("invited");
     let session = Session::open_with_invite(
         "invited",
         &format!("http://{}", server.addr),
         Some(&dir),
-        Some("let-me-in"),
+        Some("let-me-in-please"),
     )
     .expect("a valid invite must get an account onto the instance");
     assert!(session.user_id().starts_with("usr_"));
@@ -77,7 +79,7 @@ fn a_client_can_register_against_an_invite_only_instance() {
 fn registration_without_an_invite_is_refused_when_the_instance_requires_one() {
     // Counterfactual, and the one that matters: if the invite were being ignored rather than
     // honoured, the test above would pass on an instance that admits anybody.
-    let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in"]);
+    let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in-please"]);
     let dir = scratch("uninvited");
     let refused = Session::open("uninvited", &format!("http://{}", server.addr), Some(&dir));
     assert!(refused.is_err(), "an invite-only instance must refuse an unclaimed account");
@@ -85,13 +87,13 @@ fn registration_without_an_invite_is_refused_when_the_instance_requires_one() {
 
 #[test]
 fn a_wrong_invite_is_refused() {
-    let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in"]);
+    let server = start_with(RegistrationPolicy::InviteOnly, &["let-me-in-please"]);
     let dir = scratch("guesser");
     let refused = Session::open_with_invite(
         "guesser",
         &format!("http://{}", server.addr),
         Some(&dir),
-        Some("let-me-in-too"),
+        Some("let-me-in-please-too"),
     );
     assert!(refused.is_err(), "a token the instance never minted must not admit anybody");
 }
@@ -101,10 +103,12 @@ fn a_registered_client_reopens_without_its_invite() {
     // The gap this walked into once already: the instance checks the invite *before* it
     // notices the account exists, so a returning user presenting a spent token is refused —
     // locked out of their own account. The claim is recorded locally and not repeated.
-    let server = start_with(RegistrationPolicy::InviteOnly, &["one-use"]);
+    let server = start_with(RegistrationPolicy::InviteOnly, &["one-use-invite-xyz"]);
     let dir = scratch("returning");
     let url = format!("http://{}", server.addr);
-    let first = Session::open_with_invite("returning", &url, Some(&dir), Some("one-use")).unwrap();
+    let first =
+        Session::open_with_invite("returning", &url, Some(&dir), Some("one-use-invite-xyz"))
+            .unwrap();
     let user = first.user_id();
     drop(first);
 
