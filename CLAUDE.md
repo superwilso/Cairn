@@ -153,6 +153,6 @@ found by probing, say what the probe showed.
 ## Owner's items — do not attempt these
 
 - **Name clearance** (USPTO/EUIPO, domains). The owner may rename later; do not block on it.
-- **Licence files.** Must be verbatim from an authoritative source. Do not reproduce a
-  legal document from memory.
+- **Licence files** are committed (the owner asked for them, and they were downloaded
+  from their publishers). Never edit them, and never reproduce a legal document from memory.
 - **External cryptographic review.** Scheduled for M5.

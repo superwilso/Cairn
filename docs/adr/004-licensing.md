@@ -86,12 +86,14 @@ and adopting it would forfeit the community this project depends on.
 
 ## Action items
 
-- [ ] Add verbatim `LICENSE` files — AGPL-3.0 at root, Apache-2.0 under client and protocol
-      directories once those exist. **Not yet added**: the license texts must be copied
-      verbatim from an authoritative source, and outbound access to `gnu.org` and
-      `apache.org` was blocked from the environment where these docs were drafted. Use
-      GitHub's license picker or `curl https://www.gnu.org/licenses/agpl-3.0.txt`.
-- [ ] Add `DCO` and a `Signed-off-by` requirement to `CONTRIBUTING.md`.
+- [x] Add verbatim `LICENSE` files — AGPL-3.0 at root, Apache-2.0 in `cairn-proto`,
+      `cairn-crypto`, `cairn-client-core` and `clients/desktop`, CC-BY-SA-4.0 in `docs/`.
+      Downloaded from `gnu.org/licenses/agpl-3.0.txt`,
+      `apache.org/licenses/LICENSE-2.0.txt` and
+      `creativecommons.org/licenses/by-sa/4.0/legalcode.txt`, unmodified. The AGPL text
+      was fetched twice with identical hashes, and the Apache text is byte-identical to
+      Debian's `/usr/share/common-licenses/Apache-2.0`. The map is in `README.md`.
+- [x] Add `DCO` and a `Signed-off-by` requirement to `CONTRIBUTING.md`.
 - [ ] Draft the trademark policy (can follow the naming clearance in
       [`NAMING.md`](../NAMING.md)).
 - [ ] Document the AGPL boundary for self-hosters.

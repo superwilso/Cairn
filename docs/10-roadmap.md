@@ -368,7 +368,9 @@ Four calls made by the owner, so a session does not re-litigate them:
 
 **Goal:** the repository is public and someone else could plausibly contribute.
 
-- [ ] **Licence files committed** — AGPL-3.0 and Apache-2.0, verbatim *(owner)*
+- [x] **Licence files committed** — AGPL-3.0, Apache-2.0 and CC-BY-SA-4.0, downloaded
+      from their publishers at the owner's request; map in `README.md`. The trademark
+      policy and the AGPL boundary note in ADR-004 are still open.
 - [ ] **Name clearance** — USPTO/EUIPO, domains *(owner; may rename, see `NAMING.md`)*
 - [ ] Protocol specification good enough for an outsider to implement against
 - [ ] Public threat model review invited
