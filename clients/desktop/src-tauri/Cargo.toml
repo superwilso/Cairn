@@ -14,6 +14,12 @@ cairn-client-core = { path = "../../../crates/cairn-client-core", features = ["h
 tauri = { version = "2", features = [] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Opens a card's link in the system browser. It hands the URL to the platform's opener as
+# an argument (or, on Windows, an environment variable a fixed PowerShell script reads) —
+# never spliced into a shell command line; its `insecure` cmd.exe fallback stays off.
+# Chosen over the Tauri opener plugin, which adds an IPC permission surface this client
+# does not otherwise need. The URL is checked below the FFI line first (`embed::openable`).
+open = "5"
 
 [features]
 # Tauri's own convention; kept so `cargo tauri build` behaves.

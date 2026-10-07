@@ -52,6 +52,12 @@ pub struct Entry {
     /// The attachment's claimed filename, if the message carried one. A label, not a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_name: Option<String>,
+    /// The link card that came with the message, kept so a reopened room shows it again.
+    ///
+    /// `default` so a transcript written before cards were remembered still loads — an
+    /// unreadable history would look exactly like a conversation that never happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<crate::embed::Card>,
 }
 
 /// Per-room transcripts under a client's state directory.
@@ -170,7 +176,46 @@ mod tests {
             sent_at_ms: at,
             body: body.as_bytes().to_vec(),
             attachment_name: None,
+            card: None,
         }
+    }
+
+    #[test]
+    fn a_transcript_written_before_cards_were_kept_still_loads() {
+        // A line exactly as the previous version wrote it, with no `card` field. Failing to
+        // parse it would turn every existing conversation into a corrupt-history error.
+        let dir = scratch("oldformat");
+        let room = RoomId::new();
+        let history = History::open(&dir).unwrap();
+        let old = format!(
+            "{{\"sender\":\"{}\",\"sent_at_ms\":7,\"body\":[104,105]}}\n",
+            serde_json::to_value(UserId::new()).unwrap().as_str().unwrap()
+        );
+        fs::write(history.path(room), old).unwrap();
+        let replayed = history.replay(room, None, 0).unwrap();
+        assert_eq!(replayed[0].body, b"hi");
+        assert_eq!(replayed[0].card, None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_card_survives_a_restart_with_its_message() {
+        let dir = scratch("card");
+        let room = RoomId::new();
+        let history = History::open(&dir).unwrap();
+        let card = crate::embed::Card {
+            url: "https://example.com/".into(),
+            title: Some("Kept".into()),
+            ..crate::embed::Card::default()
+        };
+        history
+            .append(
+                room,
+                &Entry { card: Some(card.clone()), ..entry(1, "see https://example.com/") },
+            )
+            .unwrap();
+        assert_eq!(history.replay(room, None, 0).unwrap()[0].card, Some(card));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -109,6 +109,11 @@ jobs:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/call.browser.test.js
 
+      - name: Link cards render safely in a browser
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/cards.browser.test.js
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

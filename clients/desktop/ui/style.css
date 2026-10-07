@@ -375,3 +375,81 @@ header.topbar .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: el
 }
 
 .hint { color: var(--dim); font-weight: 400; }
+
+/* ---- link cards --------------------------------------------------------
+   Deliberately unlike anything that means "verified": no tick, no accent border, no badge.
+   A card is the sender's claim (docs/05-embeds.md §3), and the line that says where the
+   link really goes is styled to be read, not skimmed. */
+
+.msg:has(.link-card) { flex-wrap: wrap; }
+.msg > span:nth-of-type(2) { user-select: text; overflow-wrap: anywhere; }
+
+.link-card {
+  flex-basis: 100%;
+  margin: 6px 0 4px calc(8ch + 10px);
+  max-width: 440px;
+  display: flex;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.link-card:hover, .link-card:focus-visible { border-color: #333b4d; background: var(--raised); outline: none; }
+
+.card-media {
+  position: relative;
+  flex: none;
+  width: 132px;
+  background: #0b0d12;
+  display: grid;
+  place-items: center;
+}
+.card-media img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.link-card.portrait .card-media { width: 120px; aspect-ratio: 9 / 16; }
+.link-card:not(.portrait) .card-media { aspect-ratio: 1.91 / 1; width: 150px; align-self: center; }
+
+/* A recognised post with nothing fetched: the tile says what the URL says, and no more. */
+.card-media.empty {
+  background: linear-gradient(160deg, #2a2140 0%, #3a1f33 55%, #2b1a1f 100%);
+}
+.card-media-label { font-size: 12px; font-weight: 600; color: rgba(255, 255, 255, 0.78); letter-spacing: 0.02em; }
+
+.play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+.play::after {
+  content: "";
+  position: absolute;
+  left: 15px;
+  top: 11px;
+  border-style: solid;
+  border-width: 8px 0 8px 13px;
+  border-color: transparent transparent transparent #fff;
+}
+
+.card-meta { min-width: 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
+.card-eyebrow { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.card-title { font-weight: 600; line-height: 1.35; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.card-author { font-size: 12.5px; color: var(--muted); }
+.card-desc { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.card-dest { margin-top: auto; padding-top: 6px; font-family: var(--mono); font-size: 12px; color: var(--text); overflow-wrap: anywhere; }
+.card-warn { font-size: 11.5px; color: var(--warn); }
+.card-claim { font-size: 10.5px; color: var(--dim); }
+
+.prefs { padding: 4px 12px 14px; border-top: 1px solid var(--line-soft); }
+.prefs .toggle { display: flex; gap: 8px; align-items: center; font-size: 12.5px; margin-top: 10px; cursor: pointer; }
+.prefs .note { margin-top: 4px; }
+.prefs .toggle input { width: auto; flex: none; margin: 0; accent-color: var(--accent); }
+.link-card.portrait .card-media.empty { place-items: end center; }
+.link-card.portrait .card-media.empty .card-media-label { margin-bottom: 14px; }

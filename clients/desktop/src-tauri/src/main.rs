@@ -20,7 +20,9 @@
 use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
-use cairn_client_core::session::{Event, MemberView, MessageView, RoomSummary, Session};
+use cairn_client_core::session::{
+    Event, LinkPreviewSettings, MemberView, MessageView, RoomSummary, Session,
+};
 use tauri::State;
 
 /// The one session this window is signed in as.
@@ -111,9 +113,54 @@ fn open_room_tier(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.open_room_tier())
 }
 
+/// Send a message, with a link card if it has a link and previews are on.
+///
+/// **Async, and the fetch runs with the session unlocked.** A synchronous command runs on
+/// the main thread, so a slow site would freeze the window for as long as it took; and
+/// holding the session lock across the fetch would stall polling the same way. So: decide
+/// under the lock, fetch on a blocking thread without it, and send under the lock again —
+/// `finish_send` refuses if the user switched rooms in between.
+///
+/// Returns the message as the timeline should show it, card included, because MLS never
+/// decrypts a device's own message back to it.
 #[tauri::command]
-fn send(state: State<'_, AppState>, text: String) -> CmdResult<()> {
-    with(&state, |s| s.send(&text))
+async fn send(state: State<'_, AppState>, text: String) -> CmdResult<MessageView> {
+    let mut pending = with(&state, |s| s.begin_send(&text))?;
+    let pending = tauri::async_runtime::spawn_blocking(move || {
+        pending.unfurl();
+        pending
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    with(&state, |s| s.finish_send(pending))
+}
+
+#[tauri::command]
+fn link_previews(state: State<'_, AppState>) -> CmdResult<LinkPreviewSettings> {
+    with(&state, |s| Ok(s.link_previews()))
+}
+
+#[tauri::command]
+fn set_link_previews(state: State<'_, AppState>, settings: LinkPreviewSettings) -> CmdResult<()> {
+    with(&state, |s| s.set_link_previews(settings))
+}
+
+/// The text the Instagram proxy setting must show before it can be switched on.
+#[tauri::command]
+fn instagram_proxy_disclosure() -> String {
+    format!(
+        "{} The proxy used is {}.",
+        cairn_client_core::embed::instagram::disclosure(),
+        cairn_client_core::embed::instagram::SUGGESTED_PROXY
+    )
+}
+
+/// Open a card's link in the system browser. The check is `embed::openable`'s, not this
+/// shell's: only a plain http(s) URL ever reaches the platform opener.
+#[tauri::command]
+fn open_link(url: String) -> CmdResult<()> {
+    let url = cairn_client_core::embed::openable(&url).ok_or("not a link that can be opened")?;
+    open::that_detached(url).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -210,6 +257,10 @@ fn main() {
             signal,
             call_id,
             call_config,
+            link_previews,
+            set_link_previews,
+            instagram_proxy_disclosure,
+            open_link,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

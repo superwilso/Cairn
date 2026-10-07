@@ -66,6 +66,7 @@ $("go").onclick = async () => {
         await refreshRooms();
         await describeRelay();
         await listDevices();
+        await loadPreviewSettings();
     } catch (e) {
         fail($("signin-error"), e);
     }
@@ -231,15 +232,29 @@ $("admit").onclick = async () => {
     } catch (e) { fail($("error"), e); }
 };
 
-$("composer").onsubmit = async (ev) => {
+// Sends are chained rather than run side by side. A message with a link waits for its
+// preview (up to five seconds, in Rust, off the main thread), and a plain message typed
+// after it must not overtake it.
+let sendQueue = Promise.resolve();
+
+$("composer").onsubmit = (ev) => {
     ev.preventDefault();
     const text = $("text").value;
     if (!text.trim()) return;
-    try {
-        await invoke("send", { text });
-        $("text").value = "";
-        fail($("error"), null);
-    } catch (e) { fail($("error"), e); }
+    $("text").value = "";
+    sendQueue = sendQueue.then(async () => {
+        try {
+            // Rust returns the message as sent, card included: MLS never decrypts a
+            // device's own message back to it, so this is the only way it appears.
+            const sent = await invoke("send", { text });
+            if (sent) addMessage(sent);
+            fail($("error"), null);
+        } catch (e) {
+            fail($("error"), e);
+            // Not sent; give the words back rather than losing them.
+            if (!$("text").value) $("text").value = text;
+        }
+    });
 };
 
 // ---- calls -----------------------------------------------------------------
@@ -597,9 +612,117 @@ function addMessage(m) {
     // the one line standing between that and script execution in the client.
     body.textContent = m.body;
     li.append(who, body);
+    if (m.card) li.append(renderCard(m.card));
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
 }
+
+// A link card. Everything here was decided in Rust (cairn_client_core::embed::CardView):
+// whether to show it at all, where the link really goes, what kind of post it is, the
+// caveat. This only lays it out.
+//
+// Rules this follows, from docs/05-embeds.md §3:
+// - textContent only. Every string on a card is the sender's; none is ever parsed as HTML.
+// - The real destination host is always visible, computed from the URL rather than taken
+//   from the card, so a card titled "Reuters" cannot hide that its link goes elsewhere.
+// - The card reads as the sender's, never as verified: no tick, no "official" styling.
+// - No remote images. The CSP is img-src 'self' data:, and the thumbnail arrives as a data:
+//   URI the *sender's* device made. Loading the image from its original URL would have the
+//   recipient contact the platform — the leak the whole design exists to prevent.
+function renderCard(c) {
+    const card = document.createElement("div");
+    card.className = "link-card" + (c.portrait ? " portrait" : "");
+    card.tabIndex = 0;
+    card.setAttribute("role", "link");
+    card.title = c.url;
+    const open = () => invoke("open_link", { url: c.url }).catch((e) => fail($("error"), e));
+    card.onclick = open;
+    card.onkeydown = (ev) => { if (ev.key === "Enter") open(); };
+
+    const text = (cls, value) => {
+        const el = document.createElement("div");
+        el.className = cls;
+        el.textContent = value;
+        return el;
+    };
+
+    // The picture: the sender's thumbnail, or — for a recognised post with nothing fetched
+    // — a plain tile naming what the URL itself says it is.
+    if (c.thumbnail || c.platform) {
+        const media = document.createElement("div");
+        media.className = "card-media";
+        if (c.thumbnail) {
+            const img = document.createElement("img");
+            img.alt = "";
+            img.src = c.thumbnail;
+            media.append(img);
+        } else {
+            media.classList.add("empty");
+            media.append(text("card-media-label", c.platform));
+        }
+        if (c.portrait) {
+            // Playback is not offered: the video is not in the message, and fetching it here
+            // would contact the platform. The glyph says "this is a video; opening it plays
+            // it", which is what clicking does.
+            const play = document.createElement("span");
+            play.className = "play";
+            play.setAttribute("aria-hidden", "true");
+            media.append(play);
+        }
+        card.append(media);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "card-meta";
+    // A platform and kind come from the URL, in Rust. A site name comes from the page, so it
+    // is labelled as what the page says about itself rather than shown as an attribution.
+    const eyebrow = [c.platform, c.kind].filter(Boolean).join(" · ")
+        || (c.claimed_site ? "page says: " + c.claimed_site : "");
+    if (eyebrow) meta.append(text("card-eyebrow", eyebrow));
+    if (c.title) meta.append(text("card-title", c.title));
+    else if (c.platform) meta.append(text("card-title", c.platform + " " + (c.kind || "link").toLowerCase()));
+    if (c.author) meta.append(text("card-author", c.author));
+    if (c.description) meta.append(text("card-desc", c.description));
+    if (!c.title && !c.description) meta.append(text("card-desc", "No preview available · open link"));
+
+    const dest = text("card-dest", "↗ " + c.host);
+    dest.title = c.url;
+    meta.append(dest);
+    if (c.host_warning) meta.append(text("card-warn", c.host_warning));
+    if (c.caveat) meta.append(text("card-warn", c.caveat));
+    meta.append(text("card-claim", "Preview supplied by the sender, not checked by Cairn"));
+
+    card.append(meta);
+    return card;
+}
+
+// ---- link-preview settings -------------------------------------------------
+//
+// Stored per profile by Rust. Previews are on by default because the fetch is the sender's
+// own; the Instagram proxy is off by default because a third party sees the link, and the
+// disclosure text comes from Rust so every client shows the same words.
+
+async function loadPreviewSettings() {
+    try {
+        const s = await invoke("link_previews");
+        $("pref-previews").checked = s.enabled;
+        $("pref-ig-proxy").checked = s.instagram_proxy;
+        $("pref-ig-proxy").disabled = !s.enabled;
+        $("ig-proxy-note").textContent = await invoke("instagram_proxy_disclosure");
+    } catch (_) {}
+}
+
+async function savePreviewSettings() {
+    const settings = {
+        enabled: $("pref-previews").checked,
+        instagram_proxy: $("pref-previews").checked && $("pref-ig-proxy").checked,
+    };
+    $("pref-ig-proxy").disabled = !settings.enabled;
+    try { await invoke("set_link_previews", { settings }); } catch (e) { fail($("error"), e); }
+}
+
+$("pref-previews").onchange = savePreviewSettings;
+$("pref-ig-proxy").onchange = savePreviewSettings;
 
 function addNotice(text) {
     const li = document.createElement("li");

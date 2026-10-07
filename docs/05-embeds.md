@@ -403,31 +403,97 @@ provider as untrusted (`01-threat-model.md` §8).
 
 ## Status
 
-**Text cards ship; images do not.**
+**Cards with thumbnails ship, sender-side, in the desktop client and the CLI.** This is the
+arrangement [ADR-009](adr/009-instance-side-unfurl.md) supersedes; it is what runs until the
+instance unfurl service exists, and the recipient half — the important half — is the same
+under both.
 
-Implemented in `cairn-client-core::embed` and wired into `cairn-cli chat`: the sender's
-client fetches the URL, parses OpenGraph/`<title>`, and the finished card travels inside the
-encrypted body. Verified over a real socket by
+Implemented in `cairn-client-core::embed` and wired into `cairn-cli chat` and the desktop
+client (`Session::begin_send` / `PendingSend::unfurl` / `Session::finish_send`): the sender's
+device fetches the link, builds the card, and the card travels inside the encrypted body.
+Verified over a real socket by
 `a_link_card_reaches_the_recipient_and_the_server_never_sees_the_url`, which asserts the
-serialized envelope contains neither the URL nor the title.
+serialized envelope contains neither the URL nor the title. A recipient's client renders
+only what arrived — `Card::view_for` decides what is safe to show, and nothing is fetched to
+draw it.
 
-**Images are deliberately not fetched.** `Card::image_url` records where an image was and
-nothing re-hosts it, because re-hosting means bytes in the envelope and the note below —
-that the server's per-message full-state rewrite closes first — still stands. A text card is
-a few hundred bytes and does not move that; a thumbnail would. Images land with attachments.
+What a card is built from, in order:
+
+1. **oEmbed** for YouTube, TikTok, X and Reddit (`embed::oembed`) — the platform's own
+   endpoint, contacted from the same device the page fetch would have been, so no new party
+   learns the link. The URL sent is rebuilt from a validated id, so share trackers (`?si=`,
+   `?igsh=`, `?s=`) never leave the device. **X, TikTok and Reddit resolve a post by id and
+   ignore the handle or subreddit in the path** (probed: `x.com/notjack/status/20` returns
+   jack's post), so the author comes from the response and a card says so when the link's
+   own text disagrees.
+2. **OpenGraph / `<title>`** for everything else, Instagram included. On 2026-10-07 a real
+   public Instagram post fetched anonymously from the development container returned full
+   OpenGraph (caption, handle, counts, thumbnail), which `instagram::tidy` reshapes into a
+   post-like card; a profile redirected to the login page and a missing post returned a
+   script shell with no metadata. Instagram walls anonymous traffic by rate and by network,
+   so which of those a given user gets is not something this code controls.
+3. **The Instagram proxy rung**, off by default, with the disclosure §1 requires shown beside
+   the switch. **With an honest user-agent it yields nothing today.** Of the proxies probed
+   on 2026-10-07, only `zzinstagram.com` served metadata, and only to user-agents it
+   recognised as a chat app's crawler; Cairn's own was redirected to instagram.com.
+   `kkinstagram.com` redirected to the raw video file or an "open in app" page,
+   `instagramez.com` redirected to an advertising network, `ddinstagram.com` did not answer,
+   and `eeinstagram.com` answered "Post not found" for a post that exists. Redirects from a
+   proxy are therefore refused. Whether Cairn should present another product's crawler
+   user-agent to get these previews is **an owner decision, not taken**.
+4. **A URL-only card** for a recognised post (an Instagram reel, a TikTok, a Short) when
+   nothing was fetched: the recipient's client draws "Instagram reel · open link" from the
+   URL's shape. Nothing is invented.
+
+**Thumbnails ride inside the envelope.** The sender fetches the image the page names (https
+only, public addresses only, `image/*` only, at most 2 MiB, within the same five-second budget
+as the page), decodes it with size limits that refuse decompression bombs, and re-encodes it
+as a JPEG of at most 480×640 and 48 KB — which also drops EXIF. The recipient's client
+accepts only a JPEG within those bounds and renders it as a `data:` URI; the desktop CSP stays
+`img-src 'self' data:`. The blocker this section used to name, the server's per-message
+full-state rewrite, was closed by ADR-007.
+
+**What the desktop UI holds to:** every string from a card is set with `textContent`; the
+host the link really goes to — read the way a browser reads the URL, never taken from the
+card — is always on screen, with a warning for userinfo or non-Latin hosts; a card whose URL
+is not a link in its own message is not shown; the card says it was supplied by the sender;
+clicking opens the link in the system browser through Rust, which accepts only a plain
+http(s) URL.
+
+Probing the fetch path found, and the tests now pin:
+
+- `is_fetchable` passed `http://2130706433/`, `http://127.1/`, `http://0x7f000001/` and
+  `http://0177.0.0.1/` as public names, and the HTTP client then connected to loopback. It
+  also passed `[::ffff:127.0.0.1]`. Hosts are now read by one WHATWG-faithful parser
+  (`embed::target`).
+- `https://evil.test\@instagram.com/p/abc/` was accepted as an Instagram post, while a
+  browser opens `evil.test`.
+- `<€€` in a page's head panicked the metadata parser (a byte slice inside a multi-byte
+  character). Fixed, and `preview` also catches panics so a hostile page can never take a
+  message down with it.
+- Fetches had no timeout configured, so a server trickling a byte at a time could hold the
+  unfurl as long as it liked. Every preview now has a five-second budget end to end, and the
+  desktop fetches with no lock held and refuses to deliver to a room the user switched away
+  from meanwhile.
 
 Known gaps, recorded rather than implied away:
 
-- **The address check is host-based.** `is_fetchable` refuses loopback, RFC1918, link-local,
-  CGNAT and unique-local addresses, but it **does not resolve DNS**, so a hostname pointing
-  at a private address still passes, and **redirects are followed without re-checking**.
-  Closing both needs a resolver hook in the HTTP client.
-- **The fetch is not yet opt-in per platform.** §1 requires that, and today any pasted link
-  is fetched with the sender's IP. This is the leak the design accepts by construction; what
-  is missing is the consent step, not the mitigation.
-- **No authenticated fetch and no proxy step.** `CardSource` models all three rungs of the
-  fallback chain, but only `Public` is implemented. `Authenticated` needs per-platform
-  session storage; `Proxy` needs the explicit privacy notice §1 describes.
+- **The address check is host-based.** It refuses loopback, RFC1918, link-local, CGNAT and
+  unique-local addresses in every spelling a resolver accepts, but it **does not resolve
+  DNS**, so a hostname pointing at a private address still passes, and **redirects (other
+  than a proxy's) are followed without re-checking**. Closing both needs a resolver hook in
+  the HTTP client.
+- **The fetch is not opt-in per platform.** §1 requires that. The desktop client has one
+  switch for all previews, **on by default**, whose description says the linked site sees
+  the sender's IP; the CLI has none. The default is an owner decision that departs from §1,
+  recorded here so it is visible.
+- **No authenticated rung.** `Authenticated` needs per-platform session storage.
+- **No inline video.** A reel's card shows its thumbnail with a play glyph; clicking opens
+  the platform. Playing it inside Cairn means the sender re-hosting the video as an
+  attachment (see "Video" above) — that is the next step for reels, and it carries §4's
+  takedown questions with it.
+- **A hostile sender's JPEG reaches the recipient's webview decoder.** Bounded in size and
+  checked for a JPEG header, but not re-encoded on receipt.
 - **No per-sender cache**, so the same link is refetched each time.
 
 ## Implementation notes

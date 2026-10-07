@@ -403,6 +403,7 @@ impl App {
                 sent_at_ms: envelope.sent_at_ms,
                 body: body.to_vec(),
                 attachment_name,
+                card: None,
             },
         );
     }
@@ -1000,6 +1001,7 @@ impl App {
                             sent_at_ms: message.envelope.sent_at_ms,
                             body: received.body.clone(),
                             attachment_name: received.attachment.as_ref().map(|a| a.name.clone()),
+                            card: received.card.as_deref().cloned(),
                         },
                     );
                     if let Some(attachment) = &received.attachment {

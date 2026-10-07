@@ -415,7 +415,7 @@ impl Conversation {
                     }),
                     // Clamped again on receipt. These bytes came from the sender, so the
                     // limits are a defence against a hostile one, not tidiness.
-                    card: inner.card.map(crate::embed::Card::clamp),
+                    card: inner.card.map(crate::embed::Card::clamp).map(Box::new),
                     attachment: inner.attachment.map(Box::new),
                     signal: inner.signal.map(Box::new),
                 }))
@@ -537,7 +537,10 @@ pub struct ReceivedMessage {
     /// **Everything in it was chosen by the sender.** A client renders it as a claim, keeps
     /// the URL visible, and derives no trust signal from its contents. It must not fetch
     /// anything to display it — see [`crate::embed`].
-    pub card: Option<crate::embed::Card>,
+    ///
+    /// Boxed for the same reason as `attachment`: a card now carries a thumbnail and an
+    /// author, and an unboxed one made every membership event pay for it.
+    pub card: Option<Box<crate::embed::Card>>,
     /// The sender's attachment, if they sent one. Fetch the blob and open it with the key
     /// inside; both came from the encrypted body, so the server supplied neither.
     ///

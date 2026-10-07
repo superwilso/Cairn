@@ -68,6 +68,10 @@ pub enum SessionError {
     NoGroupYet,
     #[error("identity file is unreadable: {0}")]
     Identity(String),
+    #[error("you switched rooms before this message was sent, so it was not sent")]
+    RoomChanged,
+    #[error("link preview settings could not be saved: {0}")]
+    Preferences(String),
 }
 
 /// A room as a frontend needs to show it.
@@ -105,6 +109,11 @@ pub struct MessageView {
     pub sent_at_ms: i64,
     /// True when replayed from the local transcript rather than just received.
     pub historic: bool,
+    /// The sender's link card, already checked against this message and reduced to what
+    /// is safe to show. `None` when there was no card or it did not pass
+    /// ([`crate::embed::Card::view_for`]).
+    #[serde(default)]
+    pub card: Option<Box<crate::embed::CardView>>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -381,11 +390,15 @@ impl Session {
             .history
             .replay(room, ttl, now_ms())?
             .into_iter()
-            .map(|e| MessageView {
-                sender: e.sender.to_string(),
-                body: String::from_utf8_lossy(&e.body).to_string(),
-                sent_at_ms: e.sent_at_ms,
-                historic: true,
+            .map(|e| {
+                let body = String::from_utf8_lossy(&e.body).to_string();
+                MessageView {
+                    sender: e.sender.to_string(),
+                    card: e.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),
+                    body,
+                    sent_at_ms: e.sent_at_ms,
+                    historic: true,
+                }
             })
             .collect())
     }
@@ -418,6 +431,7 @@ impl Session {
                 sent_at_ms: at,
                 body: text.as_bytes().to_vec(),
                 attachment_name: None,
+                card: None,
             },
         )?;
         Ok(())
@@ -495,10 +509,14 @@ impl Session {
                             sent_at_ms: message.envelope.sent_at_ms,
                             body: received.body.clone(),
                             attachment_name: None,
+                            card: received.card.as_deref().cloned(),
                         },
                     );
                     events.push(Event::Message(MessageView {
                         sender: message.envelope.sender.to_string(),
+                        // Rendered from what arrived inside the envelope. Nothing is fetched to
+                        // draw it — the recipient-fetches-nothing rule (`docs/05-embeds.md`).
+                        card: received.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),
                         body,
                         sent_at_ms: message.envelope.sent_at_ms,
                         historic: false,
@@ -782,6 +800,157 @@ impl Session {
     }
 }
 
+/// Link-preview settings for one profile, persisted beside its state.
+///
+/// Its own file rather than a shared preferences file, so it can never clobber — or be
+/// clobbered by — another setting written by code that does not know about this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkPreviewSettings {
+    /// Whether this device fetches a link to build a card when sending it. **On by
+    /// default**: the fetch is the sender's own, recipients fetch nothing, and the card
+    /// travels inside the encrypted message. What it reveals is the sender's IP address to
+    /// the linked site — said in the setting's description, not hidden behind the default.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whether an Instagram link the site will not describe may be sent to a third-party
+    /// proxy ([`crate::embed::instagram::SUGGESTED_PROXY`]). **Off by default** — the proxy
+    /// sees the link, and `docs/05-embeds.md` forbids taking a less private path silently.
+    #[serde(default)]
+    pub instagram_proxy: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for LinkPreviewSettings {
+    fn default() -> Self {
+        Self { enabled: true, instagram_proxy: false }
+    }
+}
+
+/// A message on its way out, holding everything needed to build its preview **without the
+/// session**.
+///
+/// Sending is split in three — [`Session::begin_send`], [`PendingSend::unfurl`],
+/// [`Session::finish_send`] — so the network fetch happens with no lock held. Fetching while
+/// holding the session would stall polling (and, in the desktop shell, the window) for as
+/// long as a slow site takes; that is what the split is for.
+#[derive(Debug)]
+pub struct PendingSend {
+    room: RoomId,
+    text: String,
+    preview: Option<(String, crate::embed::instagram::ProxyPolicy)>,
+    card: Option<crate::embed::Card>,
+}
+
+impl PendingSend {
+    /// Fetch the preview, if this message has a link and previews are on.
+    ///
+    /// Never fails: no card is a perfectly good outcome, and a preview is never worth
+    /// holding back a message.
+    pub fn unfurl(&mut self) {
+        if let Some((url, policy)) = &self.preview {
+            self.card = crate::embed::preview(url, policy);
+        }
+    }
+
+    /// The URL a preview will be fetched for, if any. For a UI to say what is happening.
+    pub fn preview_url(&self) -> Option<&str> {
+        self.preview.as_ref().map(|(url, _)| url.as_str())
+    }
+}
+
+impl Session {
+    fn link_preview_path(&self) -> PathBuf {
+        self.dir.join("link-previews.json")
+    }
+
+    /// This profile's link-preview settings. A missing or unreadable file means defaults.
+    pub fn link_previews(&self) -> LinkPreviewSettings {
+        std::fs::read(self.link_preview_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_link_previews(&self, settings: LinkPreviewSettings) -> Result<(), SessionError> {
+        let bytes = serde_json::to_vec_pretty(&settings)
+            .map_err(|e| SessionError::Preferences(e.to_string()))?;
+        std::fs::write(self.link_preview_path(), bytes)
+            .map_err(|e| SessionError::Preferences(e.to_string()))
+    }
+
+    /// Start sending `text` to the open room. Cheap: decides *whether* to fetch a preview
+    /// and captures which room the message is for, and fetches nothing.
+    pub fn begin_send(&self, text: &str) -> Result<PendingSend, SessionError> {
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let preview = preview_plan(self.link_previews(), text);
+        Ok(PendingSend { room: open.convo.room(), text: text.to_string(), preview, card: None })
+    }
+
+    /// Encrypt and send a prepared message, returning it as the timeline should show it.
+    ///
+    /// **Refuses if the open room changed** since [`Session::begin_send`]. The preview fetch
+    /// runs with no lock held and can take seconds; a user who switches rooms meanwhile
+    /// would otherwise have the message delivered to whichever room is open when the fetch
+    /// returns — somebody else's conversation.
+    pub fn finish_send(&mut self, pending: PendingSend) -> Result<MessageView, SessionError> {
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.room() != pending.room {
+            return Err(SessionError::RoomChanged);
+        }
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let at = now_ms();
+        let card = pending.card.map(crate::embed::Card::clamp);
+        let outbound = open.convo.send_with_card(pending.text.as_bytes(), card.clone(), at)?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+
+        // Recorded locally because MLS will not decrypt our own message back to us — and
+        // returned, so the sender sees what they sent, card and all, without a reload.
+        self.history.append(
+            open.convo.room(),
+            &HistoryEntry {
+                sender: self.client.user(),
+                sent_at_ms: at,
+                body: pending.text.as_bytes().to_vec(),
+                attachment_name: None,
+                card: card.clone(),
+            },
+        )?;
+        Ok(MessageView {
+            sender: self.client.user().to_string(),
+            card: card.and_then(|c| c.view_for(&pending.text)).map(Box::new),
+            body: pending.text,
+            sent_at_ms: at,
+            historic: false,
+        })
+    }
+}
+
+/// Which link to fetch for `text`, and through which proxies — or nothing.
+fn preview_plan(
+    settings: LinkPreviewSettings,
+    text: &str,
+) -> Option<(String, crate::embed::instagram::ProxyPolicy)> {
+    use crate::embed::instagram::{ProxyPolicy, SUGGESTED_PROXY};
+    if !settings.enabled {
+        return None;
+    }
+    let url = crate::embed::first_url(text)?;
+    let policy = if settings.instagram_proxy {
+        ProxyPolicy::with_hosts([SUGGESTED_PROXY])
+    } else {
+        ProxyPolicy::disabled()
+    };
+    Some((url.to_string(), policy))
+}
+
 fn describe_member(m: &cairn_crypto::mls::GroupMember) -> String {
     DeviceIdentity::parse(&m.identity)
         .map(|id| id.user().to_string())
@@ -806,4 +975,80 @@ fn load_or_create_identity(dir: &Path) -> Result<(UserId, DeviceId, bool), Sessi
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+#[cfg(test)]
+mod link_preview_tests {
+    use super::*;
+
+    /// A session that never touches the network: the identity is already claimed, and the
+    /// instance address is one nothing listens on.
+    fn offline(name: &str) -> (Session, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cairn-lp-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = StoredIdentity {
+            user: uuid::Uuid::new_v4(),
+            device: uuid::Uuid::new_v4(),
+            claimed: true,
+        };
+        std::fs::write(dir.join("identity.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
+        let session = Session::open(name, "http://127.0.0.1:9", Some(&dir)).unwrap();
+        (session, dir)
+    }
+
+    #[test]
+    fn previews_are_on_and_the_instagram_proxy_off_until_someone_changes_them() {
+        let (session, dir) = offline("defaults");
+        let settings = session.link_previews();
+        assert!(settings.enabled);
+        assert!(!settings.instagram_proxy, "a third party must never see links by default");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_preview_setting_survives_a_restart() {
+        let (session, dir) = offline("persist");
+        session
+            .set_link_previews(LinkPreviewSettings { enabled: false, instagram_proxy: true })
+            .unwrap();
+        drop(session);
+        let reopened = Session::open("persist", "http://127.0.0.1:9", Some(&dir)).unwrap();
+        assert_eq!(
+            reopened.link_previews(),
+            LinkPreviewSettings { enabled: false, instagram_proxy: true }
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_message_is_never_delivered_to_a_room_opened_while_its_preview_loaded() {
+        // The race the lock-free fetch creates: begin in room A, switch to room B during
+        // the fetch, finish. The message must not land in B.
+        let (mut session, dir) = offline("race");
+        let a = RoomId::new();
+        let b = RoomId::new();
+        session.open_room(&a.to_string()).unwrap();
+        let pending = PendingSend { room: a, text: "hi".into(), preview: None, card: None };
+        session.open_room(&b.to_string()).unwrap();
+        assert!(
+            matches!(session.finish_send(pending), Err(SessionError::RoomChanged)),
+            "a message begun in one room must not be sent to another"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn with_previews_off_a_link_is_never_fetched() {
+        let text = "look https://www.instagram.com/reel/abc123/";
+        let off = LinkPreviewSettings { enabled: false, instagram_proxy: true };
+        assert!(preview_plan(off, text).is_none(), "off means nothing is fetched at all");
+
+        let on = LinkPreviewSettings::default();
+        let (url, policy) = preview_plan(on, text).expect("on, a link is previewed");
+        assert_eq!(url, "https://www.instagram.com/reel/abc123/");
+        assert!(!policy.is_enabled(), "the proxy stays off unless separately switched on");
+
+        let proxied = LinkPreviewSettings { enabled: true, instagram_proxy: true };
+        assert!(preview_plan(proxied, text).unwrap().1.is_enabled());
+        assert!(preview_plan(on, "no links here").is_none());
+    }
 }
