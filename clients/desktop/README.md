@@ -11,6 +11,7 @@ ui/style.css        the whole design, hand-written, no framework
 ui/app.js           the DOM — rooms, timeline, members, call controls
 ui/call.js          WebRTC: peer connections, devices, screen share
 ui/timer.js         the disappearing-message control and its notices
+ui/messages.js      drawing a message; replying and reacting to it
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -148,7 +149,28 @@ the next time the room was opened.
 current setting, so turning a timer on deletes messages already older than it — not only
 future ones. The dropdown says so before a value is picked.
 
-## What it does not do yet
+## Replies and reactions
+
+Hover a message for **react** and **reply**; double-click it to send a heart; on a touch
+screen, swipe it right to reply. Clicking your own reaction takes it back. One reaction per
+person per message — a new one replaces the old.
+
+Both travel inside the encrypted body and name their target by its franking commitment,
+which every member already holds, so the instance learns nothing it did not already know.
+What they deliberately do **not** carry:
+
+- **A reply carries no quoted text.** Each recipient's client looks the original up in its
+  own transcript (`cairn_client_core::thread`). A sender cannot misquote anyone, and a quote
+  cannot outlive a disappearing message: when the original expires, the quote reads
+  "Original message unavailable" — on screen at once, and on disk.
+- **A reaction names no reactor.** It is attributed to the envelope's sender, so there is
+  nothing to forge. Text is refused as a reaction, by the sender's client and again by every
+  recipient's.
+
+**A reaction cannot be reported.** Franking commits to a message's body, and a reaction's
+body is empty. A report can prove what a reply said, not which message it answered.
+
+
 
 Attachments, link cards and safety-number comparison all exist in `client-core` and are not
 yet surfaced in this UI.

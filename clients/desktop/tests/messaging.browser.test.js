@@ -95,6 +95,14 @@ class FakeSession {
             case "call_config": return { ice_servers: [], has_relay: false, max_participants: 6 };
             case "room_timer": return this.timer;
             case "set_room_timer": this.timer = args.ttlMs; return this.timer;
+            case "send": return view(ME, args.text, { id: nextId() });
+            // The quote is whatever a test put in `resolved`, deliberately unlike anything on
+            // screen: the UI must show the quote Rust resolved, not build its own.
+            case "reply": return view(ME, args.text, {
+                id: nextId(),
+                reply_to: { sender: args.sender, id: args.id, snippet: this.resolved, sent_at_ms: 1_000 },
+            });
+            case "react": return args.emoji ? [{ emoji: args.emoji, by: [ME] }] : [];
             default: throw new Error("FakeSession: unhandled command " + cmd);
         }
     }
@@ -154,7 +162,17 @@ async function shoot(page, name) {
 }
 
 function msg(sender, body, at, extra = {}) {
-    return { sender, body, sent_at_ms: at, historic: true, ...extra };
+    return { sender, body, sent_at_ms: at, historic: true, id: null, reply_to: null, reactions: [], ...extra };
+}
+
+let idCounter = 0;
+const nextId = () => (++idCounter).toString(16).padStart(64, "0");
+const ID1 = "a1".repeat(32);
+const ID2 = "b2".repeat(32);
+const HEART = "\u2764\uFE0F";
+
+function view(sender, body, extra = {}) {
+    return msg(sender, body, Date.now(), { historic: false, ...extra });
 }
 
 const pw = playwright();
@@ -243,5 +261,147 @@ test("an expired message leaves the screen, and a live one stays", { skip }, asy
     const left = await page.$$eval("#timeline li.msg", (ls) => ls.map((l) => l.textContent));
     assert.strictEqual(left.length, 1, "exactly the expired message must go: " + left);
     assert.match(left[0], /still alive/);
+    await page.close();
+});
+
+// ---- replies and reactions --------------------------------------------------
+
+test("hovering a message offers a reaction, and the chip shows what Rust returned", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "ship it", 1_000, { id: ID1 })];
+    const page = await openApp(browser, fake);
+    const li = await page.waitForSelector("#timeline li.msg");
+
+    assert.ok(!(await page.isVisible("#timeline .actions")), "the buttons wait for a hover");
+    await li.hover();
+    assert.ok(await page.isVisible("#timeline .actions .act-react"));
+    await page.click("#timeline .act-react");
+    assert.ok(await page.isVisible("#react-picker"), "the picker opens");
+    await shoot(page, "react-picker");
+    await page.click("#react-picker button >> nth=0");
+
+    await page.waitForSelector("#timeline .reactions .chip.mine");
+    assert.ok(!(await page.isVisible("#react-picker")), "and closes once used");
+    assert.deepStrictEqual(fake.asked("react"), [{ sender: BOB, id: ID1, emoji: HEART }]);
+
+    // Clicking your own chip takes it back.
+    await page.click("#timeline .reactions .chip.mine");
+    await page.waitForFunction(() => !document.querySelector("#timeline .reactions .chip"));
+    assert.deepStrictEqual(fake.asked("react")[1], { sender: BOB, id: ID1, emoji: null });
+    assert.deepStrictEqual(page.errors, []);
+    await page.close();
+});
+
+test("double-clicking a message sends a heart", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "we got the grant", 1_000, { id: ID1 })];
+    const page = await openApp(browser, fake);
+    await page.dblclick("#timeline li.msg .body");
+    await page.waitForSelector("#timeline .reactions .chip.mine");
+    assert.deepStrictEqual(fake.asked("react"), [{ sender: BOB, id: ID1, emoji: HEART }]);
+    const selected = await page.evaluate(() => String(window.getSelection()));
+    assert.strictEqual(selected, "", "the double-click must not also select a word");
+    await page.close();
+});
+
+test("a reply sends a reference and shows the quote Rust resolved", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "lunch at noon?", 1_000, { id: ID1 })];
+    fake.resolved = "as resolved by rust";
+    const page = await openApp(browser, fake);
+    assert.ok(!(await page.isVisible("#reply-bar")), "no reply bar until asked for");
+
+    await (await page.$("#timeline li.msg")).hover();
+    await page.click("#timeline .act-reply");
+    assert.ok(await page.isVisible("#reply-bar"));
+    assert.strictEqual(await page.textContent("#reply-bar .reply-text"), "lunch at noon?");
+    await shoot(page, "reply-composing");
+
+    await page.fill("#text", "yes, see you there");
+    await page.press("#text", "Enter");
+    await page.waitForSelector("#timeline li.msg.mine .quote");
+
+    assert.deepStrictEqual(fake.asked("reply"), [{ text: "yes, see you there", sender: BOB, id: ID1 }]);
+    assert.deepStrictEqual(fake.asked("send"), [], "a reply is not also sent as a plain message");
+    assert.strictEqual(
+        await page.textContent("#timeline li.msg.mine .quote-text"),
+        "as resolved by rust",
+        "the quote must be Rust's, not one built from the screen"
+    );
+    assert.ok(!(await page.isVisible("#reply-bar")), "the bar closes once sent");
+    await shoot(page, "reply-sent");
+    await page.close();
+});
+
+test("escape abandons a reply, and the next message is an ordinary one", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "hm", 1_000, { id: ID1 })];
+    const page = await openApp(browser, fake);
+    await (await page.$("#timeline li.msg")).hover();
+    await page.click("#timeline .act-reply");
+    await page.press("#text", "Escape");
+    assert.ok(!(await page.isVisible("#reply-bar")));
+    await page.fill("#text", "never mind");
+    await page.press("#text", "Enter");
+    // Also the first time the sender's own message appears without reopening the room.
+    await page.waitForSelector("#timeline li.msg.mine");
+    assert.deepStrictEqual(fake.asked("reply"), []);
+    assert.deepStrictEqual(fake.asked("send"), [{ text: "never mind" }]);
+    await page.close();
+});
+
+test("swiping a message right on a touch screen starts a reply", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "swipe me", 1_000, { id: ID1 })];
+    const page = await openApp(browser, fake);
+    await page.$eval("#timeline li.msg", (li) => {
+        const r = li.getBoundingClientRect();
+        const at = (type, dx) => li.dispatchEvent(new PointerEvent(type, {
+            pointerType: "touch", bubbles: true, clientX: r.left + 20 + dx, clientY: r.top + 5,
+        }));
+        at("pointerdown", 0);
+        at("pointermove", 40);
+        at("pointermove", 80);
+        at("pointerup", 80);
+    });
+    assert.ok(await page.isVisible("#reply-bar"));
+    assert.strictEqual(await page.textContent("#reply-bar .reply-text"), "swipe me");
+    await page.close();
+});
+
+test("someone else's reaction is drawn, and an expired original blanks its quote", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [
+        msg(BOB, "the original", 1_000, { id: ID1 }),
+        msg(ME, "the reply", 9_000, {
+            id: ID2,
+            reply_to: { sender: BOB, id: ID1, snippet: "the original", sent_at_ms: 1_000 },
+        }),
+    ];
+    const page = await openApp(browser, fake);
+    await page.waitForSelector("#timeline .quote:not(.gone)");
+
+    await deliver(page, fake, [{ kind: "reactions", sender: ME, id: ID2, reactions: [{ emoji: "\u{1F602}", by: [BOB, CAROL] }] }]);
+    const chip = await page.$eval("#timeline .chip", (c) => ({ text: c.textContent, mine: c.classList.contains("mine") }));
+    assert.deepStrictEqual(chip, { text: "\u{1F602} 2", mine: false });
+
+    // Rust has forgotten the original; a quote still showing its words would be the one
+    // place on this device a disappeared message survived.
+    await deliver(page, fake, [{ kind: "expired", before_ms: 5_000 }]);
+    const quote = await page.$eval("#timeline .quote", (q) => ({ gone: q.classList.contains("gone"), text: q.textContent }));
+    assert.ok(quote.gone, "the quote must be marked unavailable");
+    assert.ok(!quote.text.includes("the original"), quote.text);
+    assert.strictEqual(await page.$$eval("#timeline li.msg", (l) => l.length), 1);
+    await page.close();
+});
+
+test("a quote this device cannot resolve says so instead of showing anything", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "re: something", 9_000, {
+        id: ID2, reply_to: { sender: CAROL, id: ID1, snippet: null, sent_at_ms: null },
+    })];
+    const page = await openApp(browser, fake);
+    const text = await page.textContent("#timeline .quote.gone .quote-text");
+    assert.strictEqual(text, "Original message unavailable");
     await page.close();
 });

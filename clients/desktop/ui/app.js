@@ -154,6 +154,7 @@ async function selectRoom(room) {
     fail($("error"), null);
     stopRinging();
     openRoom = room;
+    CairnMessages.cancelReply();
     $("room-id").textContent = short(room);
     $("room-id").title = room;
     $("timeline").textContent = "";
@@ -237,7 +238,8 @@ $("composer").onsubmit = async (ev) => {
     const text = $("text").value;
     if (!text.trim()) return;
     try {
-        await invoke("send", { text });
+        // Rust hands back the message as sent: polling never returns a device's own.
+        addMessage(await CairnMessages.send(text));
         $("text").value = "";
         fail($("error"), null);
     } catch (e) { fail($("error"), e); }
@@ -559,6 +561,7 @@ async function tick() {
     let membershipChanged = false;
 
     for (const ev of events) {
+        if (CairnMessages.handle(ev)) continue;
         if (CairnTimer.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
@@ -587,20 +590,9 @@ async function tick() {
 
 // ---- rendering -------------------------------------------------------------
 
+// Drawing a message, and replying and reacting to it, are messages.js's.
 function addMessage(m) {
-    const li = document.createElement("li");
-    li.className = m.historic ? "msg historic" : "msg";
-    // What an `expired` event is measured against; see timer.js.
-    li.dataset.sent = m.sent_at_ms;
-    const who = document.createElement("span");
-    who.className = "mono who";
-    who.textContent = short(m.sender);
-    who.title = m.sender;
-    const body = document.createElement("span");
-    // textContent, never innerHTML: a message body is attacker-controlled text and this is
-    // the one line standing between that and script execution in the client.
-    body.textContent = m.body;
-    li.append(who, body);
+    const li = CairnMessages.render(m);
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
 }
@@ -612,6 +604,8 @@ function addNotice(text) {
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
 }
+
+CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

@@ -26,13 +26,14 @@ pub mod history;
 pub mod session;
 pub mod statedir;
 pub mod store;
+pub mod thread;
 pub mod transport;
 
 pub use client::{Client, ClientError};
 pub use contacts::{ContactError, ContactRecord, ContactStore};
 pub use conversation::{
-    accept_welcome, Conversation, ConversationError, OutboundMessage, ReceivedFranking,
-    ReceivedMessage, TimelineEvent,
+    accept_welcome, Conversation, ConversationError, MessageRef, OutboundMessage, Reaction,
+    ReceivedFranking, ReceivedMessage, TimelineEvent,
 };
 pub use embed::{Card, CardSource};
 pub use statedir::{default_state_dir, StateDirError};

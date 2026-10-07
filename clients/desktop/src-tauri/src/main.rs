@@ -20,7 +20,9 @@
 use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
-use cairn_client_core::session::{Event, MemberView, MessageView, RoomSummary, Session};
+use cairn_client_core::session::{
+    Event, MemberView, MessageView, ReactionView, RoomSummary, Session,
+};
 use tauri::State;
 
 /// The one session this window is signed in as.
@@ -111,9 +113,35 @@ fn open_room_tier(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.open_room_tier())
 }
 
+/// Returns the message as sent, so the sender sees it at once — polling never delivers a
+/// device's own messages back to it.
 #[tauri::command]
-fn send(state: State<'_, AppState>, text: String) -> CmdResult<()> {
+fn send(state: State<'_, AppState>, text: String) -> CmdResult<MessageView> {
     with(&state, |s| s.send(&text))
+}
+
+/// Reply to a message on screen. The quote recipients see is resolved from their own
+/// transcripts; this sends only which message it answers.
+#[tauri::command]
+fn reply(
+    state: State<'_, AppState>,
+    text: String,
+    sender: String,
+    id: String,
+) -> CmdResult<MessageView> {
+    with(&state, |s| s.reply(&text, &sender, &id))
+}
+
+/// React to a message, or withdraw this user's reaction with `emoji: null`. Returns every
+/// reaction now under it.
+#[tauri::command]
+fn react(
+    state: State<'_, AppState>,
+    sender: String,
+    id: String,
+    emoji: Option<String>,
+) -> CmdResult<Vec<ReactionView>> {
+    with(&state, |s| s.react(&sender, &id, emoji.as_deref()))
 }
 
 #[tauri::command]
@@ -224,6 +252,8 @@ fn main() {
             call_config,
             room_timer,
             set_room_timer,
+            reply,
+            react,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

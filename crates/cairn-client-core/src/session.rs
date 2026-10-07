@@ -38,10 +38,12 @@ use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, Tier, U
 use crate::call::{CallSignal, SignalKind};
 use crate::client::{Client, ClientError};
 use crate::contacts::{ContactError, ContactStore};
-use crate::conversation::{Conversation, ConversationError, TimelineEvent};
+use crate::conversation::{Conversation, ConversationError, MessageRef, Reaction, TimelineEvent};
 use crate::history::{Entry as HistoryEntry, History, HistoryError};
 use crate::statedir::{self, StateDirError};
 use crate::store::{ConversationIndex, IndexError};
+use crate::thread::Thread;
+pub use crate::thread::{QuoteView, ReactionView};
 use crate::transport::HttpTransport;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +72,10 @@ pub enum SessionError {
     Identity(String),
     #[error("a disappearing-message timer must be longer than zero")]
     BadTimer,
+    #[error("that message is not on this device")]
+    UnknownMessage,
+    #[error("a reaction is a single emoji")]
+    BadReaction,
 }
 
 /// A room as a frontend needs to show it.
@@ -107,6 +113,13 @@ pub struct MessageView {
     pub sent_at_ms: i64,
     /// True when replayed from the local transcript rather than just received.
     pub historic: bool,
+    /// What a reply or reaction names this message by. `None` for a message recorded
+    /// before replies existed, which can be read but not answered.
+    pub id: Option<String>,
+    /// The message this one answers, resolved from this device's own transcript.
+    pub reply_to: Option<QuoteView>,
+    /// Reactions already under it.
+    pub reactions: Vec<ReactionView>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -137,6 +150,13 @@ pub enum Event {
     Expired {
         before_ms: i64,
     },
+    /// The reactions under one message changed. The whole set, not the change: a frontend
+    /// redraws it rather than keeping its own tally, which is a second copy of a rule.
+    Reactions {
+        sender: String,
+        id: String,
+        reactions: Vec<ReactionView>,
+    },
     /// Call signalling addressed to this device, for the WebRTC layer rather than the
     /// timeline. Already filtered: signals meant for somebody else never reach a frontend.
     Signal {
@@ -153,6 +173,9 @@ struct OpenRoom {
     ttl: Option<i64>,
     /// When `ttl` was last read, so polling re-reads it on a slower clock than messages.
     ttl_checked_ms: i64,
+    /// Replies and reactions, folded over the transcript. Rebuilt whenever the timer sweeps
+    /// it, so nothing here outlives the message it describes.
+    thread: Thread,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -343,6 +366,7 @@ impl Session {
             cursor,
             ttl: None,
             ttl_checked_ms: now_ms(),
+            thread: Thread::default(),
         });
         Ok(created.room.to_string())
     }
@@ -412,23 +436,16 @@ impl Session {
 
         let cursor = self.index.cursor(&room);
         let ttl = self.client.room_ttl(room).ok().flatten();
-        self.open = Some(OpenRoom { convo, seal, cursor, ttl, ttl_checked_ms: now_ms() });
-        self.replay(room, ttl)
-    }
-
-    /// The local transcript for a room, with the room's disappearing timer applied.
-    fn replay(&self, room: RoomId, ttl: Option<i64>) -> Result<Vec<MessageView>, SessionError> {
-        Ok(self
-            .history
-            .replay(room, ttl, now_ms())?
-            .into_iter()
-            .map(|e| MessageView {
-                sender: e.sender.to_string(),
-                body: String::from_utf8_lossy(&e.body).to_string(),
-                sent_at_ms: e.sent_at_ms,
-                historic: true,
-            })
-            .collect())
+        // The local transcript, with the room's disappearing timer applied.
+        let entries = self.history.replay(room, ttl, now_ms())?;
+        let thread = Thread::build(&entries);
+        let views = entries
+            .iter()
+            .filter(|e| e.reaction.is_none())
+            .map(|e| view(e, &thread, true))
+            .collect();
+        self.open = Some(OpenRoom { convo, seal, cursor, ttl, ttl_checked_ms: now_ms(), thread });
+        Ok(views)
     }
 
     pub fn open_room_id(&self) -> Option<String> {
@@ -441,27 +458,105 @@ impl Session {
     }
 
     /// Send a message to the open room.
-    pub fn send(&mut self, text: &str) -> Result<(), SessionError> {
+    ///
+    /// Returns it as the timeline should show it. MLS never decrypts a device's own message
+    /// back to it, so polling will not deliver this; without the return value the sender's
+    /// own words appeared only after reopening the room.
+    pub fn send(&mut self, text: &str) -> Result<MessageView, SessionError> {
+        self.send_message(text, None)
+    }
+
+    /// Reply to a message on this device's screen, named by its sender and id.
+    ///
+    /// Refused for a message this device does not hold: the quote shown to everyone else is
+    /// resolved from *their* transcripts, and a reply to nothing would quote nothing.
+    pub fn reply(
+        &mut self,
+        text: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<MessageView, SessionError> {
+        let target = self.known_target(sender, id)?;
+        self.send_message(text, Some(target))
+    }
+
+    fn send_message(
+        &mut self,
+        text: &str,
+        reply_to: Option<MessageRef>,
+    ) -> Result<MessageView, SessionError> {
         let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
         if open.convo.group_id().is_none() {
             return Err(SessionError::NoGroupYet);
         }
         let at = now_ms();
-        let outbound = open.convo.send(text.as_bytes(), at)?;
+        let outbound = match reply_to.clone() {
+            Some(target) => open.convo.send_reply(text.as_bytes(), target, at)?,
+            None => open.convo.send(text.as_bytes(), at)?,
+        };
         self.client.send(open.convo.room(), &outbound.envelope)?;
 
         // Recorded locally because MLS will not decrypt our own message back to us — without
         // this the transcript is every reply and none of the prompts.
-        self.history.append(
-            open.convo.room(),
-            &HistoryEntry {
-                sender: self.client.user(),
-                sent_at_ms: at,
-                body: text.as_bytes().to_vec(),
-                attachment_name: None,
-            },
-        )?;
-        Ok(())
+        let entry = HistoryEntry {
+            sender: self.client.user(),
+            sent_at_ms: at,
+            body: text.as_bytes().to_vec(),
+            attachment_name: None,
+            id: Some(outbound.commitment.to_hex()),
+            reply_to,
+            reaction: None,
+        };
+        self.history.append(open.convo.room(), &entry)?;
+        open.thread.record(&entry);
+        Ok(view(&entry, &open.thread, false))
+    }
+
+    /// React to a message on this device's screen, or withdraw this user's reaction to it
+    /// (`emoji: None`). Returns every reaction now under that message.
+    pub fn react(
+        &mut self,
+        sender: &str,
+        id: &str,
+        emoji: Option<&str>,
+    ) -> Result<Vec<ReactionView>, SessionError> {
+        let target = self.known_target(sender, id)?;
+        let reaction = Reaction { target: target.clone(), emoji: emoji.map(str::to_owned) };
+        // The same rule every recipient applies on receipt, applied first so a refusal is
+        // a sentence here rather than a reaction that silently vanishes everywhere else.
+        if !reaction.is_valid() {
+            return Err(SessionError::BadReaction);
+        }
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let at = now_ms();
+        let outbound = open.convo.send_reaction(reaction.clone(), at)?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+        let entry = HistoryEntry {
+            sender: self.client.user(),
+            sent_at_ms: at,
+            body: Vec::new(),
+            attachment_name: None,
+            id: None,
+            reply_to: None,
+            reaction: Some(reaction),
+        };
+        self.history.append(open.convo.room(), &entry)?;
+        open.thread.record(&entry);
+        Ok(open.thread.reactions(&target))
+    }
+
+    /// Parse a frontend's `(sender, id)` and check this device holds that message.
+    fn known_target(&self, sender: &str, id: &str) -> Result<MessageRef, SessionError> {
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        let sender: UserId = sender.parse().map_err(|_| SessionError::UnknownMessage)?;
+        let target = MessageRef { sender, id: id.to_owned() };
+        if !open.thread.knows(&target) {
+            return Err(SessionError::UnknownMessage);
+        }
+        Ok(target)
     }
 
     /// Fetch and decrypt whatever has arrived since the last poll.
@@ -528,22 +623,29 @@ impl Session {
                         }
                         continue;
                     }
-                    let body = String::from_utf8_lossy(&received.body).to_string();
-                    let _ = self.history.append(
-                        room,
-                        &HistoryEntry {
-                            sender: message.envelope.sender,
-                            sent_at_ms: message.envelope.sent_at_ms,
-                            body: received.body.clone(),
-                            attachment_name: None,
-                        },
-                    );
-                    events.push(Event::Message(MessageView {
-                        sender: message.envelope.sender.to_string(),
-                        body,
+                    // Attributed to the envelope's sender, for a reaction as for a message:
+                    // the payload has no field naming who reacted, so none can be forged.
+                    let entry = HistoryEntry {
+                        sender: message.envelope.sender,
                         sent_at_ms: message.envelope.sent_at_ms,
-                        historic: false,
-                    }));
+                        body: received.body,
+                        attachment_name: None,
+                        id: received.franking.as_ref().map(|f| f.commitment.to_hex()),
+                        reply_to: received.reply_to.map(|r| *r),
+                        reaction: received.reaction.map(|r| *r),
+                    };
+                    let _ = self.history.append(room, &entry);
+                    open.thread.record(&entry);
+                    if let Some(reaction) = &entry.reaction {
+                        let target = &reaction.target;
+                        events.push(Event::Reactions {
+                            sender: target.sender.to_string(),
+                            id: target.id.clone(),
+                            reactions: open.thread.reactions(target),
+                        });
+                    } else {
+                        events.push(Event::Message(view(&entry, &open.thread, false)));
+                    }
                 }
                 Ok(TimelineEvent::Membership { added, removed, .. }) => {
                     events.push(Event::Membership {
@@ -613,7 +715,7 @@ impl Session {
         // Forces the next poll to sweep, so a frontend learns at once which messages on its
         // screen the new timer has just ended.
         open.ttl_checked_ms = i64::MIN;
-        self.history.replay(room, confirmed, now_ms())?;
+        open.thread = Thread::build(&self.history.replay(room, confirmed, now_ms())?);
         Ok(confirmed)
     }
 
@@ -635,7 +737,9 @@ impl Session {
         if let Some(ttl) = current {
             // Rewrites the transcript without anything past the timer — deletion, not a
             // filter on what is shown.
-            let _ = self.history.replay(room, Some(ttl), now);
+            if let Ok(live) = self.history.replay(room, Some(ttl), now) {
+                open.thread = Thread::build(&live);
+            }
             events.push(Event::Expired { before_ms: now.saturating_sub(ttl) });
         }
     }
@@ -912,6 +1016,20 @@ fn load_or_create_identity(dir: &Path) -> Result<(UserId, DeviceId, bool), Sessi
             Ok((UserId::new(), DeviceId::new(), false))
         }
         Err(e) => Err(SessionError::Identity(e.to_string())),
+    }
+}
+
+/// A transcript entry as a frontend shows it, with its quote and reactions resolved.
+fn view(entry: &HistoryEntry, thread: &Thread, historic: bool) -> MessageView {
+    let own = entry.id.as_ref().map(|id| MessageRef { sender: entry.sender, id: id.clone() });
+    MessageView {
+        sender: entry.sender.to_string(),
+        body: String::from_utf8_lossy(&entry.body).to_string(),
+        sent_at_ms: entry.sent_at_ms,
+        historic,
+        id: entry.id.clone(),
+        reply_to: entry.reply_to.as_ref().map(|r| thread.quote(r)),
+        reactions: own.map(|r| thread.reactions(&r)).unwrap_or_default(),
     }
 }
 
