@@ -12,6 +12,7 @@ ui/app.js           the DOM — rooms, timeline, members, call controls
 ui/call.js          WebRTC: peer connections, devices, screen share
 ui/timer.js         the disappearing-message control and its notices
 ui/messages.js      drawing a message; replying and reacting to it
+ui/search.js        message search in the sidebar
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -170,7 +171,21 @@ What they deliberately do **not** carry:
 **A reaction cannot be reported.** Franking commits to a message's body, and a reaction's
 body is empty. A report can prove what a reply said, not which message it answered.
 
+## Search
 
+The box above the room list searches **this device's transcripts**, in Rust
+(`cairn_client_core::search`). The query is never sent to the instance — in an encrypted
+room it could not search anyway, and asking it to would disclose what the user is looking
+for. The instance does see one timer lookup per room with a transcript, so it can tell
+that a search-shaped burst happened, though never what was searched for.
+
+It finds only what this device kept: nothing from before it joined, nothing past a room's
+timer. Each room is swept against its timer, read fresh, before it is searched, and a room
+whose timer cannot be read (offline) is **skipped and named** rather than searched as if
+it had none — otherwise a message that expired while the device was away would come back
+as a search result.
+
+## What it does not do yet
 
 Attachments, link cards and safety-number comparison all exist in `client-core` and are not
 yet surfaced in this UI.

@@ -21,7 +21,7 @@ use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
 use cairn_client_core::session::{
-    Event, MemberView, MessageView, ReactionView, RoomSummary, Session,
+    Event, MemberView, MessageView, ReactionView, RoomSummary, SearchResults, Session,
 };
 use tauri::State;
 
@@ -130,6 +130,13 @@ fn reply(
     id: String,
 ) -> CmdResult<MessageView> {
     with(&state, |s| s.reply(&text, &sender, &id))
+}
+
+/// Search this device's transcripts. Runs entirely in Rust, over local history; the
+/// query is never sent anywhere.
+#[tauri::command]
+fn search(state: State<'_, AppState>, query: String) -> CmdResult<SearchResults> {
+    with(&state, |s| s.search(&query))
 }
 
 /// React to a message, or withdraw this user's reaction with `emoji: null`. Returns every
@@ -254,6 +261,7 @@ fn main() {
             set_room_timer,
             reply,
             react,
+            search,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

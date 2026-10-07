@@ -44,6 +44,9 @@
     <symbol id="i-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="12" cy="13.5" r="7.5"/><path d="M12 13.5V9.5M10 2.5h4M18.5 6.5l1.5-1.5"/>
     </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/>
+    </symbol>
     <symbol id="i-react" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="12" cy="12" r="8.5"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9.3 9.8h.01M14.7 9.8h.01"/>
     </symbol>
@@ -91,7 +94,16 @@
       <input id="invite-token" placeholder="invite token" spellcheck="false" autocomplete="off">
       <button id="join">Join</button>
     </div>
-    <h2 class="section">Rooms</h2>
+    <!-- Search runs in Rust over this device's transcripts; the query never leaves it. -->
+    <label class="search">
+      <svg width="14" height="14"><use href="#i-search"/></svg>
+      <input id="search" type="search" placeholder="Search messages" aria-label="Search messages on this device" autocomplete="off" spellcheck="false">
+    </label>
+    <div id="search-results" hidden>
+      <ul id="search-hits"></ul>
+      <p id="search-note" class="hint"></p>
+    </div>
+    <h2 id="rooms-heading" class="section">Rooms</h2>
     <ul id="rooms"></ul>
   </aside>
 
@@ -199,6 +211,7 @@
 <script src="call.js"></script>
 <script src="timer.js"></script>
 <script src="messages.js"></script>
+<script src="search.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

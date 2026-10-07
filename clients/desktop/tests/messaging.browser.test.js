@@ -103,6 +103,7 @@ class FakeSession {
                 reply_to: { sender: args.sender, id: args.id, snippet: this.resolved, sent_at_ms: 1_000 },
             });
             case "react": return args.emoji ? [{ emoji: args.emoji, by: [ME] }] : [];
+            case "search": return this.found || { hits: [], unsearched: [] };
             default: throw new Error("FakeSession: unhandled command " + cmd);
         }
     }
@@ -403,5 +404,62 @@ test("a quote this device cannot resolve says so instead of showing anything", {
     const page = await openApp(browser, fake);
     const text = await page.textContent("#timeline .quote.gone .quote-text");
     assert.strictEqual(text, "Original message unavailable");
+    await page.close();
+});
+
+// ---- search -----------------------------------------------------------------
+
+function hit(extra = {}) {
+    return {
+        room: ROOM, sender: BOB, sent_at_ms: 1_000, id: ID1,
+        before: "so ", matched: "Quarterly numbers", after: " are in", ...extra,
+    };
+}
+
+test("search asks Rust, marks the match Rust returned, and jumps to it", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [msg(BOB, "so Quarterly numbers are in", 1_000, { id: ID1 })];
+    fake.found = { hits: [hit()], unsearched: [] };
+    const page = await openApp(browser, fake);
+    await page.fill("#search", "quarterly");
+    await page.waitForSelector("#search-hits li");
+
+    assert.deepStrictEqual(fake.asked("search").at(-1), { query: "quarterly" });
+    assert.strictEqual(await page.textContent("#search-hits mark"), "Quarterly numbers");
+    assert.ok(!(await page.isVisible("#rooms")), "results replace the room list");
+    assert.match(await page.textContent("#search-note"), /never sent to the instance/);
+    await shoot(page, "search");
+
+    await page.click("#search-hits li");
+    await page.waitForSelector("#timeline li.msg.flash");
+    assert.strictEqual(await page.$eval("#timeline li.msg.flash", (l) => l.dataset.id), ID1);
+    assert.deepStrictEqual(page.errors, []);
+    await page.close();
+});
+
+test("a hit's text is drawn as text, not markup", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.found = { hits: [hit({ before: "<img src=x onerror=alert(1)>", matched: "<b>x</b>" })], unsearched: [] };
+    const page = await openApp(browser, fake);
+    await page.fill("#search", "x");
+    await page.waitForSelector("#search-hits li");
+    assert.strictEqual(await page.$$eval("#search-hits img, #search-hits b", (n) => n.length), 0);
+    assert.strictEqual(await page.textContent("#search-hits mark"), "<b>x</b>");
+    await page.close();
+});
+
+test("rooms that could not be searched are named, and clearing restores the list", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.found = { hits: [], unsearched: [ROOM] };
+    const page = await openApp(browser, fake);
+    await page.fill("#search", "anything");
+    await page.waitForFunction(() => document.getElementById("search-note").textContent !== "");
+    const note = await page.textContent("#search-note");
+    assert.match(note, /No messages found/);
+    assert.match(note, /1 room was not searched/, "a skipped room must not read as 'never said there'");
+
+    await page.press("#search", "Escape");
+    assert.ok(await page.isVisible("#rooms"));
+    assert.ok(!(await page.isVisible("#search-results")));
     await page.close();
 });

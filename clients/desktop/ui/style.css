@@ -501,3 +501,40 @@ label.timer select option, label.timer select optgroup { background: var(--surfa
 #reply-bar .reply-who { color: var(--accent); }
 #reply-bar .reply-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
 #reply-bar button { padding: 2px 9px; font-size: 18px; }
+
+/* ---- search ------------------------------------------------------------ */
+
+label.search {
+  display: flex; align-items: center; gap: 8px;
+  margin: 4px 12px 2px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--dim);
+}
+label.search:focus-within { border-color: rgba(110, 168, 254, 0.55); color: var(--accent); }
+label.search input {
+  flex: 1; min-width: 0;
+  border: 0; background: transparent; padding: 7px 0;
+  font-size: 13px;
+}
+label.search input:focus { outline: none; }
+
+/* Each of these sets no display of its own today; the attribute rule is spelled out anyway
+   so a later `display` cannot quietly beat it. */
+#search-results[hidden], #rooms[hidden], #rooms-heading[hidden] { display: none; }
+#search-results { flex: 1; overflow-y: auto; padding: 8px 8px 12px; min-height: 0; }
+#search-hits li {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+#search-hits li:hover, #search-hits li:focus-visible { background: var(--surface-2); outline: none; }
+#search-hits .hit-meta { display: flex; gap: 6px; font-size: 11.5px; color: var(--accent); }
+#search-hits .hit-room { color: var(--dim); }
+#search-hits .hit-when { margin-left: auto; color: var(--dim); }
+#search-hits .hit-text { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+#search-hits mark { background: var(--accent-soft); color: var(--text); border-radius: 3px; padding: 0 1px; }
+#search-note { font-size: 11.5px; padding: 6px 8px; }

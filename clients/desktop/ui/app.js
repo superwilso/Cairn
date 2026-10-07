@@ -606,6 +606,12 @@ function addNotice(text) {
 }
 
 CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
+CairnSearch.init({
+    openRoom: (room) => selectRoom(room),
+    current: () => openRoom,
+    short,
+    onError: (e) => fail($("error"), e),
+});
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

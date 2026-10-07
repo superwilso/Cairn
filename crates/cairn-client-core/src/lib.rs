@@ -23,6 +23,7 @@ pub mod conversation;
 pub mod embed;
 pub mod history;
 #[cfg(feature = "http")]
+pub mod search;
 pub mod session;
 pub mod statedir;
 pub mod store;
