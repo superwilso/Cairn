@@ -1,0 +1,25 @@
+name: Scheduled audit
+
+# `ci.yml` audits on every pull request, which only catches an advisory published *before*
+# the code changed. Advisories arrive on their own schedule: RUSTSEC-2026-0285 (rustls,
+# TLS 1.3 handshake messages accepted across encryption levels) was published while `main`
+# sat green, and nothing turned red until an unrelated change happened to run the audit.
+# A vulnerable dependency in a security product should not wait for somebody to touch the
+# code — so this runs daily against `main`, and a failure shows on the Actions tab.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit (main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit

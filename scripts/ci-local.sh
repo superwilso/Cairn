@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Everything .github/workflows/ci.yml runs, on this machine, before it costs anything.
 #
-# Why this exists: CI on a private repo bills macOS minutes at 10x and Windows at 2x, so a
-# full matrix run is expensive out of proportion to how often it catches something. Catching
-# a failure here costs nothing.
+# Why this exists: a red CI run costs a round trip — push, wait for three platforms, read
+# the log, push again — and a failure caught here costs nothing. It was first written when
+# the repository was private and every macOS minute was billed 10x; that is no longer true,
+# but the round trip still is.
 #
 # It must stay a faithful copy of the workflow. The two are easy to let drift, and a local
 # check that is *weaker* than CI is worse than none — it produces confidence CI then
@@ -86,7 +87,7 @@ fi
 
 # Every icon the bundle config names must exist. `tauri-build` hard-errors on Windows
 # without icons/icon.ico -- so a missing file does not fail here, it fails 20 minutes into a
-# billed Windows runner.
+# Windows runner.
 run "bundle icons present" python3 - <<'PYCHECK'
 import json, sys
 from pathlib import Path

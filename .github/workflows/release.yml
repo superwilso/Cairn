@@ -1,11 +1,10 @@
 # Build the desktop client and publish it to GitHub Releases.
 #
-# ## Cost, because it is the reason this is not on every push
+# ## Why this is not on every push
 #
-# GitHub bills a private repository's Windows minutes at **2x** and macOS at **10x**. A Tauri
-# build compiles the whole workspace plus the webview bindings and then runs an installer
-# packager, so it is not cheap. This runs only on a version tag or when somebody asks for it
-# by hand. `ci.yml` carries the same reasoning for its matrix.
+# A Tauri build compiles the whole workspace plus the webview bindings and then runs an
+# installer packager, and what it produces is a release, not a check — `ci.yml` already
+# builds and tests every platform. This runs only on a version tag or when asked by hand.
 #
 # ## Windows only, for now
 #
@@ -20,8 +19,8 @@
 # **This workflow has never run.** It was written on Linux, where a Windows installer cannot
 # be produced or verified.
 #
-# What *was* exercised locally, because a first run on a billed Windows runner is an
-# expensive place to discover a typo:
+# What *was* exercised locally, because a first run on a slow Windows runner is a poor
+# place to discover a typo:
 #
 #   - **The exact build command below**, `cargo tauri build --bundles <type>`, against this
 #     exact config, through to a finished bundle (`--bundles deb` on Linux). That covers
