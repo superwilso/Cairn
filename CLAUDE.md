@@ -80,9 +80,9 @@ handler and it is untested and bypassable.
 checks the MSRV floor and `cargo audit`. Running `cargo test` alone is a weaker check than
 CI, which is how a green local tree can still fail.
 
-This matters more than tidiness. GitHub bills a private repo's macOS minutes at **10x** and
-Windows at 2x, so a full matrix run costs ~49 billed minutes against a 2000/month allowance —
-about 40 runs. It has already run out once. A failure caught locally costs nothing.
+The repository is public, so CI minutes are free and every pull request runs Linux,
+Windows and macOS. Run the local script anyway: a red run still costs a full round trip and
+reviewers' attention, and a failure caught locally costs nothing.
 
 ```bash
 scripts/ci-local.sh                                 # everything CI runs, locally
@@ -168,6 +168,6 @@ found by probing, say what the probe showed.
 ## Owner's items — do not attempt these
 
 - **Name clearance** (USPTO/EUIPO, domains). The owner may rename later; do not block on it.
-- **Licence files.** Must be verbatim from an authoritative source. Do not reproduce a
-  legal document from memory.
+- **Licence files** are committed (the owner asked for them, and they were downloaded
+  from their publishers). Never edit them, and never reproduce a legal document from memory.
 - **External cryptographic review.** Scheduled for M5.

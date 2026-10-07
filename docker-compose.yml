@@ -20,7 +20,13 @@ services:
       # operator hands out access. Re-minted on every restart, so treat a spent token as
       # spent regardless of what the server says after a reboot.
       CAIRN_INVITES: ${CAIRN_INVITES:?set CAIRN_INVITES in .env, e.g. a couple of long random strings}
+      # Registration is limited per address, and every connection here comes from Caddy.
+      # Naming Caddy lets the instance believe the X-Forwarded-For it adds — and only that
+      # one host's, because anyone can send the header. Must match caddy's address below.
+      CAIRN_TRUSTED_PROXIES: 172.30.0.2
       RUST_LOG: ${RUST_LOG:-info}
+    networks:
+      - internal
     volumes:
       # Holds the franking key. Losing it invalidates every report the instance ever
       # issued, so this is the thing to back up.
@@ -40,8 +46,20 @@ services:
       # and Let's Encrypt rate-limits that.
       - caddy-data:/data
       - caddy-config:/config
+    networks:
+      internal:
+        # Fixed, so the trust above names exactly this container. Not `.1`: that is the
+        # bridge gateway, which is where a connection would appear to come from if somebody
+        # published a port on `cairn` — and that one must not be believed.
+        ipv4_address: 172.30.0.2
     depends_on:
       - cairn
+
+networks:
+  internal:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   cairn-data:

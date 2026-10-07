@@ -170,6 +170,29 @@
   </section>
 </div>
 
+<!-- Safety numbers. Every digit here comes from Rust, computed from the encrypted group's
+     own roster; this page only lays them out and hands the same string back. A number built
+     from anything the instance published would match on both ends of an interception —
+     see docs/01-threat-model.md §4. -->
+<div id="safety" class="sheet" hidden>
+  <div class="panel" role="dialog" aria-modal="true" aria-labelledby="safety-title">
+    <header>
+      <h3 id="safety-title">Safety numbers</h3>
+      <span id="safety-who" class="mono grow"></span>
+      <button id="safety-close" class="ghost" title="Close (Esc)">Close</button>
+    </header>
+    <div id="safety-changed" class="alarm" hidden>
+      <strong>A key changed after you verified it.</strong>
+      That is what a reinstall looks like — and exactly what an interception looks like.
+      Nothing here can tell them apart. Compare the new number before you trust this
+      conversation again.
+    </div>
+    <p id="safety-how" class="how"></p>
+    <ul id="safety-devices"></ul>
+    <p id="safety-error" class="error"></p>
+  </div>
+</div>
+
 <script src="call.js"></script>
 <script src="app.js"></script>
 </body>

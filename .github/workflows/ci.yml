@@ -27,27 +27,17 @@ jobs:
   # The cross-platform claim in docs/09-platform-strategy.md is checked here rather than
   # assumed. Only Linux is verified locally during development.
   #
-  # macOS is deliberately not in the pull-request matrix. GitHub bills a private repo's
-  # macOS minutes at **10x** Linux and Windows at 2x, which made a single six-job run cost
-  # roughly 49 billed minutes — about 60% of it macOS alone — against a 2000-minute monthly
-  # allowance. That is ~40 runs a month, and it ran out.
-  #
-  # The trade, stated rather than buried: an Apple-only failure is now caught when a branch
-  # merges rather than while it is in review. Accepted because nothing in the tree has an
-  # Apple-specific code path — every cfg branch is unix-vs-not — and because
-  # `scripts/ci-local.sh` cross-compiles to aarch64-apple-darwin before a push. Add the
-  # `full-matrix` label, or use workflow_dispatch, to get macOS on a pull request anyway.
+  # All three on every pull request. macOS used to be held back to merge time because a
+  # private repository is billed 10x for it, and the allowance ran out once; the repository
+  # is public now, standard runners cost nothing, and an Apple-only failure belongs in
+  # review rather than on `main`.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(
-          (github.event_name == 'pull_request' &&
-           !contains(github.event.pull_request.labels.*.name, 'full-matrix'))
-          && '["ubuntu-latest","windows-latest"]'
-          || '["ubuntu-latest","windows-latest","macos-latest"]') }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -83,7 +73,7 @@ jobs:
 
       # Every icon the bundle config names must exist. `tauri-build` hard-errors on Windows
       # without icons/icon.ico, so a missing file does not fail here — it fails partway
-      # through a billed Windows runner in the release workflow.
+      # through the much slower release build.
       - name: Bundle icons present
         run: |
           python3 - <<'EOF'
@@ -108,6 +98,13 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/call.browser.test.js
+
+      - name: The safety-number panel in a browser
+        # The numbers are computed and checked in Rust; this proves the page hands back the
+        # exact string it was given and never hides a "key changed" warning.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/safety.browser.test.js
 
   lint:
     name: fmt + clippy

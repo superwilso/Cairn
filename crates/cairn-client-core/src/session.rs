@@ -43,6 +43,7 @@ use crate::history::{Entry as HistoryEntry, History, HistoryError};
 use crate::statedir::{self, StateDirError};
 use crate::store::{ConversationIndex, IndexError};
 use crate::transport::HttpTransport;
+use crate::verify::{self, SafetyView, VerifyError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -62,6 +63,10 @@ pub enum SessionError {
     Mls(#[from] cairn_crypto::mls::MlsError),
     #[error(transparent)]
     Shape(#[from] cairn_proto::ShapeError),
+    #[error(transparent)]
+    Verify(#[from] VerifyError),
+    #[error("not a valid id: {0}")]
+    BadId(String),
     #[error("no room is open")]
     NoRoomOpen,
     #[error("this room has no encrypted group on this device yet — wait to be admitted")]
@@ -92,10 +97,24 @@ pub struct RoomSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberView {
     pub user: String,
+    /// The instance's word for this account's role — or [`UNLISTED`] for an account that
+    /// holds a leaf in the encrypted group but that the instance did not list at all.
     pub role: String,
     pub in_group: bool,
+    /// Every one of this account's devices in the group has had its safety number compared,
+    /// and none has changed key since.
     pub verified: bool,
+    /// At least one of this account's devices changed key after being verified. Sticky until
+    /// the new number is compared — see [`ContactStore::observe`].
+    pub key_changed: bool,
 }
+
+/// The role reported for a group member the instance's member list omits.
+///
+/// The list comes from the instance; the roster comes from the group. A member who can read
+/// the room must never be invisible just because the instance left them out — that is the
+/// "silently added member" of `docs/01-threat-model.md` §4 with extra steps.
+pub const UNLISTED: &str = "unlisted";
 
 /// A message for display. Plain data: no envelope, no keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,6 +542,16 @@ impl Session {
             }
         }
 
+        // A roster change is when a key change happens, so it is when the contact store
+        // should hear about it — a verified contact re-added under a new key is flagged now,
+        // not whenever somebody next opens the member list. Best-effort: `members` and
+        // `safety_numbers` observe again before reporting anything, and surface the error.
+        if events.iter().any(|e| matches!(e, Event::Membership { .. }))
+            && open.convo.group_id().is_some()
+        {
+            let _ = verify::observe_roster(&open.convo, &mut self.contacts);
+        }
+
         let _ = self.index.advance(room, open.cursor);
         self.open = Some(open);
         Ok(events)
@@ -681,43 +710,60 @@ impl Session {
     }
 
     /// Everyone in the room, from both the instance's list and the encrypted group.
-    pub fn members(&self) -> Result<Vec<MemberView>, SessionError> {
+    ///
+    /// Observes the roster first. Without that, verification state is whatever the contact
+    /// store last saw — and before this, nothing in `Session` ever showed it anything, so a
+    /// contact verified once and then substituted was still reported verified.
+    pub fn members(&mut self) -> Result<Vec<MemberView>, SessionError> {
         let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
         let room = open.convo.room();
-
-        // Verification state is held per *device* — the contact store is keyed by MLS
-        // identity bytes — so an account counts as verified only when every device of theirs
-        // in this group has been verified. Reporting "verified" while one of someone's
-        // devices is unchecked would be the badge overstating itself.
-        let roster = open.convo.members();
-        let mut in_group: Vec<(UserId, bool)> = Vec::new();
-        for m in &roster {
-            let Ok(id) = DeviceIdentity::parse(&m.identity) else { continue };
-            let ok = self.contacts.state_of(&m.identity) == VerificationState::Verified;
-            match in_group.iter_mut().find(|(u, _)| *u == id.user()) {
-                Some(entry) => entry.1 &= ok,
-                None => in_group.push((id.user(), ok)),
-            }
+        if open.convo.group_id().is_some() {
+            verify::observe_roster(&open.convo, &mut self.contacts)?;
         }
+        let listed = self.client.room_members(room)?;
+        Ok(member_views(listed, &open.convo.members(), &self.contacts))
+    }
 
-        Ok(self
-            .client
-            .room_members(room)?
-            .into_iter()
-            .map(|(user, role)| {
-                let found = in_group.iter().find(|(u, _)| *u == user);
-                MemberView {
-                    user: user.to_string(),
-                    role,
-                    in_group: found.is_some(),
-                    verified: found.is_some_and(|(_, v)| *v),
-                }
-            })
-            .collect())
+    /// The safety number for each of `user`'s devices in the open room's group.
+    ///
+    /// Computed from the group's own roster, never from a key the instance published — see
+    /// [`crate::verify`]. Asking about your own account lists your other devices.
+    pub fn safety_numbers(&mut self, user: &str) -> Result<Vec<SafetyView>, SessionError> {
+        let user: UserId = user.parse().map_err(|_| SessionError::BadId(user.to_string()))?;
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        Ok(verify::safety_numbers(&open.convo, &mut self.contacts, user)?)
+    }
+
+    /// Record that the user compared `number` with this device's owner and it matched.
+    ///
+    /// `number` is the one the frontend displayed, handed back unchanged. It is checked
+    /// against the number *now*: if the key changed while it was on screen, this refuses
+    /// rather than certifying a key the user never saw. Returns the account's refreshed
+    /// numbers so the frontend can redraw from one call.
+    pub fn verify(
+        &mut self,
+        user: &str,
+        device: &str,
+        number: &str,
+    ) -> Result<Vec<SafetyView>, SessionError> {
+        let account: UserId = user.parse().map_err(|_| SessionError::BadId(user.to_string()))?;
+        let device: DeviceId =
+            device.parse().map_err(|_| SessionError::BadId(device.to_string()))?;
+        let identity = DeviceIdentity::new(account, device).to_credential();
+
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        verify::verify(&open.convo, &mut self.contacts, &identity, number)?;
+        Ok(verify::safety_numbers(&open.convo, &mut self.contacts, account)?)
     }
 
     /// Accounts the instance lists that the encrypted group does not hold.
-    pub fn waiting(&self) -> Result<Vec<String>, SessionError> {
+    pub fn waiting(&mut self) -> Result<Vec<String>, SessionError> {
         Ok(self.members()?.into_iter().filter(|m| !m.in_group).map(|m| m.user).collect())
     }
 
@@ -788,6 +834,67 @@ fn describe_member(m: &cairn_crypto::mls::GroupMember) -> String {
         .unwrap_or_else(|_| format!("unattributable leaf {}", m.index))
 }
 
+/// Join the instance's member list with the group's roster.
+///
+/// Verification state is held per *device* — the contact store is keyed by MLS identity
+/// bytes — so an account counts as verified only when every device of theirs in this group
+/// has been verified. Reporting "verified" while one of someone's devices is unchecked would
+/// be the badge overstating itself.
+///
+/// Roster accounts the instance did not list are appended as [`UNLISTED`] rather than
+/// dropped. The member list is the only place a frontend shows who is in a room, and the
+/// instance writes it: leaving someone off it must not make a reader of the room invisible.
+fn member_views(
+    listed: Vec<(UserId, String)>,
+    roster: &[cairn_crypto::mls::GroupMember],
+    contacts: &ContactStore,
+) -> Vec<MemberView> {
+    struct Seen {
+        user: UserId,
+        verified: bool,
+        changed: bool,
+    }
+    let mut in_group: Vec<Seen> = Vec::new();
+    for m in roster {
+        let Ok(id) = DeviceIdentity::parse(&m.identity) else { continue };
+        let state = contacts.state_of(&m.identity);
+        let verified = state == VerificationState::Verified;
+        let changed = state == VerificationState::ChangedSinceVerified;
+        match in_group.iter_mut().find(|s| s.user == id.user()) {
+            Some(entry) => {
+                entry.verified &= verified;
+                entry.changed |= changed;
+            }
+            None => in_group.push(Seen { user: id.user(), verified, changed }),
+        }
+    }
+
+    let mut views: Vec<MemberView> = listed
+        .iter()
+        .map(|(user, role)| {
+            let found = in_group.iter().find(|s| s.user == *user);
+            MemberView {
+                user: user.to_string(),
+                role: role.clone(),
+                in_group: found.is_some(),
+                verified: found.is_some_and(|s| s.verified),
+                key_changed: found.is_some_and(|s| s.changed),
+            }
+        })
+        .collect();
+
+    for seen in in_group.iter().filter(|s| !listed.iter().any(|(u, _)| *u == s.user)) {
+        views.push(MemberView {
+            user: seen.user.to_string(),
+            role: UNLISTED.to_string(),
+            in_group: true,
+            verified: seen.verified,
+            key_changed: seen.changed,
+        });
+    }
+    views
+}
+
 fn load_or_create_identity(dir: &Path) -> Result<(UserId, DeviceId, bool), SessionError> {
     let path = dir.join("identity.json");
     match std::fs::read(&path) {
@@ -806,4 +913,90 @@ fn load_or_create_identity(dir: &Path) -> Result<(UserId, DeviceId, bool), Sessi
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_crypto::mls::GroupMember;
+
+    fn store(name: &str) -> ContactStore {
+        let dir = std::env::temp_dir()
+            .join("cairn-member-views")
+            .join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        ContactStore::open(dir).unwrap()
+    }
+
+    fn leaf(index: u32, user: UserId, key: &[u8]) -> GroupMember {
+        GroupMember {
+            index,
+            identity: DeviceIdentity::new(user, DeviceId::new()).to_credential(),
+            signature_key: key.to_vec(),
+        }
+    }
+
+    fn verified(contacts: &mut ContactStore, member: &GroupMember) {
+        contacts.observe(member).unwrap();
+        assert!(contacts.mark_verified(&member.identity).unwrap());
+    }
+
+    #[test]
+    fn an_account_is_verified_only_when_every_device_is() {
+        let bob = UserId::new();
+        let phone = leaf(1, bob, b"phone");
+        let laptop = leaf(2, bob, b"laptop");
+        let mut contacts = store("every");
+        verified(&mut contacts, &phone);
+
+        let roster = [phone.clone(), laptop.clone()];
+        let views = member_views(vec![(bob, "member".into())], &roster, &contacts);
+        assert!(!views[0].verified, "one unchecked device must keep the account unverified");
+
+        verified(&mut contacts, &laptop);
+        let views = member_views(vec![(bob, "member".into())], &roster, &contacts);
+        assert!(views[0].verified);
+        assert!(!views[0].key_changed);
+    }
+
+    #[test]
+    fn a_key_change_on_any_device_flags_the_account() {
+        let bob = UserId::new();
+        let phone = leaf(1, bob, b"phone");
+        let laptop = leaf(2, bob, b"laptop");
+        let mut contacts = store("flag");
+        verified(&mut contacts, &phone);
+        verified(&mut contacts, &laptop);
+
+        let substituted = GroupMember { signature_key: b"someone else".to_vec(), ..laptop };
+        contacts.observe(&substituted).unwrap();
+
+        let views = member_views(vec![(bob, "member".into())], &[phone, substituted], &contacts);
+        assert!(!views[0].verified);
+        assert!(views[0].key_changed, "the account must carry the warning, not hide it");
+    }
+
+    #[test]
+    fn a_group_member_the_instance_does_not_list_is_still_shown() {
+        // The member list is the instance's to write. A leaf that can read the room must not
+        // vanish from the only place a frontend shows people because the list omitted it.
+        let alice = UserId::new();
+        let hidden = UserId::new();
+        let roster = [leaf(0, alice, b"alice"), leaf(1, hidden, b"hidden")];
+
+        let views = member_views(vec![(alice, "owner".into())], &roster, &store("unlisted"));
+        let shown = views.iter().find(|v| v.user == hidden.to_string());
+        let shown = shown.expect("a group member the instance left out must still be shown");
+        assert_eq!(shown.role, UNLISTED);
+        assert!(shown.in_group);
+        assert!(!shown.verified, "and unverified is the honest default");
+    }
+
+    #[test]
+    fn a_listed_account_without_a_leaf_is_waiting_not_verified() {
+        let carol = UserId::new();
+        let views = member_views(vec![(carol, "member".into())], &[], &store("waiting"));
+        assert!(!views[0].in_group);
+        assert!(!views[0].verified);
+        assert!(!views[0].key_changed);
+    }
 }

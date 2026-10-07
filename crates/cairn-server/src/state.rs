@@ -20,6 +20,7 @@ use cairn_proto::{
     BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId, Username,
 };
 
+use crate::address::AddressBucket;
 use crate::storage::{Storage, StorageError, Write};
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +57,12 @@ pub enum ServerError {
     InviteRequired,
     #[error("invite is unknown, already used, or expired")]
     InviteInvalid,
+    /// An operator tried to mint a registration invite short enough to guess.
+    #[error(
+        "a registration invite must be at least {MIN_INVITE_TOKEN_LEN} characters; \
+         it is the only thing standing between a stranger and an account"
+    )]
+    InviteTooShort,
     #[error("not a member of this room")]
     NotAMember,
     #[error("this room is not open to join; a member must add you")]
@@ -183,7 +190,39 @@ pub const MAX_UPLOAD_BYTES_PER_WINDOW: usize = 100 * 1024 * 1024;
 /// for an hour is not a person typing.
 pub const MAX_MESSAGES_PER_WINDOW: usize = 1_800;
 
-/// The window the claim, upload, and send limits are all measured over.
+/// How many registration attempts one address may make per window, successful or not.
+///
+/// The only limit keyed to an address rather than an account, because registration is
+/// where accounts come from. Probing it before it existed: one address made **2,000 invite
+/// guesses in under a second** with no refusal, and under open registration created 2,000
+/// accounts — each of which then had its own fresh send and upload budget, so the
+/// per-account limits bounded nothing.
+///
+/// Failures count, deliberately. Under invite-only registration a failure *is* the attack
+/// — guessing tokens — and a limiter that only counted successes would let it run free.
+/// Twenty leaves room for a household behind one NAT to sign up together with typos.
+///
+/// What it does not do: bound an attacker with many addresses. That is why invite-only is
+/// the default and why [`MIN_INVITE_TOKEN_LEN`] exists — against a distributed guesser,
+/// the token's length is the defence and this limit is not.
+pub const MAX_REGISTRATION_ATTEMPTS_PER_ADDRESS: usize = 20;
+
+/// The shortest registration invite an operator may mint.
+///
+/// Invites are chosen by the operator (`CAIRN_INVITES`), and the examples people copy are
+/// words like `for-alice`. Sixteen characters of anything is not an entropy guarantee —
+/// `aaaaaaaaaaaaaaaa` passes — but it makes a guessable invite a deliberate act rather
+/// than the path of least resistance.
+pub const MIN_INVITE_TOKEN_LEN: usize = 16;
+
+/// Above this many tracked addresses, the registration limiter drops idle ones.
+///
+/// Accounts are bounded by registration and so are the other limiters' keys; addresses are
+/// not, and a limiter that remembered every address it ever saw would be a memory leak an
+/// attacker could drive.
+const MAX_TRACKED_ADDRESSES: usize = 10_000;
+
+/// The window the claim, upload, send, and registration limits are all measured over.
 pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 /// How far outside the present a signed request's timestamp may be.
@@ -434,6 +473,32 @@ impl WindowBudget {
     }
 }
 
+/// Registration attempts per address. In memory, for the same reason as [`ClaimLimiter`].
+#[derive(Debug, Default)]
+struct RegistrationLimiter {
+    attempts: HashMap<AddressBucket, VecDeque<i64>>,
+}
+
+impl RegistrationLimiter {
+    /// Record an attempt from `from`, or refuse it. A refusal is not recorded, so an honest
+    /// client that backs off on a 429 recovers when the window rolls.
+    fn admit(&mut self, from: AddressBucket, now_ms: i64) -> Result<(), ServerError> {
+        let expired = |at: &i64| now_ms.saturating_sub(*at) >= CLAIM_WINDOW_MS;
+        if self.attempts.len() >= MAX_TRACKED_ADDRESSES && !self.attempts.contains_key(&from) {
+            self.attempts.retain(|_, recent| recent.back().is_some_and(|at| !expired(at)));
+        }
+        let recent = self.attempts.entry(from).or_default();
+        while recent.front().is_some_and(expired) {
+            recent.pop_front();
+        }
+        if recent.len() >= MAX_REGISTRATION_ATTEMPTS_PER_ADDRESS {
+            return Err(ServerError::RateLimited);
+        }
+        recent.push_back(now_ms);
+        Ok(())
+    }
+}
+
 impl ClaimLimiter {
     /// Record a claim by `actor` against `target`, or refuse it.
     ///
@@ -484,6 +549,8 @@ pub struct Instance {
     lookup_limiter: Mutex<HashMap<UserId, VecDeque<i64>>>,
     /// Bounds how fast one account can fill an operator's disk. Not persisted, as above.
     upload_budget: Mutex<WindowBudget>,
+    /// Bounds registration per address; see [`MAX_REGISTRATION_ATTEMPTS_PER_ADDRESS`].
+    registration_limiter: Mutex<RegistrationLimiter>,
     /// Bounds message flooding. Sending is authenticated, so unlike registration this needs
     /// no knowledge of the caller's address and lives entirely here with the other rules.
     send_budget: Mutex<WindowBudget>,
@@ -522,6 +589,7 @@ impl Instance {
             lookup_limiter: Mutex::new(HashMap::new()),
             upload_budget: Mutex::default(),
             send_budget: Mutex::default(),
+            registration_limiter: Mutex::default(),
             franking_key,
             storage,
         })
@@ -568,12 +636,37 @@ impl Instance {
         token: &str,
         expires_at_ms: Option<i64>,
     ) -> Result<(), ServerError> {
+        if token.chars().count() < MIN_INVITE_TOKEN_LEN {
+            return Err(ServerError::InviteTooShort);
+        }
         let record = InviteRecord { used_by: None, expires_at_ms };
         self.invites
             .lock()
             .expect("invites mutex poisoned")
             .insert(token.to_owned(), record.clone());
         self.write(&[Write::Invite(token.to_owned(), record)])
+    }
+
+    /// Registration as it arrives from the network: [`Self::claim_account`], charged to the
+    /// address it came from.
+    ///
+    /// Separate from `claim_account` so that in-process callers — the operator's own tools,
+    /// tests — are not forced to invent an address. **The HTTP surface must call this one**;
+    /// `registration_is_limited_per_address_over_http` is what holds it to that.
+    pub fn register(
+        &self,
+        from: AddressBucket,
+        user: UserId,
+        device: DeviceId,
+        public_key: &[u8],
+        invite: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), ServerError> {
+        self.registration_limiter
+            .lock()
+            .expect("registration limiter poisoned")
+            .admit(from, now_ms)?;
+        self.claim_account(user, device, public_key, invite, now_ms)
     }
 
     /// Claim a user id, creating the account and registering its first device.
@@ -1754,7 +1847,7 @@ pub(crate) mod tests {
         let (room, owner, moderator, second_device, invite_used_by) = {
             let inst = Instance::open(storage.clone()).unwrap();
             inst.set_registration_policy(RegistrationPolicy::InviteOnly).unwrap();
-            inst.create_invite("tok-a", None).unwrap();
+            inst.create_invite("invite-token-aaaa", None).unwrap();
 
             // Built from the ids, so the key packages it publishes name the account that
             // publishes them — which the instance now checks.
@@ -1764,8 +1857,14 @@ pub(crate) mod tests {
                 &cairn_proto::DeviceIdentity::new(owner, owner_device).to_credential(),
             )
             .unwrap();
-            inst.claim_account(owner, owner_device, owner_key.public_key(), Some("tok-a"), 0)
-                .unwrap();
+            inst.claim_account(
+                owner,
+                owner_device,
+                owner_key.public_key(),
+                Some("invite-token-aaaa"),
+                0,
+            )
+            .unwrap();
 
             // A second device on the same account, authorised by the first.
             let second_key = cairn_crypto::mls::Session::new(b"owner-2").unwrap();
@@ -1786,12 +1885,18 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            inst.create_invite("tok-b", None).unwrap();
+            inst.create_invite("invite-token-bbbb", None).unwrap();
             let mod_key = cairn_crypto::mls::Session::new(b"mod").unwrap();
             let moderator = UserId::new();
             let mod_device = DeviceId::new();
-            inst.claim_account(moderator, mod_device, mod_key.public_key(), Some("tok-b"), 0)
-                .unwrap();
+            inst.claim_account(
+                moderator,
+                mod_device,
+                mod_key.public_key(),
+                Some("invite-token-bbbb"),
+                0,
+            )
+            .unwrap();
 
             let (room, _) = inst.create_room(public_shape(), owner).unwrap();
             inst.add_room_member(room, owner, moderator).unwrap();
@@ -1821,7 +1926,7 @@ pub(crate) mod tests {
                 .invites
                 .lock()
                 .unwrap()
-                .get("tok-a")
+                .get("invite-token-aaaa")
                 .and_then(|r| r.used_by)
                 .expect("the invite must have been recorded as spent");
             (room, owner, moderator, second_device, used_by)
@@ -1835,7 +1940,7 @@ pub(crate) mod tests {
             "the registration policy must survive"
         );
         assert_eq!(
-            restarted.invites.lock().unwrap().get("tok-a").and_then(|r| r.used_by),
+            restarted.invites.lock().unwrap().get("invite-token-aaaa").and_then(|r| r.used_by),
             Some(invite_used_by),
             "a spent invite must stay spent, or it could be redeemed twice"
         );
@@ -2313,14 +2418,14 @@ mod accounts {
     #[test]
     fn an_invite_works_once() {
         let inst = Instance::in_memory();
-        inst.create_invite("token-abc", None).unwrap();
+        inst.create_invite("invite-token-abcd", None).unwrap();
 
         let first = cairn_crypto::mls::Session::new(b"first").unwrap();
         inst.claim_account(
             UserId::new(),
             DeviceId::new(),
             first.public_key(),
-            Some("token-abc"),
+            Some("invite-token-abcd"),
             0,
         )
         .unwrap();
@@ -2332,7 +2437,7 @@ mod accounts {
                 UserId::new(),
                 DeviceId::new(),
                 second.public_key(),
-                Some("token-abc"),
+                Some("invite-token-abcd"),
                 0
             ),
             Err(ServerError::InviteInvalid)
@@ -2342,14 +2447,14 @@ mod accounts {
     #[test]
     fn an_expired_invite_is_refused() {
         let inst = Instance::in_memory();
-        inst.create_invite("expiring", Some(1_000)).unwrap();
+        inst.create_invite("invite-expiring-x", Some(1_000)).unwrap();
         let key = cairn_crypto::mls::Session::new(b"late").unwrap();
         assert!(matches!(
             inst.claim_account(
                 UserId::new(),
                 DeviceId::new(),
                 key.public_key(),
-                Some("expiring"),
+                Some("invite-expiring-x"),
                 1_000
             ),
             Err(ServerError::InviteInvalid)
@@ -2380,10 +2485,10 @@ mod accounts {
 
         let (user, device) = {
             let inst = Instance::open(storage.clone()).unwrap();
-            inst.create_invite("persisted", None).unwrap();
+            inst.create_invite("invite-persisted-x", None).unwrap();
             let key = cairn_crypto::mls::Session::new(b"a").unwrap();
             let (u, d) = (UserId::new(), DeviceId::new());
-            inst.claim_account(u, d, key.public_key(), Some("persisted"), 0).unwrap();
+            inst.claim_account(u, d, key.public_key(), Some("invite-persisted-x"), 0).unwrap();
             (u, d)
         };
 
@@ -2400,7 +2505,7 @@ mod accounts {
                 UserId::new(),
                 DeviceId::new(),
                 key.public_key(),
-                Some("persisted"),
+                Some("invite-persisted-x"),
                 0
             ),
             Err(ServerError::InviteInvalid)
@@ -3659,5 +3764,59 @@ mod disappearing {
         let restarted = Instance::open(storage).unwrap();
         assert_eq!(restarted.room_ttl(room), Some(60_000));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn bucket(last: u8) -> AddressBucket {
+        AddressBucket::of(std::net::IpAddr::from([198, 51, 100, last]))
+    }
+
+    fn fresh_claim(inst: &Instance, from: AddressBucket, now_ms: i64) -> Result<(), ServerError> {
+        let (user, device) = (UserId::new(), DeviceId::new());
+        let key = cairn_crypto::mls::Session::new(
+            &cairn_proto::DeviceIdentity::new(user, device).to_credential(),
+        )
+        .unwrap();
+        inst.register(from, user, device, key.public_key(), None, now_ms)
+    }
+
+    #[test]
+    fn a_registration_refusal_lifts_when_the_window_rolls() {
+        let inst = Instance::in_memory();
+        inst.set_registration_policy(RegistrationPolicy::Open).unwrap();
+        for _ in 0..MAX_REGISTRATION_ATTEMPTS_PER_ADDRESS {
+            fresh_claim(&inst, bucket(1), 0).unwrap();
+        }
+        // Hammering while refused must not push the window out, or a client that retries
+        // on a 429 would never recover.
+        for t in 0..50 {
+            assert!(matches!(
+                fresh_claim(&inst, bucket(1), t * 1_000),
+                Err(ServerError::RateLimited)
+            ));
+        }
+        fresh_claim(&inst, bucket(2), 0).expect("another address has its own budget");
+        fresh_claim(&inst, bucket(1), CLAIM_WINDOW_MS).expect("the window rolled");
+    }
+
+    #[test]
+    fn the_registration_limiter_cannot_be_grown_without_bound() {
+        let inst = Instance::in_memory();
+        let mut limiter = inst.registration_limiter.lock().unwrap();
+        for i in 0..(MAX_TRACKED_ADDRESSES as u32 + 500) {
+            let ip = std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            limiter.admit(AddressBucket::of(ip), 0).unwrap();
+        }
+        // All still inside the window, so none may be forgotten yet — forgetting a live
+        // entry would hand that address a fresh budget.
+        assert_eq!(limiter.attempts.len(), MAX_TRACKED_ADDRESSES + 500);
+        limiter.admit(bucket(9), CLAIM_WINDOW_MS).unwrap();
+        assert_eq!(limiter.attempts.len(), 1, "idle addresses are dropped once over the cap");
+    }
+
+    #[test]
+    fn a_guessable_registration_invite_cannot_be_minted() {
+        let inst = Instance::in_memory();
+        assert!(matches!(inst.create_invite("for-alice", None), Err(ServerError::InviteTooShort)));
+        inst.create_invite(&"x".repeat(MIN_INVITE_TOKEN_LEN), None).unwrap();
     }
 }

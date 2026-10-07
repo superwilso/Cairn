@@ -36,7 +36,9 @@ openssl rand -hex 24
 ```
 
 They are single-use, and they are the only thing standing between the open internet and
-an account on your instance. A guessable token is an open instance.
+an account on your instance. A guessable token is an open instance. The server refuses to
+start with one shorter than 16 characters — a floor, not an entropy check, so use the
+command above rather than typing something long.
 
 Check it came up:
 
@@ -44,6 +46,34 @@ Check it came up:
 docker compose logs cairn | grep listening
 curl -s https://cairn.example.com/health
 ```
+
+### Registration limits, and telling the instance about your proxy
+
+Each address may attempt registration 20 times an hour, successful or not. Failures count
+because under invite-only registration a failure *is* the attack: before this limit, one
+address could guess about 2,000 invites a second. IPv6 addresses are grouped by `/64`, since
+one machine can otherwise pick a fresh address from its `/64` for every attempt.
+
+The instance can only limit addresses it can see. Behind Caddy, **every** connection comes
+from Caddy, so the instance must be told to believe the `X-Forwarded-For` header Caddy
+adds — and told *only* about Caddy, because anyone can send that header themselves.
+`docker-compose.yml` does this for you: Caddy has a fixed address on a private network and
+`CAIRN_TRUSTED_PROXIES` names it. If you change the network, change both.
+
+Getting it wrong fails in the safe direction. If the instance trusts no proxy, everyone
+shares Caddy's one budget — registrations get refused early — and the log says
+`ignoring X-Forwarded-For from an untrusted peer`. It never fails by letting a client pick
+its own address.
+
+Two setups from §6 cannot give the instance real addresses, and it is better to know than to
+discover: behind a **Tor onion service** every client arrives from the local Tor daemon, and
+behind a **stream-level passthrough VPS** every client arrives from the tunnel. In both, all
+registrations share one budget. Invite-only registration still holds, which is the part that
+matters.
+
+What this does not do: bound someone with many addresses. A botnet, or anyone holding a
+large IPv6 allocation, gets many budgets. That is why invite-only is the default — against a
+distributed guesser, a long random token is the defence, and the limit is not.
 
 ## 3. Why TLS is not optional here
 
@@ -87,8 +117,14 @@ Then, to talk:
    step. Raw `usr_...` ids still work if you prefer.
 3. They run `/open rom_...` with the room id you were shown.
 4. Both of you run `/safety` and compare the numbers **out of band** — on a call, or in
-   person. If they match, no key substitution happened. If they differ, stop.
-5. `/verify 0` records that you compared them. It persists.
+   person. If they match, no key substitution happened between the two of you. If they
+   differ, stop.
+5. `/verify <n>`, with the member's number from `/safety`, records that you compared them.
+   It persists, and it confirms the number `/safety` printed: if their key changed in
+   between, it refuses and asks you to compare again.
+
+In the desktop client the same comparison is a click: select the person in the member list,
+read the digits to each other, and press **Mark as verified**.
 
 **Usernames now exist**, so step 1 can be `@alice` rather than a uuid — claim one once,
 and it is yours. They resolve by **exact match only**: there is no search or directory, so
@@ -301,10 +337,10 @@ Honest list. Each of these is real and none is hypothetical.
 
   Message sending and attachment uploads are now capped per account over the same window,
   which bounds how fast one account can fill your disk — probing found one account storing
-  300 MiB without a single refusal. **Registration is still unthrottled**, and it is the
-  hard one: behind Caddy every request arrives from the proxy, so limiting by address means
-  trusting `X-Forwarded-For`, which an attacker can set to evade their own limit or to forge
-  someone else's address into a ban.
+  300 MiB without a single refusal. Registration is capped per address (§2), which closes
+  the loop: before it, accounts were free to mint, and each new one arrived with a fresh
+  send and upload budget. **What none of these bound is an attacker with many addresses**,
+  and every counter lives in memory, so a restart clears them all.
 - **Message history is stored in the clear.** A restart now replays a room rather than
   losing it, which it could not do from the network — MLS discards each message key after
   use, so the server holds ciphertext your device can no longer open. The copy is written

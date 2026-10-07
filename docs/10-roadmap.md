@@ -306,6 +306,12 @@ Four calls made by the owner, so a session does not re-litigate them:
       wrapped in Tauri, per ADR-008. Group chats, invites, admission, the tier badge, the
       member list, and the transport badge that says *plaintext* over `http://` rather than
       implying a protection that is not there.
+- [x] **Safety numbers in the desktop client**, through the same `cairn_client_core::verify`
+      the CLI now uses: per device, from the roster, with the sticky *key changed* warning.
+      Building it found two faults in what was already there — a substituted key still
+      reported as verified because nothing showed the contact store the roster, and a
+      confirmation that certified whatever key held a position at the moment of the click.
+      See `01-threat-model.md` §4.
 - [x] **Voice, video and screen sharing**, with microphone / camera / output selection.
       A WebRTC **mesh** capped at six: media is DTLS-SRTP directly between participants and
       never reaches the instance, and there is no SFU to deploy. Signalling rides *inside*
@@ -342,10 +348,24 @@ Four calls made by the owner, so a session does not re-litigate them:
       the likeliest way it would have failed: `tauri-build` hard-errors without
       `icons/icon.ico`, and the icon that existed was a placeholder of 512x512 identical
       pixels. `scripts/make-icon.py` draws both, and CI checks every icon the bundle names.
-- [ ] Rate limiting on registration and sending. Both need the caller's address, which
-      `state.rs` never sees — so unlike the claim limit, this one genuinely cannot live
-      entirely where the other rules do, and that boundary needs designing rather than
-      assuming.
+- [x] **Rate limiting on registration and sending.** Sending turned out not to need an
+      address at all — `accept` authenticates the envelope first, so it is capped per
+      account alongside uploads. Registration did, and probing showed what was at stake:
+      one address made **2,000 invite guesses in under a second** with no refusal, and
+      under open registration minted 2,000 accounts, each arriving with a fresh send and
+      upload budget.
+
+      **The boundary, as designed:** `state.rs` owns the rule
+      (`MAX_REGISTRATION_ATTEMPTS_PER_ADDRESS`, failures included) and takes an opaque
+      `AddressBucket`; `address.rs` decides which address that is. `X-Forwarded-For` is
+      believed only from proxies the operator names in `CAIRN_TRUSTED_PROXIES`, walked
+      right to left so only entries the proxy wrote count. Unconfigured, it fails toward
+      one shared, over-strict budget, never toward a client choosing its own address.
+      IPv6 is bucketed by `/64`. Served without connect info, registration fails closed.
+
+      Registration invites shorter than 16 characters are now refused at startup, because
+      against a guesser with many addresses the token is the defence and the limit is not.
+      **Not bounded:** an attacker with many addresses, and anything after a restart.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
@@ -354,7 +374,9 @@ Four calls made by the owner, so a session does not re-litigate them:
 
 **Goal:** the repository is public and someone else could plausibly contribute.
 
-- [ ] **Licence files committed** — AGPL-3.0 and Apache-2.0, verbatim *(owner)*
+- [x] **Licence files committed** — AGPL-3.0, Apache-2.0 and CC-BY-SA-4.0, downloaded
+      from their publishers at the owner's request; map in `README.md`. The trademark
+      policy and the AGPL boundary note in ADR-004 are still open.
 - [ ] **Name clearance** — USPTO/EUIPO, domains *(owner; may rename, see `NAMING.md`)*
 - [ ] Protocol specification good enough for an outsider to implement against
 - [ ] Public threat model review invited

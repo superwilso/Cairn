@@ -187,6 +187,12 @@ Split by component, deliberately — see [ADR-004](docs/adr/004-licensing.md).
 Server and applications: **AGPL-3.0-or-later**. Protocol libraries and clients:
 **Apache-2.0**. Documentation: **CC-BY-SA-4.0**.
 
-> **Licence files are not yet committed.** They must be copied verbatim from an
-> authoritative source; the environment used to draft this could not reach `gnu.org` or
-> `apache.org`. See [ADR-004](docs/adr/004-licensing.md) action items.
+| Path | Licence | File |
+|---|---|---|
+| Everything not listed below — server, `cairn-cli`, scripts | AGPL-3.0-or-later | [`LICENSE`](LICENSE) |
+| `crates/cairn-proto`, `crates/cairn-crypto`, `crates/cairn-client-core` | Apache-2.0 | `LICENSE` in each |
+| `clients/desktop` | Apache-2.0 | [`clients/desktop/LICENSE`](clients/desktop/LICENSE) |
+| `docs/` | CC-BY-SA-4.0 | [`docs/LICENSE`](docs/LICENSE) |
+
+The nearest `LICENSE` file governs. Each text was downloaded from its publisher — `gnu.org`,
+`apache.org`, `creativecommons.org` — and is unmodified.

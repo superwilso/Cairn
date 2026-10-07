@@ -14,3 +14,6 @@ clients/desktop/src-tauri/gen/
 
 # Playwright, installed by the CI desktop job for the browser call test.
 node_modules/
+
+# Agent worktrees: full checkouts with their own .git, never part of this tree.
+.claude/worktrees/
