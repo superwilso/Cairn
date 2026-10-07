@@ -39,6 +39,7 @@ use cairn_client_core::client::{Client, CreatedRoom};
 use cairn_client_core::embed::{self, Card};
 use cairn_client_core::history::{Entry as HistoryEntry, History};
 use cairn_client_core::transport::HttpTransport;
+use cairn_client_core::verify;
 use cairn_client_core::{
     accept_welcome, ContactStore, Conversation, ConversationIndex, TimelineEvent,
 };
@@ -130,6 +131,10 @@ struct Open {
     seal: RoomSeal,
     /// Last server sequence number seen, so polling does not re-read the room.
     cursor: u64,
+    /// The safety numbers `/safety` last printed, by credential. `/verify` confirms one of
+    /// *these* — never whatever the leaf holds at the moment the command is typed, which a
+    /// commit arriving in between could have changed.
+    shown: Vec<(Vec<u8>, String)>,
 }
 
 /// Run the client until the user quits.
@@ -593,7 +598,7 @@ impl App {
 
         self.index.record(created.room, &created.seal, convo.group_id())?;
         println!("  room {} created, tier {}", created.room, created.tier_label());
-        self.open = Some(Open { convo, seal: created.seal, cursor: 0 });
+        self.open = Some(Open { convo, seal: created.seal, cursor: 0, shown: Vec::new() });
         Ok(())
     }
 
@@ -655,6 +660,7 @@ impl App {
                     )?,
                     seal,
                     cursor,
+                    shown: Vec::new(),
                 });
                 return Ok(());
             }
@@ -663,7 +669,7 @@ impl App {
         println!("  opened {room} at tier {}", seal.tier().label());
         self.replay_history(room);
         let cursor = self.index.cursor(&room);
-        self.open = Some(Open { convo, seal, cursor });
+        self.open = Some(Open { convo, seal, cursor, shown: Vec::new() });
         // Said on open rather than left to be discovered: someone who redeemed an invite is
         // sitting in a room they cannot read, and the only person who can fix that is
         // whoever opens it next.
@@ -826,6 +832,11 @@ impl App {
             println!("  no MLS group yet");
             return;
         }
+        // The store answers from what it last saw. Showing it the roster first means a key
+        // substituted since then reads as changed, not as the verification it replaced.
+        if let Err(e) = verify::observe_roster(&open.convo, &mut self.contacts) {
+            println!("  ! could not update verification state: {e}");
+        }
         let own = open.convo.own_member().ok();
         for (n, member) in members.iter().enumerate() {
             let you = own.as_ref().is_some_and(|o| o.index == member.index);
@@ -844,7 +855,7 @@ impl App {
     /// a whole roster, and inventing one that looked like it did would be worse than the
     /// tedium of comparing several.
     fn show_safety_numbers(&mut self) {
-        let Some(open) = self.open.as_ref() else {
+        let Some(open) = self.open.as_mut() else {
             println!("  no room open");
             return;
         };
@@ -852,6 +863,10 @@ impl App {
             println!("  no MLS group yet");
             return;
         };
+        if let Err(e) = verify::observe_roster(&open.convo, &mut self.contacts) {
+            println!("  ! could not update verification state: {e}");
+        }
+        open.shown.clear();
 
         println!("  Compare these aloud, in person or on a call the server cannot touch.");
         println!("  They are derived from the keys this group actually uses.\n");
@@ -861,6 +876,7 @@ impl App {
             }
             match open.convo.safety_number_with(member) {
                 Ok(number) => {
+                    open.shown.push((member.identity.clone(), number.as_str().to_string()));
                     println!(
                         "  {n}. {} {}",
                         label(member),
@@ -876,20 +892,30 @@ impl App {
         println!("\n  If they match: /verify <n>. If they do not, stop and ask why.");
     }
 
+    /// Confirm the number `/safety` printed for member `n`.
+    ///
+    /// Goes through `cairn_client_core::verify`, the same rule the desktop uses: the number
+    /// shown is handed back and checked against the leaf's number *now*. This used to mark
+    /// whatever key sat at position `n` when the command ran — and the poll that runs before
+    /// every prompt can land a commit between `/safety` and `/verify`, so the key certified
+    /// could be one the user never compared.
     fn verify(&mut self, n: usize) -> Fallible<()> {
         let Some(open) = self.open.as_ref() else {
             return Err("no room open".into());
         };
         let members = open.convo.members();
         let member = members.get(n).ok_or("no member with that number")?;
+        let Some((_, shown)) = open.shown.iter().find(|(id, _)| *id == member.identity) else {
+            return Err("run /safety and compare the number first".into());
+        };
 
-        // Recording the sighting first means the fingerprint being marked verified is the
-        // one from the roster, never one supplied from elsewhere.
-        self.contacts.observe(member)?;
-        if self.contacts.mark_verified(&member.identity)? {
-            println!("  {} marked verified", label(member));
-        } else {
-            println!("  ! could not record that");
+        match verify::verify(&open.convo, &mut self.contacts, &member.identity, shown) {
+            Ok(()) => println!("  {} marked verified", label(member)),
+            Err(verify::VerifyError::NumberChanged) => {
+                println!("  ! their safety number changed since /safety printed it.");
+                println!("    Run /safety again and compare the new one.");
+            }
+            Err(e) => return Err(e.into()),
         }
         Ok(())
     }

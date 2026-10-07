@@ -21,6 +21,8 @@ let callStarted = 0;
 let elapsedTimer = null;
 let ringingFrom = null;
 let callConfig = null;
+// Whose safety numbers are on screen, so a roster change can redraw them.
+let safetyFor = null;
 
 const show = (el, on) => { el.hidden = !on; };
 const fail = (el, e) => { el.textContent = e ? String(e) : ""; };
@@ -153,6 +155,9 @@ async function selectRoom(room) {
 
     fail($("error"), null);
     stopRinging();
+    // A safety number belongs to one group; leaving it on screen over another room's would
+    // invite comparing the wrong one.
+    closeSafety();
     openRoom = room;
     $("room-id").textContent = short(room);
     $("room-id").title = room;
@@ -204,19 +209,41 @@ async function refreshMembers() {
             li.classList.add("pending");
             li.title = "in the room, but not in the encrypted group — cannot read it";
             waiting.push(m.user);
-        } else if (m.verified) {
-            const tick = document.createElement("span");
-            tick.className = "tick";
-            tick.textContent = "✓";
-            tick.title = "safety number compared";
-            li.append(tick);
         } else {
-            // Unverified is the honest default: nobody is verified until safety numbers
-            // have been compared out of band.
-            li.title = "safety number not compared";
+            // Only someone in the encrypted group has a key to compare.
+            li.classList.add("openable");
+            li.onclick = () => openSafety(m.user);
+
+            if (m.role === "unlisted") {
+                // Rust found them in the group's roster; the instance's member list left
+                // them out. They can read the room, so they are shown — loudly.
+                const flag = document.createElement("span");
+                flag.className = "badge warn";
+                flag.textContent = "unlisted";
+                li.append(flag);
+                li.title = "holds the group's keys, but the instance did not list them";
+            }
+            if (m.key_changed) {
+                const flag = document.createElement("span");
+                flag.className = "badge bad";
+                flag.textContent = "key changed";
+                li.append(flag);
+                li.title = "a key changed since you verified it — compare the new number";
+            } else if (m.verified) {
+                const tick = document.createElement("span");
+                tick.className = "tick";
+                tick.textContent = "✓";
+                tick.title = "safety number compared";
+                li.append(tick);
+            } else if (m.role !== "unlisted") {
+                // Unverified is the honest default: nobody is verified until safety numbers
+                // have been compared out of band.
+                li.title = "safety number not compared — click to compare";
+            }
         }
         list.append(li);
     }
+    if (safetyFor) await openSafety(safetyFor);
 
     show($("waiting"), waiting.length > 0);
     $("waiting-text").textContent =
@@ -230,6 +257,132 @@ $("admit").onclick = async () => {
         await refreshMembers();
     } catch (e) { fail($("error"), e); }
 };
+
+// ---- safety numbers --------------------------------------------------------
+//
+// The number, its state and the decision to accept a comparison all come from Rust
+// (cairn_client_core::verify). This only lays the digits out and hands the exact string it
+// was given back to `mark_verified` — which refuses it if the key changed while the panel
+// was open, so the button can never certify a number nobody looked at.
+
+async function openSafety(user) {
+    safetyFor = user;
+    fail($("safety-error"), null);
+    let devices;
+    try {
+        devices = await invoke("safety_numbers", { user });
+    } catch (e) {
+        renderSafety(user, []);
+        fail($("safety-error"), e);
+        return;
+    }
+    renderSafety(user, devices);
+}
+
+function closeSafety() {
+    safetyFor = null;
+    show($("safety"), false);
+}
+
+function renderSafety(user, devices) {
+    const mine = user === myUser;
+    $("safety-who").textContent = short(user);
+    $("safety-who").title = user;
+    show($("safety-changed"), devices.some((d) => d.state === "ChangedSinceVerified"));
+
+    $("safety-how").textContent = mine
+        ? "These are your other devices in this group. Open this panel on each of them and " +
+          "check the numbers match."
+        // Scoped on purpose. A match proves the keys between these two people were not
+        // swapped; it says nothing about anyone else in the group, and "nobody has swapped a
+        // key in this room" — the first draft of this text — claimed exactly that.
+        : "Compare these digits with " + short(user) + " in person, or on a call this " +
+          "instance does not carry; they should see the same number. If every digit " +
+          "matches, the keys between the two of you have not been swapped. That covers " +
+          "only you and them — everyone else in the group has their own number. If " +
+          "anything differs, do not mark it verified: stop and ask why.";
+
+    const list = $("safety-devices");
+    list.textContent = "";
+    if (devices.length === 0) {
+        const li = document.createElement("li");
+        li.className = "empty";
+        li.textContent = mine
+            ? "No other device of yours is in this group."
+            : "Nothing to compare yet — they have no key in this group.";
+        list.append(li);
+    }
+    for (const d of devices) list.append(deviceRow(d));
+    show($("safety"), true);
+}
+
+const STATE_LABEL = {
+    Verified: ["verified", "ok"],
+    Unverified: ["not verified", ""],
+    ChangedSinceVerified: ["key changed", "bad"],
+};
+
+function deviceRow(d) {
+    const li = document.createElement("li");
+    li.className = "device " + (d.state === "ChangedSinceVerified" ? "changed" : "");
+
+    const head = document.createElement("div");
+    head.className = "device-head";
+    const name = document.createElement("span");
+    name.className = "mono grow";
+    name.textContent = "device " + String(d.device).replace(/^dev_/, "").slice(0, 12);
+    name.title = d.device;
+    const [label, tone] = STATE_LABEL[d.state] || ["unknown", "warn"];
+    const badge = document.createElement("span");
+    badge.className = "badge " + tone;
+    badge.textContent = label;
+    head.append(name, badge);
+
+    // Layout only: twelve groups of five, four to a row, the way people read them aloud.
+    const digits = document.createElement("div");
+    digits.className = "digits";
+    for (const group of String(d.number).split(" ")) {
+        const g = document.createElement("span");
+        g.textContent = group;
+        digits.append(g);
+    }
+
+    li.append(head, digits);
+
+    if (d.state !== "Verified") {
+        const confirm = document.createElement("button");
+        confirm.className = "primary";
+        confirm.textContent = d.state === "ChangedSinceVerified"
+            ? "The new number matches — verify again"
+            : "Mark as verified";
+        confirm.onclick = async () => {
+            fail($("safety-error"), null);
+            confirm.disabled = true;
+            try {
+                const devices = await invoke("mark_verified", {
+                    user: d.user,
+                    device: d.device,
+                    number: d.number,
+                });
+                renderSafety(d.user, devices);
+                await refreshMembers();
+            } catch (e) {
+                // Most likely the key changed while this was on screen. Redraw with the
+                // number as it is now, and keep the reason visible.
+                await openSafety(d.user);
+                fail($("safety-error"), e);
+            }
+        };
+        li.append(confirm);
+    }
+    return li;
+}
+
+$("safety-close").onclick = () => closeSafety();
+$("safety").onclick = (ev) => { if (ev.target === $("safety")) closeSafety(); };
+document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !$("safety").hidden) closeSafety();
+});
 
 $("composer").onsubmit = async (ev) => {
     ev.preventDefault();
@@ -574,6 +727,7 @@ async function tick() {
             for (const who of ev.left) addNotice("left the group: " + short(who));
         } else if (ev.kind === "removed") {
             addNotice("You were removed from this room.");
+            closeSafety();
             if (inCall) await hangUp();
             clearInterval(pollTimer);
             openRoom = null;

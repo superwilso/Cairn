@@ -109,6 +109,13 @@ jobs:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/call.browser.test.js
 
+      - name: The safety-number panel in a browser
+        # The numbers are computed and checked in Rust; this proves the page hands back the
+        # exact string it was given and never hides a "key changed" warning.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/safety.browser.test.js
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

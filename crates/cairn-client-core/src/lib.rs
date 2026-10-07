@@ -27,6 +27,7 @@ pub mod session;
 pub mod statedir;
 pub mod store;
 pub mod transport;
+pub mod verify;
 
 pub use client::{Client, ClientError};
 pub use contacts::{ContactError, ContactRecord, ContactStore};

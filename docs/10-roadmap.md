@@ -306,6 +306,12 @@ Four calls made by the owner, so a session does not re-litigate them:
       wrapped in Tauri, per ADR-008. Group chats, invites, admission, the tier badge, the
       member list, and the transport badge that says *plaintext* over `http://` rather than
       implying a protection that is not there.
+- [x] **Safety numbers in the desktop client**, through the same `cairn_client_core::verify`
+      the CLI now uses: per device, from the roster, with the sticky *key changed* warning.
+      Building it found two faults in what was already there — a substituted key still
+      reported as verified because nothing showed the contact store the roster, and a
+      confirmation that certified whatever key held a position at the moment of the click.
+      See `01-threat-model.md` §4.
 - [x] **Voice, video and screen sharing**, with microphone / camera / output selection.
       A WebRTC **mesh** capped at six: media is DTLS-SRTP directly between participants and
       never reaches the instance, and there is no SFU to deploy. Signalling rides *inside*
