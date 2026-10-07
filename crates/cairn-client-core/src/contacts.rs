@@ -102,8 +102,12 @@ impl ContactStore {
         let key = hex::encode(&member.identity);
         let fingerprint = member.fingerprint();
 
-        match self.contacts.get_mut(&key) {
-            Some(existing) => existing.verification.observe(fingerprint),
+        let changed = match self.contacts.get_mut(&key) {
+            Some(existing) => {
+                let before = existing.verification.clone();
+                existing.verification.observe(fingerprint);
+                existing.verification != before
+            }
             None => {
                 self.contacts.insert(
                     key.clone(),
@@ -112,10 +116,16 @@ impl ContactStore {
                         verification: ContactVerification::new(fingerprint),
                     },
                 );
+                true
             }
-        }
+        };
 
-        self.save()?;
+        // Only a change is written. Frontends now observe the whole roster every time they
+        // ask about verification, and rewriting the file for each unchanged sighting would
+        // be a disk write per member per refresh for nothing.
+        if changed {
+            self.save()?;
+        }
         Ok(self.contacts.get(&key).expect("just inserted or updated"))
     }
 

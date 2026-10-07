@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
 use cairn_client_core::session::{Event, MemberView, MessageView, RoomSummary, Session};
+use cairn_client_core::verify::SafetyView;
 use tauri::State;
 
 /// The one session this window is signed in as.
@@ -126,6 +127,28 @@ fn members(state: State<'_, AppState>) -> CmdResult<Vec<MemberView>> {
     with(&state, |s| s.members())
 }
 
+/// One account's safety numbers in the open room, one per device.
+///
+/// Computed in `client-core` from the group's own roster. The UI displays the string it is
+/// given and hands it back unchanged to `mark_verified`; it never derives one itself.
+#[tauri::command]
+fn safety_numbers(state: State<'_, AppState>, user: String) -> CmdResult<Vec<SafetyView>> {
+    with(&state, |s| s.safety_numbers(&user))
+}
+
+/// Record a comparison. `number` is the one the user was shown: `Session::verify` refuses if
+/// it is no longer the device's number, so a key that changed while the panel was open is
+/// never the one certified.
+#[tauri::command]
+fn mark_verified(
+    state: State<'_, AppState>,
+    user: String,
+    device: String,
+    number: String,
+) -> CmdResult<Vec<SafetyView>> {
+    with(&state, |s| s.verify(&user, &device, &number))
+}
+
 #[tauri::command]
 fn admit_waiting(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
     with(&state, |s| s.admit_waiting())
@@ -202,6 +225,8 @@ fn main() {
             send,
             poll,
             members,
+            safety_numbers,
+            mark_verified,
             admit_waiting,
             create_invite,
             redeem_invite,

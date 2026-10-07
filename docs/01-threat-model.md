@@ -169,9 +169,11 @@ holds.
 polish. They are what makes A4 a bounded adversary rather than an unbounded one, and they
 belong in the same milestone as encryption itself.
 
-**Status.** Safety numbers are implemented, tested, and now **shown to the user** by the
-interactive client (`cairn-cli chat`, `/safety`), with verification state persisted across
-restarts and a loud, sticky warning when a verified contact's key changes.
+**Status.** Safety numbers are implemented, tested, and now **shown to the user** by both
+clients — `cairn-cli chat` (`/safety`, `/verify`) and the desktop client (from the member
+list) — through one shared implementation in `cairn_client_core::verify`, with verification
+state persisted across restarts and a loud, sticky warning when a verified contact's key
+changes.
 
 Two things had to be fixed before that display was worth anything, and both were found by
 attacking the code rather than reading it:
@@ -186,6 +188,18 @@ attacking the code rather than reading it:
 - **Membership changes were invisible.** A commit adding a member was indistinguishable
   from any other handshake, so no client could have warned about one. Roster changes, and
   this device's own removal, are now distinct events the client prints in the timeline.
+
+Two more surfaced when the desktop client gained the same display, again by probing:
+
+- **A substituted key could still read as verified.** The contact store reports the state of
+  the key it last *observed*, and the desktop session never showed it the roster. A contact
+  verified once — the CLI shares the profile directory — and then replaced by a different
+  key under the same credential was reported verified, with a tick. State is now reported
+  only after observing the current roster, so the substitution reads as *key changed*.
+- **Confirming by position could certify an unseen key.** `/verify <n>` marked whatever key
+  held position *n* when the command ran; a commit landing after `/safety` printed the
+  number changed which key that was. Both clients now hand back the number that was shown,
+  and verification is refused if it is no longer the current one.
 
 **A4 is bounded for a user who actually compares.** That is a narrower claim than "A4 is
 bounded", and the gap is deliberate: verification is manual and per-peer, so it protects

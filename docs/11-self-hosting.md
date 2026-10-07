@@ -117,8 +117,14 @@ Then, to talk:
    step. Raw `usr_...` ids still work if you prefer.
 3. They run `/open rom_...` with the room id you were shown.
 4. Both of you run `/safety` and compare the numbers **out of band** — on a call, or in
-   person. If they match, no key substitution happened. If they differ, stop.
-5. `/verify 0` records that you compared them. It persists.
+   person. If they match, no key substitution happened between the two of you. If they
+   differ, stop.
+5. `/verify <n>`, with the member's number from `/safety`, records that you compared them.
+   It persists, and it confirms the number `/safety` printed: if their key changed in
+   between, it refuses and asks you to compare again.
+
+In the desktop client the same comparison is a click: select the person in the member list,
+read the digits to each other, and press **Mark as verified**.
 
 **Usernames now exist**, so step 1 can be `@alice` rather than a uuid — claim one once,
 and it is yours. They resolve by **exact match only**: there is no search or directory, so

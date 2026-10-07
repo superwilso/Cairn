@@ -8,7 +8,7 @@ Tauri. Windows is the first target.
 ```
 ui/index.html       structure, and the inline SVG icon set
 ui/style.css        the whole design, hand-written, no framework
-ui/app.js           the DOM — rooms, timeline, members, call controls
+ui/app.js           the DOM — rooms, timeline, members, safety numbers, call controls
 ui/call.js          WebRTC: peer connections, devices, screen share
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
@@ -89,7 +89,37 @@ CLI hardcoded `is_direct: true, member_ceiling: 2`, so every room was a two-pers
   keys silently.
 
 The member panel shows the distinction rather than flattening it: someone in the room but
-not in the encrypted group is marked, because they cannot read a word of it.
+not in the encrypted group is marked, because they cannot read a word of it. The reverse is
+marked too: someone who holds a leaf in the encrypted group but whom the instance's member
+list leaves out appears as **unlisted** rather than not at all. The list is the instance's to
+write, and a reader of the room must not vanish because it omitted them.
+
+## Safety numbers
+
+Click anyone in the encrypted group to see the safety number for each of their devices —
+twelve groups of five digits, the same number they see on their side. Compare it in person
+or on a call the instance does not carry; if every digit matches, press **Mark as verified**.
+The member list then shows a tick, and only when *every* device of that account has been
+compared.
+
+What the panel does and does not claim:
+
+- **A match covers two people.** It proves the keys between you and that person were not
+  swapped. It says nothing about anyone else in the group, each of whom has their own number.
+- **The number is computed in Rust from the encrypted group's own roster**
+  (`cairn_client_core::verify`), never from a key the instance published. A number built from
+  the instance's directory matches on both ends of an interception — `docs/01-threat-model.md`
+  §4 records the version of this that did exactly that.
+- **The button confirms the number you were shown, not whatever is there when you click.**
+  The page hands the displayed string back and Rust refuses it if the key changed while the
+  panel was open.
+- **A key that changes after you verified it stays flagged** — *key changed* in the member
+  list and a red warning in the panel — until you compare the new number. A reinstall and an
+  interception look identical here, which is exactly why it is not cleared automatically.
+- Unverified is the default, and the honest one.
+
+Verification state lives in the profile's `contacts.json`, shared with `cairn-cli chat` when
+both use the same profile.
 
 ## Calls
 
@@ -132,8 +162,9 @@ target; recorded here so it is a decision rather than a mystery.
 
 ## What it does not do yet
 
-Attachments, link cards, safety-number comparison and disappearing-message controls all
-exist in `client-core` and are not yet surfaced in this UI.
+Attachments, link cards and disappearing-message controls all exist in `client-core` and are
+not yet surfaced in this UI. Safety numbers are compared by reading digits aloud; there is no
+QR code to scan yet.
 
 ## The icon
 

@@ -8,13 +8,14 @@ need a secure messenger today, use Signal.
 
 Specifically, and non-exhaustively:
 
-- **No key transparency, and safety numbers are only in the terminal client.**
-  `cairn-cli chat` shows and compares them (`/safety`, `/verify`) and persists the result,
-  including a sticky warning when a verified contact's keys change. The desktop client
-  displays whether a contact was verified but cannot show or compare the number itself.
-  Until a user compares numbers out of band, the end-to-end encryption holds only against
-  an honest-but-curious server, **not a malicious one**. Key transparency — which makes server equivocation detectable without
-  manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
+- **No key transparency; verification is manual and per person.** Both clients show
+  safety numbers computed from the MLS group's own roster — `cairn-cli chat` with `/safety`
+  and `/verify`, the desktop client from the member list — and persist verification state,
+  with a sticky warning when a verified contact's key changes. That bounds a malicious
+  server **only for the people a user has actually compared numbers with**: a match covers
+  that pair and nobody else in the group, and a user who never compares is still exposed
+  to key substitution. Key transparency — which makes server equivocation detectable
+  without manual comparison — remains unimplemented. See `docs/01-threat-model.md` §4.
 - **No sessions or passwords, and rate limits that bound one actor, not many.** Accounts
   are claimed and invite-gated by default, and adding a device to an existing account
   requires authorization from a device already on it. Registration is limited per address

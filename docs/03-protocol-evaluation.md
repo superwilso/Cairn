@@ -55,6 +55,13 @@ performance measurements. Those are still owed.
   welcome among traffic it cannot read (`is_welcome` distinguishes it). This keeps the
   server's single sequencing point covering handshakes and messages together, which is the
   ordering MLS requires (ADR-002).
+- **A verification state is a claim about a key, and has to be asked about the current
+  one.** The contact store answers from the last key it *observed*, and the desktop session
+  never showed it any: a contact verified once and then replaced by a different key under
+  the same credential was still reported verified. Verifying by position had the mirror
+  fault — a commit landing between showing a number and confirming it certified a key
+  nobody compared. `cairn_client_core::verify` observes the roster before reporting and
+  takes the displayed number back, refusing it if it is no longer current.
 - **Running it found bugs the tests could not.** Two clients against a live server surfaced
   a message truncated at its first space and a replay storm on restart. Every test had sent
   single-word messages and used fresh state, so both passed.
@@ -163,7 +170,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 
 | Gap | Consequence |
 |---|---|
-| No key transparency; safety numbers not surfaced in a UI | The primitive exists and is tested, but nothing displays it and no contact store persists verification state, so in practice E2EE still holds against an honest-but-curious server rather than a malicious one (`01-threat-model.md` §4) |
+| No key transparency; verification is manual | Both clients show roster-derived safety numbers and persist verification state, but nothing checks keys without a human comparing digits — so E2EE holds against a malicious server only for the pairs of people who actually compared (`01-threat-model.md` §4) |
 | Snapshot storage rewrites all state per message | O(messages) per write; fine for a scaffold, not for load |
 | No write-ahead log | A crash between saves loses everything since the last one (writes are atomic, so never a partial file) |
 | Client state stored unencrypted | Group state and key package secrets sit on disk in the clear, 0600 on Unix and default ACLs on Windows. Consistent with `01-threat-model.md` §3.4, but weaker than the platform keystores a shipping client needs |
