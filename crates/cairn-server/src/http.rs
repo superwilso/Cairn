@@ -91,6 +91,8 @@ pub fn router_behind(instance: SharedInstance, proxies: TrustedProxies) -> Route
         .route("/v1/usernames", post(claim_username))
         .route("/v1/usernames/{name}", get(lookup_username))
         .route("/v1/reports", post(submit_report))
+        .route("/v1/gifs", get(gif_capability))
+        .route("/v1/gifs/tunnel/{target}", get(gif_tunnel))
         .with_state(state)
 }
 
@@ -160,6 +162,13 @@ impl IntoResponse for ServerError {
             // 409, not 404. The account exists and may be addable later; a 404 would tell
             // the caller to stop trying, which is the wrong instruction.
             ServerError::NoKeyPackages | ServerError::TooManyKeyPackages => StatusCode::CONFLICT,
+            // 404: there is no relay here to use. A client asks the capability endpoint
+            // first and hides its picker, so this is only seen by one that did not.
+            ServerError::GifsDisabled => StatusCode::NOT_FOUND,
+            ServerError::GifTargetRefused => StatusCode::FORBIDDEN,
+            ServerError::GifUpstreamUnreachable => StatusCode::BAD_GATEWAY,
+            // Startup only, like `InviteTooShort`.
+            ServerError::GifConfigInvalid(_) => StatusCode::BAD_REQUEST,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -572,6 +581,219 @@ async fn lookup_username(
         cairn_proto::Username::parse(&name).map_err(|e| ServerError::BadUsername(e.to_string()))?;
     let user = instance.lookup_username(actor, &name, now_ms())?;
     Ok(Json(ResolvedUser { user: user.to_string() }))
+}
+
+#[derive(Serialize)]
+struct GifCapabilityResponse {
+    /// False when the operator configured no provider. A client hides its picker.
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'static str>,
+    /// An instance-scoped quota token, not a secret from members — see
+    /// `Instance::gif_capability` for why it cannot be otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    /// The only hosts the relay will reach. Sent so a client refuses to *ask* for anything
+    /// else, which turns a hostile provider response into an error rather than a probe.
+    hosts: &'static [&'static str],
+}
+
+/// Whether GIF search is available here, and what a client needs to use it.
+///
+/// Authenticated: the key is not a secret from members, but it is from everyone else.
+async fn gif_capability(
+    State(instance): State<SharedInstance>,
+    headers: HeaderMap,
+) -> Result<Json<GifCapabilityResponse>, ServerError> {
+    let actor = signed_actor(&instance, &headers, "gif_capability", None)?;
+    Ok(Json(match instance.gif_capability(actor) {
+        Some(c) => GifCapabilityResponse {
+            enabled: true,
+            provider: Some(c.provider.label()),
+            api_key: Some(c.api_key),
+            hosts: c.hosts,
+        },
+        None => GifCapabilityResponse { enabled: false, provider: None, api_key: None, hosts: &[] },
+    }))
+}
+
+/// The protocol name a client asks to upgrade to.
+pub const GIF_TUNNEL_PROTOCOL: &str = "cairn-gif-tunnel";
+
+/// The action a tunnel request is signed for. The target is *inside* the signed action, so
+/// a captured authorization cannot be replayed to open a tunnel to a different host —
+/// `request_signing_bytes` length-prefixes the action, so no two targets collide.
+pub fn gif_tunnel_action(target: &str) -> String {
+    format!("gif_tunnel:{target}")
+}
+
+/// Open an opaque byte tunnel from the client to the GIF provider.
+///
+/// ## Why an upgrade rather than `CONNECT`
+///
+/// The Signal shape this copies is a `CONNECT` proxy, and the rules here are the same — an
+/// authenticated tunnel to an allowlisted `host:443`, carrying TLS the instance cannot
+/// read. But a `CONNECT` request targets an *authority*, not a path, and the deployment
+/// this project documents puts Caddy in front of the instance: Caddy's reverse proxy
+/// routes paths and does not forward a bare `CONNECT` to its upstream. An HTTP/1.1
+/// `Upgrade` on an ordinary path travels through any reverse proxy that carries
+/// WebSockets, and leaves exactly the same bytes on the wire afterwards. What the instance
+/// can see is unchanged: the account, the provider host, the time, and the size of what
+/// went each way — never the query, which is inside the client's TLS session.
+///
+/// The upstream is dialled *before* the 101 is sent, so a provider that cannot be reached
+/// is an ordinary 502 rather than a tunnel that opens and immediately dies.
+async fn gif_tunnel(
+    State(instance): State<SharedInstance>,
+    Path(target): Path<String>,
+    mut request: axum::extract::Request,
+) -> Result<Response, ServerError> {
+    let actor = signed_actor(&instance, request.headers(), &gif_tunnel_action(&target), None)?;
+
+    let wants_tunnel = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case(GIF_TUNNEL_PROTOCOL));
+    if !wants_tunnel {
+        return Ok((StatusCode::UPGRADE_REQUIRED, [(axum::http::header::UPGRADE, GIF_TUNNEL_PROTOCOL)])
+            .into_response());
+    }
+
+    // `rsplit_once`, so an IPv6 literal's colons cannot be mistaken for the port separator
+    // — not that one would pass the allowlist, which is the point of not parsing further.
+    let (host, port) = target
+        .rsplit_once(':')
+        .and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?)))
+        .ok_or(ServerError::GifTargetRefused)?;
+    let grant = instance.authorize_gif_tunnel(actor, host, port, now_ms())?;
+    let upstream = dial_gif_upstream(&grant).await?;
+
+    let on_upgrade = hyper::upgrade::on(&mut request);
+    tokio::spawn(async move {
+        let carried = match on_upgrade.await {
+            Ok(upgraded) => {
+                splice_gif_tunnel(hyper_util::rt::TokioIo::new(upgraded), upstream, &grant).await
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "GIF tunnel upgrade did not complete");
+                0
+            }
+        };
+        instance.record_gif_relay_bytes(grant.actor, carried, now_ms());
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(axum::http::header::UPGRADE, GIF_TUNNEL_PROTOCOL)
+        .header(axum::http::header::CONNECTION, "upgrade")
+        .body(axum::body::Body::empty())
+        .expect("a static response is well-formed"))
+}
+
+/// Connect to an approved provider host, refusing any address that points inward.
+async fn dial_gif_upstream(
+    grant: &crate::state::GifTunnelGrant,
+) -> Result<tokio::net::TcpStream, ServerError> {
+    const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let candidates: Vec<SocketAddr> = match grant.upstream_override {
+        Some(addr) => vec![addr],
+        None => {
+            let resolved = tokio::time::timeout(
+                DIAL_TIMEOUT,
+                tokio::net::lookup_host((grant.host.as_str(), grant.port)),
+            )
+            .await
+            .map_err(|_| ServerError::GifUpstreamUnreachable)?
+            .map_err(|_| ServerError::GifUpstreamUnreachable)?;
+            let all: Vec<SocketAddr> = resolved.collect();
+            let public: Vec<SocketAddr> = all
+                .iter()
+                .copied()
+                .filter(|a| crate::state::gif_upstream_permitted(a.ip()))
+                .collect();
+            if public.is_empty() && !all.is_empty() {
+                tracing::warn!(
+                    host = %grant.host,
+                    ?all,
+                    "a GIF provider host resolved only to non-public addresses; refusing. \
+                     Check this instance's DNS"
+                );
+                return Err(ServerError::GifTargetRefused);
+            }
+            public
+        }
+    };
+    for addr in candidates {
+        if let Ok(Ok(stream)) =
+            tokio::time::timeout(DIAL_TIMEOUT, tokio::net::TcpStream::connect(addr)).await
+        {
+            return Ok(stream);
+        }
+    }
+    Err(ServerError::GifUpstreamUnreachable)
+}
+
+/// Copy bytes both ways until either side closes or a limit from the grant is reached.
+/// Returns how many bytes crossed, both directions together, for the account's budget.
+///
+/// Hand-rolled rather than `tokio::io::copy_bidirectional`, which has no byte ceiling, no
+/// idle timeout and no lifetime — the three things that stop a member parking a pipe to
+/// the provider on the operator's connection.
+async fn splice_gif_tunnel<C>(
+    client: C,
+    upstream: tokio::net::TcpStream,
+    grant: &crate::state::GifTunnelGrant,
+) -> u64
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let idle = std::time::Duration::from_millis(grant.idle_timeout_ms);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(grant.max_lifetime_ms);
+    let mut from_client = vec![0u8; 16 * 1024];
+    let mut from_upstream = vec![0u8; 16 * 1024];
+    let mut carried: u64 = 0;
+
+    loop {
+        let remaining = grant.max_bytes.saturating_sub(carried);
+        if remaining == 0 {
+            break;
+        }
+        // Never read more than the grant has left, so the ceiling is exact rather than
+        // overshot by up to a buffer.
+        let cap = usize::try_from(remaining).unwrap_or(usize::MAX).min(from_client.len());
+        tokio::select! {
+            read = client_read.read(&mut from_client[..cap]) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    carried += n as u64;
+                    if upstream_write.write_all(&from_client[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            },
+            read = upstream_read.read(&mut from_upstream[..cap]) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    carried += n as u64;
+                    if client_write.write_all(&from_upstream[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            },
+            () = tokio::time::sleep(idle) => break,
+            () = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    let _ = client_write.shutdown().await;
+    let _ = upstream_write.shutdown().await;
+    carried
 }
 
 fn now_ms() -> i64 {

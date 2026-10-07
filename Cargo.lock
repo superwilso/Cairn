@@ -396,6 +396,8 @@ dependencies = [
  "cairn-crypto",
  "cairn-proto",
  "hex",
+ "hyper",
+ "hyper-util",
  "rand 0.8.7",
  "redb",
  "serde",
