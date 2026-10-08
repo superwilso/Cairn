@@ -20,7 +20,9 @@
 use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
-use cairn_client_core::session::{Event, MemberView, MessageView, RoomSummary, Session};
+use cairn_client_core::session::{
+    Event, MemberView, MessageView, ReactionView, RoomSummary, Session,
+};
 use cairn_client_core::verify::SafetyView;
 use tauri::State;
 
@@ -112,9 +114,35 @@ fn open_room_tier(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.open_room_tier())
 }
 
+/// Returns the message as sent, so the sender sees it at once — polling never delivers a
+/// device's own messages back to it.
 #[tauri::command]
-fn send(state: State<'_, AppState>, text: String) -> CmdResult<()> {
+fn send(state: State<'_, AppState>, text: String) -> CmdResult<MessageView> {
     with(&state, |s| s.send(&text))
+}
+
+/// Reply to a message on screen. The quote recipients see is resolved from their own
+/// transcripts; this sends only which message it answers.
+#[tauri::command]
+fn reply(
+    state: State<'_, AppState>,
+    text: String,
+    sender: String,
+    id: String,
+) -> CmdResult<MessageView> {
+    with(&state, |s| s.reply(&text, &sender, &id))
+}
+
+/// React to a message, or withdraw this user's reaction with `emoji: null`. Returns every
+/// reaction now under it.
+#[tauri::command]
+fn react(
+    state: State<'_, AppState>,
+    sender: String,
+    id: String,
+    emoji: Option<String>,
+) -> CmdResult<Vec<ReactionView>> {
+    with(&state, |s| s.react(&sender, &id, emoji.as_deref()))
 }
 
 #[tauri::command]
@@ -211,6 +239,128 @@ fn call_config() -> CallConfig {
     }
 }
 
+// ---- attachments -----------------------------------------------------------
+//
+// Async, and off the main thread: a 25 MiB upload over a home connection would otherwise
+// freeze the window for as long as it took. Each one takes the session lock only for the
+// short steps that touch MLS state — sealing, and sending the message that carries the key —
+// and runs the transfer itself on a clone of the network client with the lock released, so
+// polling (and with it, an ongoing call) carries on while a file goes up. The sequencing is
+// `Session`'s; see `cairn_client_core::session::attachments`.
+
+/// Run blocking work on Tauri's blocking pool rather than the main thread.
+async fn off_main<T: Send + 'static>(
+    work: impl FnOnce() -> CmdResult<T> + Send + 'static,
+) -> CmdResult<T> {
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())?
+}
+
+fn with_app<T>(
+    app: &tauri::AppHandle,
+    f: impl FnOnce(&mut Session) -> Result<T, cairn_client_core::session::SessionError>,
+) -> CmdResult<T> {
+    use tauri::Manager as _;
+    with(&app.state::<AppState>(), f)
+}
+
+/// The file's claimed name and type, sent in a header beside the raw bytes.
+#[derive(serde::Deserialize)]
+struct FileMeta {
+    name: String,
+    mime: String,
+}
+
+/// Send a file to the open room.
+///
+/// The bytes arrive as the raw IPC body rather than a JSON array of numbers, which would
+/// make a 25 MiB photo roughly 100 MB of JSON. The UI never sees the key this creates.
+#[tauri::command]
+async fn send_file(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<MessageView> {
+    let meta: FileMeta = request
+        .headers()
+        .get("x-cairn-file")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or("the file's name and type are missing")?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        // Found by running the real shell: when the webview cannot reach the `ipc:`
+        // protocol (a CSP without it in `connect-src` is enough) Tauri falls back to
+        // `postMessage` and re-encodes the bytes as a JSON array of numbers. Slow for a big
+        // file, but a file that sends slowly beats one that cannot be sent.
+        tauri::ipc::InvokeBody::Json(value) => <Vec<u8> as serde::Deserialize>::deserialize(value)
+            .map_err(|_| "expected the file's bytes")?,
+    };
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_upload(&meta.name, &meta.mime, &bytes))?;
+        drop(bytes);
+        let uploaded = pending.upload().map_err(|e| e.to_string())?;
+        with_app(&app, |s| s.send_uploaded(uploaded))
+    })
+    .await
+}
+
+/// The plaintext of an attachment in the open room, as raw bytes for the UI to show.
+#[tauri::command]
+async fn fetch_attachment(app: tauri::AppHandle, id: String) -> CmdResult<tauri::ipc::Response> {
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_download(&id))?;
+        let bytes = pending.fetch().map_err(|e| e.to_string())?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+}
+
+/// Save an attachment into the user's Downloads folder, returning where it landed.
+///
+/// Written by Rust rather than by a webview download, because the name is the sender's and
+/// turning it into a path safely is exactly the kind of decision that belongs below this line.
+#[tauri::command]
+async fn save_attachment(app: tauri::AppHandle, id: String) -> CmdResult<String> {
+    use tauri::Manager as _;
+    // Found by running the real shell: a Linux session without xdg-user-dirs configured
+    // has no Downloads directory to report, and every save failed with "unknown path".
+    // `~/Downloads` is what that directory would have been called; `save_into` creates it.
+    let dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().home_dir().map(|home| home.join("Downloads")))
+        .map_err(|e| e.to_string())?;
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_download(&id))?;
+        let path = pending.save_into(&dir).map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
+    })
+    .await
+}
+
+/// The ceiling, so the UI can refuse an oversized file before reading it — and say the
+/// number, which lives in Rust rather than being copied into JavaScript.
+#[derive(serde::Serialize)]
+struct AttachmentLimits {
+    max_bytes: usize,
+}
+
+#[tauri::command]
+fn attachment_limits() -> AttachmentLimits {
+    AttachmentLimits { max_bytes: cairn_client_core::session::MAX_ATTACHMENT_BYTES }
+}
+
+/// The open room's disappearing-message timer, in milliseconds; `None` is off.
+#[tauri::command]
+fn room_timer(state: State<'_, AppState>) -> CmdResult<Option<i64>> {
+    with(&state, |s| s.room_timer())
+}
+
+/// Set it. Returns what the instance holds afterwards, which is what the UI shows.
+#[tauri::command]
+fn set_room_timer(state: State<'_, AppState>, ttl_ms: Option<i64>) -> CmdResult<Option<i64>> {
+    with(&state, |s| s.set_room_timer(ttl_ms))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -235,6 +385,14 @@ fn main() {
             signal,
             call_id,
             call_config,
+            send_file,
+            fetch_attachment,
+            save_attachment,
+            attachment_limits,
+            room_timer,
+            set_room_timer,
+            reply,
+            react,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

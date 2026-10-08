@@ -100,6 +100,17 @@ if command -v node >/dev/null 2>&1; then
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/safety.browser.test.js
+        run "desktop attachments in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/attachments.browser.test.js
+
+        # The messaging UI against a stand-in for the Rust session. The decisions are Rust's
+        # and tested in cargo; this checks the half that is drawn.
+        run "desktop messaging UI in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/messaging.browser.test.js
     fi
 else
     printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'

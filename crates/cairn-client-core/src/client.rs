@@ -75,7 +75,11 @@ fn now_ms() -> i64 {
 }
 
 /// One device's connection to one instance.
-#[derive(Debug)]
+///
+/// `Clone` (when the transport is) so a long transfer can run on a copy without holding
+/// whatever lock guards the original. A copy shares the device's signing key through the
+/// same `Arc`, and can only make the same signed requests the original could.
+#[derive(Debug, Clone)]
 pub struct Client<T: Transport> {
     transport: T,
     session: Arc<Session>,

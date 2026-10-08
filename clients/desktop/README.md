@@ -10,6 +10,8 @@ ui/index.html       structure, and the inline SVG icon set
 ui/style.css        the whole design, hand-written, no framework
 ui/app.js           the DOM — rooms, timeline, members, safety numbers, call controls
 ui/call.js          WebRTC: peer connections, devices, screen share
+ui/timer.js         the disappearing-message control and its notices
+ui/messages.js      drawing a message; replying and reacting to it
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -27,7 +29,7 @@ upward and it belongs in `client-core`.
 
 Deliberate. This is a security product with a small supply chain as a stated value, and a
 chat window does not need a framework and 300 transitive packages to render a list. There is
-no `package.json`, no bundler, and nothing to audit but the three files in `ui/`.
+no `package.json`, no bundler, and nothing to audit but the files in `ui/`.
 
 ## Running it
 
@@ -160,11 +162,70 @@ The fix is a `permission-request` handler reached through `with_webview`, which 
 Linux-only `webkit2gtk` dependency on this crate. Not taken yet because Windows is the
 target; recorded here so it is a decision rather than a mystery.
 
+## Attachments
+
+Photos and files go through the paperclip, a drop onto the conversation, or a paste. The
+bytes cross the IPC boundary as a raw body — not a JSON array, which would make a 25 MiB
+photo about 100 MB of text — and Rust seals, uploads and sends them; `ui/attachments.js`
+never sees a key. A sender's claimed type decides nothing on its own: Rust maps it to
+`image` (PNG, JPEG, GIF, WebP — never SVG), `audio`, or `file`, and only the first two are
+ever turned into something the webview renders. A file is only offered as **Save**, which
+Rust writes into Downloads under a sanitised name without overwriting anything.
+
+Two settings in `tauri.conf.json` exist for this and are easy to undo by accident:
+
+- `connect-src ipc: http://ipc.localhost` — Tauri's own local IPC endpoints, not remote
+  origins. Without them the webview cannot reach the `ipc:` protocol, Tauri silently falls
+  back to `postMessage`, and every binary payload is re-encoded as JSON numbers.
+- `dragDropEnabled: false` — hands file drops to the page. With it on, Tauri consumes them.
+
+Honest limits: one request per file, up to 25 MiB, no resume. The attachment key is stored
+beside the local transcript (same file, same `0600`) so yesterday's photo still opens; the
+instance does not yet delete blobs, so a disappearing timer removes this device's key but
+not the server's ciphertext.
+
+## Disappearing messages
+
+The clock in the room header is the room's timer: off, 5 minutes, 1 hour, 1 day or 1 week.
+Any member may set it (`docs/10-roadmap.md`), and `ui/timer.js` only displays and forwards —
+`Session::set_room_timer` sets it, and `Session::poll` re-reads it every ten seconds, because
+another member may change it from any client and the instance does not push. A change is
+announced in the timeline, unattributed: the instance does not say who made it, and a name
+taken from a message would be that sender's claim.
+
+While the room is open, polling also sweeps the transcript on disk and tells the UI which
+messages to take off the screen. Before this, an expired message was only deleted locally
+the next time the room was opened.
+
+**A new timer reaches back.** The instance measures every stored message against the
+current setting, so turning a timer on deletes messages already older than it — not only
+future ones. The dropdown says so before a value is picked.
+
+## Replies and reactions
+
+Hover a message for **react** and **reply**; double-click it to send a heart; on a touch
+screen, swipe it right to reply. Clicking your own reaction takes it back. One reaction per
+person per message — a new one replaces the old.
+
+Both travel inside the encrypted body and name their target by its franking commitment,
+which every member already holds, so the instance learns nothing it did not already know.
+What they deliberately do **not** carry:
+
+- **A reply carries no quoted text.** Each recipient's client looks the original up in its
+  own transcript (`cairn_client_core::thread`). A sender cannot misquote anyone, and a quote
+  cannot outlive a disappearing message: when the original expires, the quote reads
+  "Original message unavailable" — on screen at once, and on disk.
+- **A reaction names no reactor.** It is attributed to the envelope's sender, so there is
+  nothing to forge. Text is refused as a reaction, by the sender's client and again by every
+  recipient's.
+
+**A reaction cannot be reported.** Franking commits to a message's body, and a reaction's
+body is empty. A report can prove what a reply said, not which message it answered.
+
 ## What it does not do yet
 
-Attachments, link cards and disappearing-message controls all exist in `client-core` and are
-not yet surfaced in this UI. Safety numbers are compared by reading digits aloud; there is no
-QR code to scan yet.
+Link cards exist in `client-core` and are not yet surfaced in this UI. Safety numbers are
+compared by reading digits aloud; there is no QR code to scan yet.
 
 ## The icon
 

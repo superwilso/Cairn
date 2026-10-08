@@ -38,12 +38,20 @@ use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, Tier, U
 use crate::call::{CallSignal, SignalKind};
 use crate::client::{Client, ClientError};
 use crate::contacts::{ContactError, ContactStore};
-use crate::conversation::{Conversation, ConversationError, TimelineEvent};
+use crate::conversation::{Conversation, ConversationError, MessageRef, Reaction, TimelineEvent};
 use crate::history::{Entry as HistoryEntry, History, HistoryError};
 use crate::statedir::{self, StateDirError};
 use crate::store::{ConversationIndex, IndexError};
+use crate::thread::Thread;
+pub use crate::thread::{QuoteView, ReactionView};
 use crate::transport::HttpTransport;
 use crate::verify::{self, SafetyView, VerifyError};
+
+mod attachments;
+pub use attachments::{
+    kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
+    PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -73,6 +81,28 @@ pub enum SessionError {
     NoGroupYet,
     #[error("identity file is unreadable: {0}")]
     Identity(String),
+    #[error(transparent)]
+    Attachment(#[from] cairn_crypto::attachment::AttachmentError),
+    #[error("that file is empty; there is nothing to send")]
+    EmptyAttachment,
+    #[error(
+        "that file is {} — attachments are limited to {}",
+        human_bytes(*size),
+        human_bytes(*max)
+    )]
+    AttachmentTooLarge { size: usize, max: usize },
+    #[error("that attachment is not one this device received in the open room")]
+    UnknownAttachment,
+    #[error("the room changed while the file was uploading, so it was not sent")]
+    RoomChangedDuringUpload,
+    #[error("could not save the attachment: {0}")]
+    Save(std::io::Error),
+    #[error("a disappearing-message timer must be longer than zero")]
+    BadTimer,
+    #[error("that message is not on this device")]
+    UnknownMessage,
+    #[error("a reaction is a single emoji")]
+    BadReaction,
 }
 
 /// A room as a frontend needs to show it.
@@ -124,6 +154,17 @@ pub struct MessageView {
     pub sent_at_ms: i64,
     /// True when replayed from the local transcript rather than just received.
     pub historic: bool,
+    /// The file, photo or voice note this message carried. No key: a frontend fetches the
+    /// bytes by id through [`Session::fetch_attachment`].
+    #[serde(default)]
+    pub attachment: Option<AttachmentView>,
+    /// What a reply or reaction names this message by. `None` for a message recorded
+    /// before replies existed, which can be read but not answered.
+    pub id: Option<String>,
+    /// The message this one answers, resolved from this device's own transcript.
+    pub reply_to: Option<QuoteView>,
+    /// Reactions already under it.
+    pub reactions: Vec<ReactionView>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -138,6 +179,29 @@ pub enum Event {
     },
     /// This device was removed. The frontend must close the room.
     Removed,
+    /// The room's disappearing-message timer changed, as the instance now holds it.
+    ///
+    /// Read back from the instance rather than taken from anybody's announcement, because
+    /// the instance's value is the one that actually deletes things — both its own copy and,
+    /// through [`History::replay`], this device's. Unattributed for the same reason: the
+    /// instance does not say who set it, and a name supplied by a message would be a claim.
+    Timer {
+        ttl_ms: Option<i64>,
+    },
+    /// Messages sent at or before `before_ms` are past the room's timer and have been
+    /// deleted from this device's transcript. A frontend removes them from the screen too;
+    /// a message still displayed after its timer has disappeared from everywhere except the
+    /// place its user is looking.
+    Expired {
+        before_ms: i64,
+    },
+    /// The reactions under one message changed. The whole set, not the change: a frontend
+    /// redraws it rather than keeping its own tally, which is a second copy of a rule.
+    Reactions {
+        sender: String,
+        id: String,
+        reactions: Vec<ReactionView>,
+    },
     /// Call signalling addressed to this device, for the WebRTC layer rather than the
     /// timeline. Already filtered: signals meant for somebody else never reach a frontend.
     Signal {
@@ -150,7 +214,23 @@ struct OpenRoom {
     convo: Conversation,
     seal: RoomSeal,
     cursor: u64,
+    /// The disappearing-message timer as last read from the instance.
+    ttl: Option<i64>,
+    /// When `ttl` was last read, so polling re-reads it on a slower clock than messages.
+    ttl_checked_ms: i64,
+    /// Replies and reactions, folded over the transcript. Rebuilt whenever the timer sweeps
+    /// it, so nothing here outlives the message it describes.
+    thread: Thread,
 }
+
+/// How often an open room re-reads its timer and sweeps its transcript.
+///
+/// Any member may change the timer (`docs/10-roadmap.md`), from any client — the CLI's `/ttl`
+/// announces nothing — so the only reliable way to notice is to ask. Asking on every poll
+/// would double the requests an idle room makes; ten seconds bounds how long a stale timer
+/// can be shown, and how long an expired message can outlive its timer on this disk while
+/// the room stays open.
+const TIMER_RECHECK_MS: i64 = 10_000;
 
 /// One signed-in client.
 pub struct Session {
@@ -175,6 +255,11 @@ pub struct Session {
     /// people to press the button independently and hope their minted ids reconciled —
     /// there was no way to be told a call had started at all.
     ringing: Option<String>,
+    /// Attachments seen in the open room, with the keys that open them. Never handed to a
+    /// frontend; see `attachments.rs` for why a frontend can only fetch what is in here.
+    attachments: attachments::Known,
+    /// How often polling re-reads the open room's timer. [`TIMER_RECHECK_MS`] outside tests.
+    timer_recheck_ms: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,6 +326,8 @@ impl Session {
             call: None,
             negotiated: false,
             ringing: None,
+            attachments: attachments::Known::new(),
+            timer_recheck_ms: TIMER_RECHECK_MS,
         };
         if !claimed {
             session.claim(invite)?;
@@ -321,7 +408,18 @@ impl Session {
         )?;
         self.index.record(created.room, &created.seal, convo.group_id())?;
         let cursor = self.index.cursor(&created.room);
-        self.open = Some(OpenRoom { convo, seal: created.seal, cursor });
+        // A room is created without a timer; nobody has had the chance to set one.
+        self.open = Some(OpenRoom {
+            convo,
+            seal: created.seal,
+            cursor,
+            ttl: None,
+            ttl_checked_ms: now_ms(),
+            thread: Thread::default(),
+        });
+        // Found by a probe: without this, creating a room left the previous room's
+        // attachments fetchable from the new one.
+        self.attachments.clear();
         Ok(created.room.to_string())
     }
 
@@ -389,24 +487,19 @@ impl Session {
         };
 
         let cursor = self.index.cursor(&room);
-        self.open = Some(OpenRoom { convo, seal, cursor });
-        self.replay(room)
-    }
-
-    /// The local transcript for a room, with the room's disappearing timer applied.
-    fn replay(&self, room: RoomId) -> Result<Vec<MessageView>, SessionError> {
         let ttl = self.client.room_ttl(room).ok().flatten();
-        Ok(self
-            .history
-            .replay(room, ttl, now_ms())?
-            .into_iter()
-            .map(|e| MessageView {
-                sender: e.sender.to_string(),
-                body: String::from_utf8_lossy(&e.body).to_string(),
-                sent_at_ms: e.sent_at_ms,
-                historic: true,
-            })
-            .collect())
+        // The local transcript, with the room's disappearing timer applied.
+        let entries = self.history.replay(room, ttl, now_ms())?;
+        // A room's attachments are fetchable only while it is open.
+        attachments::remember(&mut self.attachments, &entries);
+        let thread = Thread::build(&entries);
+        let views = entries
+            .iter()
+            .filter(|e| e.reaction.is_none())
+            .map(|e| view(e, &thread, true))
+            .collect();
+        self.open = Some(OpenRoom { convo, seal, cursor, ttl, ttl_checked_ms: now_ms(), thread });
+        Ok(views)
     }
 
     pub fn open_room_id(&self) -> Option<String> {
@@ -419,27 +512,107 @@ impl Session {
     }
 
     /// Send a message to the open room.
-    pub fn send(&mut self, text: &str) -> Result<(), SessionError> {
+    ///
+    /// Returns it as the timeline should show it. MLS never decrypts a device's own message
+    /// back to it, so polling will not deliver this; without the return value the sender's
+    /// own words appeared only after reopening the room.
+    pub fn send(&mut self, text: &str) -> Result<MessageView, SessionError> {
+        self.send_message(text, None)
+    }
+
+    /// Reply to a message on this device's screen, named by its sender and id.
+    ///
+    /// Refused for a message this device does not hold: the quote shown to everyone else is
+    /// resolved from *their* transcripts, and a reply to nothing would quote nothing.
+    pub fn reply(
+        &mut self,
+        text: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<MessageView, SessionError> {
+        let target = self.known_target(sender, id)?;
+        self.send_message(text, Some(target))
+    }
+
+    fn send_message(
+        &mut self,
+        text: &str,
+        reply_to: Option<MessageRef>,
+    ) -> Result<MessageView, SessionError> {
         let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
         if open.convo.group_id().is_none() {
             return Err(SessionError::NoGroupYet);
         }
         let at = now_ms();
-        let outbound = open.convo.send(text.as_bytes(), at)?;
+        let outbound = match reply_to.clone() {
+            Some(target) => open.convo.send_reply(text.as_bytes(), target, at)?,
+            None => open.convo.send(text.as_bytes(), at)?,
+        };
         self.client.send(open.convo.room(), &outbound.envelope)?;
 
         // Recorded locally because MLS will not decrypt our own message back to us — without
         // this the transcript is every reply and none of the prompts.
-        self.history.append(
-            open.convo.room(),
-            &HistoryEntry {
-                sender: self.client.user(),
-                sent_at_ms: at,
-                body: text.as_bytes().to_vec(),
-                attachment_name: None,
-            },
-        )?;
-        Ok(())
+        let entry = HistoryEntry {
+            sender: self.client.user(),
+            sent_at_ms: at,
+            body: text.as_bytes().to_vec(),
+            attachment_name: None,
+            attachment: None,
+            id: Some(outbound.commitment.to_hex()),
+            reply_to,
+            reaction: None,
+        };
+        self.history.append(open.convo.room(), &entry)?;
+        open.thread.record(&entry);
+        Ok(view(&entry, &open.thread, false))
+    }
+
+    /// React to a message on this device's screen, or withdraw this user's reaction to it
+    /// (`emoji: None`). Returns every reaction now under that message.
+    pub fn react(
+        &mut self,
+        sender: &str,
+        id: &str,
+        emoji: Option<&str>,
+    ) -> Result<Vec<ReactionView>, SessionError> {
+        let target = self.known_target(sender, id)?;
+        let reaction = Reaction { target: target.clone(), emoji: emoji.map(str::to_owned) };
+        // The same rule every recipient applies on receipt, applied first so a refusal is
+        // a sentence here rather than a reaction that silently vanishes everywhere else.
+        if !reaction.is_valid() {
+            return Err(SessionError::BadReaction);
+        }
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let at = now_ms();
+        let outbound = open.convo.send_reaction(reaction.clone(), at)?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+        let entry = HistoryEntry {
+            sender: self.client.user(),
+            sent_at_ms: at,
+            body: Vec::new(),
+            attachment_name: None,
+            attachment: None,
+            id: None,
+            reply_to: None,
+            reaction: Some(reaction),
+        };
+        self.history.append(open.convo.room(), &entry)?;
+        open.thread.record(&entry);
+        Ok(open.thread.reactions(&target))
+    }
+
+    /// Parse a frontend's `(sender, id)` and check this device holds that message.
+    fn known_target(&self, sender: &str, id: &str) -> Result<MessageRef, SessionError> {
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        let sender: UserId = sender.parse().map_err(|_| SessionError::UnknownMessage)?;
+        let target = MessageRef { sender, id: id.to_owned() };
+        if !open.thread.knows(&target) {
+            return Err(SessionError::UnknownMessage);
+        }
+        Ok(target)
     }
 
     /// Fetch and decrypt whatever has arrived since the last poll.
@@ -506,22 +679,34 @@ impl Session {
                         }
                         continue;
                     }
-                    let body = String::from_utf8_lossy(&received.body).to_string();
-                    let _ = self.history.append(
-                        room,
-                        &HistoryEntry {
-                            sender: message.envelope.sender,
-                            sent_at_ms: message.envelope.sent_at_ms,
-                            body: received.body.clone(),
-                            attachment_name: None,
-                        },
-                    );
-                    events.push(Event::Message(MessageView {
-                        sender: message.envelope.sender.to_string(),
-                        body,
+                    // Attributed to the envelope's sender, for a reaction as for a message:
+                    // the payload has no field naming who reacted, so none can be forged.
+                    let attachment = received.attachment.map(|a| *a);
+                    let entry = HistoryEntry {
+                        sender: message.envelope.sender,
                         sent_at_ms: message.envelope.sent_at_ms,
-                        historic: false,
-                    }));
+                        body: received.body,
+                        attachment_name: attachment.as_ref().map(|a| a.name.clone()),
+                        attachment,
+                        id: received.franking.as_ref().map(|f| f.commitment.to_hex()),
+                        reply_to: received.reply_to.map(|r| *r),
+                        reaction: received.reaction.map(|r| *r),
+                    };
+                    let _ = self.history.append(room, &entry);
+                    open.thread.record(&entry);
+                    if let Some(a) = &entry.attachment {
+                        self.attachments.insert(a.blob, a.clone());
+                    }
+                    if let Some(reaction) = &entry.reaction {
+                        let target = &reaction.target;
+                        events.push(Event::Reactions {
+                            sender: target.sender.to_string(),
+                            id: target.id.clone(),
+                            reactions: open.thread.reactions(target),
+                        });
+                    } else {
+                        events.push(Event::Message(view(&entry, &open.thread, false)));
+                    }
                 }
                 Ok(TimelineEvent::Membership { added, removed, .. }) => {
                     events.push(Event::Membership {
@@ -552,9 +737,92 @@ impl Session {
             let _ = verify::observe_roster(&open.convo, &mut self.contacts);
         }
 
+        if let Some(live) = self.recheck_timer(&mut open, &mut events) {
+            // An expired message takes the only in-memory key to its attachment with it.
+            attachments::remember(&mut self.attachments, &live);
+        }
         let _ = self.index.advance(room, open.cursor);
         self.open = Some(open);
         Ok(events)
+    }
+
+    /// The open room's disappearing-message timer, in milliseconds. `None` is off.
+    ///
+    /// As last read from the instance — on opening the room, and every
+    /// [`TIMER_RECHECK_MS`] while polling.
+    pub fn room_timer(&self) -> Result<Option<i64>, SessionError> {
+        Ok(self.open.as_ref().ok_or(SessionError::NoRoomOpen)?.ttl)
+    }
+
+    /// Shorten how often polling re-reads the timer. For tests, which cannot wait out
+    /// [`TIMER_RECHECK_MS`] on every assertion.
+    #[doc(hidden)]
+    pub fn set_timer_recheck_ms(&mut self, ms: i64) {
+        self.timer_recheck_ms = ms;
+    }
+
+    /// Set or clear the open room's disappearing-message timer. Any member may.
+    ///
+    /// Returns the timer the instance reports *afterwards*, not the one asked for: the
+    /// frontend shows what is in force, and the two only differ if something went wrong.
+    ///
+    /// **It reaches back.** The instance measures every stored message against the current
+    /// setting each time the room is read (`Instance::purge_expired`), so turning a timer on
+    /// deletes messages already older than it — not only future ones — and this device does
+    /// the same to its own transcript here, immediately. `docs/10-roadmap.md` records the
+    /// owner's decision as "applies to future messages only"; the instance does not implement
+    /// that, and a client telling its user otherwise would be promising them a history the
+    /// instance is about to delete. The frontend says so before anyone picks a value, and
+    /// `crates/cairn-server/tests/disappearing_session.rs` fails the moment it stops being
+    /// true.
+    pub fn set_room_timer(&mut self, ttl_ms: Option<i64>) -> Result<Option<i64>, SessionError> {
+        // The instance refuses these too. Refusing here as well means the user gets a
+        // sentence rather than a status code.
+        if ttl_ms.is_some_and(|t| t <= 0) {
+            return Err(SessionError::BadTimer);
+        }
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        let room = open.convo.room();
+        self.client.set_room_ttl(room, ttl_ms)?;
+        let confirmed = self.client.room_ttl(room)?;
+        open.ttl = confirmed;
+        // Forces the next poll to sweep, so a frontend learns at once which messages on its
+        // screen the new timer has just ended.
+        open.ttl_checked_ms = i64::MIN;
+        open.thread = Thread::build(&self.history.replay(room, confirmed, now_ms())?);
+        Ok(confirmed)
+    }
+
+    /// Re-read the timer, announce a change, and delete whatever has expired since the last
+    /// sweep. Failures are swallowed: a missed recheck is retried on the next poll, and
+    /// failing the poll over it would drop the messages it had already fetched.
+    fn recheck_timer(
+        &self,
+        open: &mut OpenRoom,
+        events: &mut Vec<Event>,
+    ) -> Option<Vec<HistoryEntry>> {
+        let now = now_ms();
+        if now.saturating_sub(open.ttl_checked_ms) < self.timer_recheck_ms {
+            return None;
+        }
+        let room = open.convo.room();
+        let Ok(current) = self.client.room_ttl(room) else { return None };
+        open.ttl_checked_ms = now;
+        if current != open.ttl {
+            open.ttl = current;
+            events.push(Event::Timer { ttl_ms: current });
+        }
+        if let Some(ttl) = current {
+            // Rewrites the transcript without anything past the timer — deletion, not a
+            // filter on what is shown.
+            let live = self.history.replay(room, Some(ttl), now).ok();
+            if let Some(live) = &live {
+                open.thread = Thread::build(live);
+            }
+            events.push(Event::Expired { before_ms: now.saturating_sub(ttl) });
+            return live;
+        }
+        None
     }
 
     /// Join the call in the open room, announcing arrival to everyone already in it.
@@ -907,6 +1175,33 @@ fn load_or_create_identity(dir: &Path) -> Result<(UserId, DeviceId, bool), Sessi
             Ok((UserId::new(), DeviceId::new(), false))
         }
         Err(e) => Err(SessionError::Identity(e.to_string())),
+    }
+}
+
+/// `12.3 MB`-style sizes for error messages a person reads. Binary units, labelled as such.
+fn human_bytes(n: usize) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if n >= 1024 * 1024 {
+        format!("{:.1} MiB", n as f64 / MIB)
+    } else if n >= 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} bytes")
+    }
+}
+
+/// A transcript entry as a frontend shows it, with its quote and reactions resolved.
+fn view(entry: &HistoryEntry, thread: &Thread, historic: bool) -> MessageView {
+    let own = entry.id.as_ref().map(|id| MessageRef { sender: entry.sender, id: id.clone() });
+    MessageView {
+        sender: entry.sender.to_string(),
+        body: String::from_utf8_lossy(&entry.body).to_string(),
+        sent_at_ms: entry.sent_at_ms,
+        historic,
+        attachment: entry.attachment.as_ref().map(AttachmentView::of),
+        id: entry.id.clone(),
+        reply_to: entry.reply_to.as_ref().map(|r| thread.quote(r)),
+        reactions: own.map(|r| thread.reactions(&r)).unwrap_or_default(),
     }
 }
 

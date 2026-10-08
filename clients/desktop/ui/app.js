@@ -159,9 +159,11 @@ async function selectRoom(room) {
     // invite comparing the wrong one.
     closeSafety();
     openRoom = room;
+    CairnMessages.cancelReply();
     $("room-id").textContent = short(room);
     $("room-id").title = room;
     $("timeline").textContent = "";
+    CairnAttach.reset();
     try {
         const history = await invoke("open_room", { room });
         for (const m of history) addMessage(m);
@@ -178,6 +180,7 @@ async function selectRoom(room) {
             ? "Transport-encrypted. The instance can read this room."
             : "End-to-end encrypted. The instance stores ciphertext it cannot read.";
     } catch (_) {}
+    await CairnTimer.load();
     await refreshRooms();
     await refreshMembers();
     startPolling();
@@ -389,11 +392,73 @@ $("composer").onsubmit = async (ev) => {
     const text = $("text").value;
     if (!text.trim()) return;
     try {
-        await invoke("send", { text });
+        // Rust hands back the message as sent: polling never returns a device's own.
+        addMessage(await CairnMessages.send(text));
         $("text").value = "";
         fail($("error"), null);
     } catch (e) { fail($("error"), e); }
 };
+
+// ---- attachments -----------------------------------------------------------
+
+CairnAttach.bind({
+    invoke,
+    onError: (e) => fail($("error"), e),
+    onNotice: (text) => addNotice(text),
+});
+
+// One at a time, in the order given: a batch dropped together arrives in that order, and a
+// failure says which file it was about.
+async function sendFiles(files) {
+    if (!openRoom) return fail($("error"), "Open a room before sending a file.");
+    for (const file of files) {
+        const pending = addNotice("Sending " + file.name + "…");
+        try {
+            const view = await CairnAttach.send(file);
+            fail($("error"), null);
+            // MLS will not decrypt our own message back to us, so no poll will deliver it.
+            addMessage(view);
+        } catch (e) {
+            fail($("error"), e);
+        } finally {
+            pending.remove();
+        }
+    }
+}
+
+$("attach").onclick = () => $("file-input").click();
+$("file-input").onchange = async () => {
+    const files = [...$("file-input").files];
+    // Cleared before sending, so picking the same file again still fires `change`.
+    $("file-input").value = "";
+    await sendFiles(files);
+};
+
+// `dragDropEnabled: false` in tauri.conf.json hands drops to the page; with it on, Tauri
+// takes them and the page sees nothing.
+const dropZone = document.querySelector("main");
+dropZone.addEventListener("dragover", (ev) => {
+    if (!ev.dataTransfer || ![...ev.dataTransfer.types].includes("Files")) return;
+    ev.preventDefault();
+    dropZone.classList.add("dropping");
+});
+dropZone.addEventListener("dragleave", (ev) => {
+    if (!dropZone.contains(ev.relatedTarget)) dropZone.classList.remove("dropping");
+});
+dropZone.addEventListener("drop", (ev) => {
+    dropZone.classList.remove("dropping");
+    if (!ev.dataTransfer || !ev.dataTransfer.files.length) return;
+    ev.preventDefault();
+    sendFiles([...ev.dataTransfer.files]);
+});
+
+// A pasted screenshot is a file on the clipboard. Pasted text is left to the input.
+$("text").addEventListener("paste", (ev) => {
+    const files = ev.clipboardData ? [...ev.clipboardData.files] : [];
+    if (!files.length) return;
+    ev.preventDefault();
+    sendFiles(files);
+});
 
 // ---- calls -----------------------------------------------------------------
 
@@ -711,6 +776,8 @@ async function tick() {
     let membershipChanged = false;
 
     for (const ev of events) {
+        if (CairnMessages.handle(ev)) continue;
+        if (CairnTimer.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -739,18 +806,9 @@ async function tick() {
 
 // ---- rendering -------------------------------------------------------------
 
+// Drawing a message, and replying and reacting to it, are messages.js's.
 function addMessage(m) {
-    const li = document.createElement("li");
-    li.className = m.historic ? "msg historic" : "msg";
-    const who = document.createElement("span");
-    who.className = "mono who";
-    who.textContent = short(m.sender);
-    who.title = m.sender;
-    const body = document.createElement("span");
-    // textContent, never innerHTML: a message body is attacker-controlled text and this is
-    // the one line standing between that and script execution in the client.
-    body.textContent = m.body;
-    li.append(who, body);
+    const li = CairnMessages.render(m);
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
 }
@@ -761,7 +819,10 @@ function addNotice(text) {
     li.textContent = text;
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
+    return li;
 }
+
+CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

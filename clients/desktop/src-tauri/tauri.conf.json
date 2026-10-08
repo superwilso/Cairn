@@ -13,11 +13,13 @@
         "width": 1000,
         "height": 700,
         "minWidth": 700,
-        "minHeight": 480
+        "minHeight": 480,
+        "dragDropEnabled": false
       }
     ],
+    "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob: mediastream:"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ipc: http://ipc.localhost; media-src 'self' blob: mediastream:"
     }
   },
   "bundle": {

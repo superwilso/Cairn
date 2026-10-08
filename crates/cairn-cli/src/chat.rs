@@ -408,6 +408,12 @@ impl App {
                 sent_at_ms: envelope.sent_at_ms,
                 body: body.to_vec(),
                 attachment_name,
+                // The CLI writes the opened file to disk on receipt rather than keeping the
+                // key to fetch it again, so there is nothing to remember here.
+                attachment: None,
+                id: None,
+                reply_to: None,
+                reaction: None,
             },
         );
     }
@@ -483,6 +489,9 @@ impl App {
             key,
             name: name.clone(),
             size: bytes.len(),
+            // The CLI does not guess types. A recipient shows an untyped file as a download,
+            // which is the safe reading of "unknown".
+            mime: None,
         };
 
         let open = self.open.as_mut().expect("checked above");
@@ -1007,6 +1016,16 @@ impl App {
             }
 
             match open.convo.receive(&message.envelope) {
+                // A reaction has an empty body; printed as a message it would be a blank
+                // line from nobody in particular.
+                Ok(TimelineEvent::Message(received)) if received.reaction.is_some() => {
+                    let emoji = received.reaction.and_then(|r| r.emoji);
+                    println!(
+                        "\n  {} {}",
+                        short(&message.envelope.sender.as_uuid().to_string()),
+                        emoji.map_or("withdrew a reaction".to_owned(), |e| format!("reacted {e}"))
+                    );
+                }
                 Ok(TimelineEvent::Message(received)) => {
                     println!(
                         "\n  [{}] {}: {}",
@@ -1026,6 +1045,10 @@ impl App {
                             sent_at_ms: message.envelope.sent_at_ms,
                             body: received.body.clone(),
                             attachment_name: received.attachment.as_ref().map(|a| a.name.clone()),
+                            attachment: None,
+                            id: None,
+                            reply_to: None,
+                            reaction: None,
                         },
                     );
                     if let Some(attachment) = &received.attachment {
