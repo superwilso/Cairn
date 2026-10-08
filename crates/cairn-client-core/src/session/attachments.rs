@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use cairn_crypto::attachment::AttachmentKey;
 use cairn_proto::{BlobId, RoomId};
 
-use super::{now_ms, MessageView, Session, SessionError};
+use super::{now_ms, view, MessageView, Session, SessionError};
 use crate::client::Client;
 use crate::conversation::Attachment;
 use crate::history::Entry as HistoryEntry;
@@ -327,7 +327,6 @@ impl Session {
             return Err(SessionError::NoGroupYet);
         }
         let attachment = uploaded.attachment;
-        let view = AttachmentView::of(&attachment);
         // The body is the filename: a client that predates attachments — or this one, with
         // the descriptor stripped — still shows *something* sensible.
         let body = attachment.name.clone().into_bytes();
@@ -335,25 +334,21 @@ impl Session {
         let outbound = open.convo.send_with_attachment(&body, attachment.clone(), at)?;
         self.client.send(open.convo.room(), &outbound.envelope)?;
 
-        let room = open.convo.room();
-        self.history.append(
-            room,
-            &HistoryEntry {
-                sender: self.client.user(),
-                sent_at_ms: at,
-                body: body.clone(),
-                attachment_name: Some(attachment.name.clone()),
-                attachment: Some(attachment.clone()),
-            },
-        )?;
-        self.attachments.insert(attachment.blob, attachment);
-        Ok(MessageView {
-            sender: self.client.user().to_string(),
-            body: String::from_utf8_lossy(&body).to_string(),
+        let entry = HistoryEntry {
+            sender: self.client.user(),
             sent_at_ms: at,
-            historic: false,
-            attachment: Some(view),
-        })
+            body,
+            attachment_name: Some(attachment.name.clone()),
+            attachment: Some(attachment.clone()),
+            id: Some(outbound.commitment.to_hex()),
+            reply_to: None,
+            reaction: None,
+        };
+        self.history.append(open.convo.room(), &entry)?;
+        // Into the thread too, so the sender can be replied to or reacted to about it.
+        open.thread.record(&entry);
+        self.attachments.insert(attachment.blob, attachment);
+        Ok(view(&entry, &open.thread, false))
     }
 
     /// Seal, upload and send in one call, holding `&mut self` throughout. For callers that
@@ -393,6 +388,16 @@ impl Session {
 
 /// The open room's known attachments, keyed by blob.
 pub(super) type Known = HashMap<BlobId, Attachment>;
+
+/// Replace what is known with exactly the attachments in `entries` — the open room's live
+/// transcript. Run on open and after every timer sweep, so a key leaves memory when the
+/// message that carried it leaves the disk.
+pub(super) fn remember(known: &mut Known, entries: &[HistoryEntry]) {
+    known.clear();
+    for a in entries.iter().filter_map(|e| e.attachment.as_ref()) {
+        known.insert(a.blob, a.clone());
+    }
+}
 
 #[cfg(test)]
 mod tests {

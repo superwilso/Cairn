@@ -411,6 +411,9 @@ impl App {
                 // The CLI writes the opened file to disk on receipt rather than keeping the
                 // key to fetch it again, so there is nothing to remember here.
                 attachment: None,
+                id: None,
+                reply_to: None,
+                reaction: None,
             },
         );
     }
@@ -1013,6 +1016,16 @@ impl App {
             }
 
             match open.convo.receive(&message.envelope) {
+                // A reaction has an empty body; printed as a message it would be a blank
+                // line from nobody in particular.
+                Ok(TimelineEvent::Message(received)) if received.reaction.is_some() => {
+                    let emoji = received.reaction.and_then(|r| r.emoji);
+                    println!(
+                        "\n  {} {}",
+                        short(&message.envelope.sender.as_uuid().to_string()),
+                        emoji.map_or("withdrew a reaction".to_owned(), |e| format!("reacted {e}"))
+                    );
+                }
                 Ok(TimelineEvent::Message(received)) => {
                     println!(
                         "\n  [{}] {}: {}",
@@ -1033,6 +1046,9 @@ impl App {
                             body: received.body.clone(),
                             attachment_name: received.attachment.as_ref().map(|a| a.name.clone()),
                             attachment: None,
+                            id: None,
+                            reply_to: None,
+                            reaction: None,
                         },
                     );
                     if let Some(attachment) = &received.attachment {

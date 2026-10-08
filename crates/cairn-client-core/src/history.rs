@@ -70,6 +70,19 @@ pub struct Entry {
     /// `default` so a transcript written before attachments existed still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<crate::conversation::Attachment>,
+    /// The message's franking commitment, in hex — what a reply or reaction names it by.
+    /// Absent on entries written before replies existed; those can be read but not answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The message this one answered, unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<crate::conversation::MessageRef>,
+    /// Set when this entry is a reaction rather than a message.
+    ///
+    /// Stored as an entry of its own rather than folded into its target, so the transcript
+    /// stays append-only and the timer deletes a reaction by its own clock, like any message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<crate::conversation::Reaction>,
 }
 
 /// Per-room transcripts under a client's state directory.
@@ -189,6 +202,9 @@ mod tests {
             body: body.as_bytes().to_vec(),
             attachment_name: None,
             attachment: None,
+            id: None,
+            reply_to: None,
+            reaction: None,
         }
     }
 

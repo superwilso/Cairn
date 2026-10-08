@@ -231,7 +231,7 @@ impl Conversation {
         card: Option<crate::embed::Card>,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        self.send_with(plaintext, card, None, None, now_ms)
+        self.send_with(plaintext, Extras { card, ..Extras::default() }, now_ms)
     }
 
     /// Send with an attachment the caller has already sealed and uploaded.
@@ -246,7 +246,11 @@ impl Conversation {
         attachment: Attachment,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        self.send_with(plaintext, None, Some(attachment), None, now_ms)
+        self.send_with(
+            plaintext,
+            Extras { attachment: Some(attachment), ..Extras::default() },
+            now_ms,
+        )
     }
 
     /// Send a call signal. The body is empty: this is not a message anyone reads.
@@ -259,17 +263,45 @@ impl Conversation {
         signal: crate::call::CallSignal,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        self.send_with(b"", None, None, Some(signal), now_ms)
+        self.send_with(b"", Extras { signal: Some(signal), ..Extras::default() }, now_ms)
+    }
+
+    /// Send a message that answers an earlier one.
+    ///
+    /// Carries a *reference* and nothing else — no copy of the text being answered. Each
+    /// recipient looks the quote up in its own transcript, so a sender cannot misquote
+    /// anyone, and a quote cannot keep a disappearing message alive after its timer.
+    pub fn send_reply(
+        &mut self,
+        plaintext: &[u8],
+        reply_to: MessageRef,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(plaintext, Extras { reply_to: Some(reply_to), ..Extras::default() }, now_ms)
+    }
+
+    /// React to a message, or withdraw a reaction (`emoji: None`).
+    ///
+    /// The body is empty, like a signal's, so the franking commitment covers nothing a
+    /// report could use: **a reaction is not reportable**. That is a limitation, recorded
+    /// here rather than discovered; the alternative — franking the emoji as if it were the
+    /// message — would make a reaction indistinguishable from a one-character message to
+    /// any client that predates reactions.
+    pub fn send_reaction(
+        &mut self,
+        reaction: Reaction,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(b"", Extras { reaction: Some(reaction), ..Extras::default() }, now_ms)
     }
 
     fn send_with(
         &mut self,
         plaintext: &[u8],
-        card: Option<crate::embed::Card>,
-        attachment: Option<Attachment>,
-        signal: Option<crate::call::CallSignal>,
+        extras: Extras,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
+        let Extras { card, attachment, signal, reply_to, reaction } = extras;
         let tier = self.seal.tier();
         if !tier.is_e2ee() {
             return Err(ConversationError::NotEncrypted);
@@ -288,6 +320,8 @@ impl Conversation {
             card: card.map(crate::embed::Card::clamp),
             attachment,
             signal,
+            reply_to,
+            reaction,
         };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
@@ -380,6 +414,8 @@ impl Conversation {
                 // A T3 plaintext message carries no attachment: there is no encrypted body
                 // to put the key in, and a key beside the ciphertext protects nothing.
                 attachment: None,
+                reply_to: None,
+                reaction: None,
             })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
@@ -407,6 +443,13 @@ impl Conversation {
                     return Err(ConversationError::CommitmentMismatch);
                 }
 
+                // A reaction that is not one is dropped whole rather than shown as an empty
+                // message: these bytes came from the sender, and a "reaction" carrying a
+                // paragraph is a hostile client using the reaction chip as a billboard.
+                if inner.reaction.as_ref().is_some_and(|r| !r.is_valid()) {
+                    return Ok(TimelineEvent::Nothing);
+                }
+
                 Ok(TimelineEvent::Message(ReceivedMessage {
                     body: inner.body,
                     franking: Some(ReceivedFranking {
@@ -418,6 +461,10 @@ impl Conversation {
                     card: inner.card.map(crate::embed::Card::clamp),
                     attachment: inner.attachment.map(Box::new),
                     signal: inner.signal.map(Box::new),
+                    // A malformed reference makes this an ordinary message, not an error:
+                    // the text is still something its sender said.
+                    reply_to: inner.reply_to.filter(MessageRef::is_valid).map(Box::new),
+                    reaction: inner.reaction.map(Box::new),
                 }))
             }
         }
@@ -496,6 +543,76 @@ struct InnerBody {
     /// `default` so a message from a client that predates calls still decodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signal: Option<crate::call::CallSignal>,
+    /// The message this one answers. A reference only — see [`Conversation::send_reply`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply_to: Option<MessageRef>,
+    /// A reaction to an earlier message. Inside the encrypted body like everything else: who
+    /// reacted to what, with which emoji, is conversation content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reaction: Option<Reaction>,
+}
+
+/// The optional parts of an outgoing message. Bundled so `send_with` does not grow a
+/// positional argument for every feature, which is how two `Option`s get swapped silently.
+#[derive(Default)]
+struct Extras {
+    card: Option<crate::embed::Card>,
+    attachment: Option<Attachment>,
+    signal: Option<crate::call::CallSignal>,
+    reply_to: Option<MessageRef>,
+    reaction: Option<Reaction>,
+}
+
+/// Names one earlier message in a room: who sent it, and its franking commitment.
+///
+/// The commitment is the message's identity because every party already has it — the
+/// sender computed it, each recipient verified it, and the instance stored it beside the
+/// ciphertext — so naming it inside an encrypted body tells the instance nothing new. It is
+/// unique per message (the opening is random), but **only per sender**: anyone holding a
+/// message's opening can send the same body and reproduce its commitment. A reference
+/// therefore always carries the sender, and resolving one must match both.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MessageRef {
+    pub sender: UserId,
+    /// Hex of the target's franking commitment.
+    pub id: String,
+}
+
+impl MessageRef {
+    /// Whether `id` is a well-formed commitment. Checked on receipt: an arbitrary string
+    /// here would be stored, indexed and echoed back by every recipient.
+    /// Lowercase only, so one message has one spelling and a lookup cannot miss it on case.
+    pub fn is_valid(&self) -> bool {
+        decode_commitment(&self.id).is_some_and(|c| c.to_hex() == self.id)
+    }
+}
+
+/// One member's reaction to one message. Each member holds at most one per message; a
+/// later reaction replaces an earlier one, and `emoji: None` withdraws it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub target: MessageRef,
+    pub emoji: Option<String>,
+}
+
+impl Reaction {
+    /// Longest emoji accepted, in scalar values. A family with skin tones is eleven.
+    pub const MAX_CHARS: usize = 16;
+
+    /// Whether this is a reaction rather than a message wearing one's clothes.
+    ///
+    /// Short, no ASCII (which rules out words, not emoji), and no control characters or
+    /// whitespace. Not a full emoji grammar — the point is that a chip under someone's
+    /// message cannot carry text, not that every sequence is a well-formed glyph.
+    pub fn is_valid(&self) -> bool {
+        self.target.is_valid() && self.emoji.as_deref().is_none_or(is_emoji_like)
+    }
+}
+
+fn is_emoji_like(s: &str) -> bool {
+    let n = s.chars().count();
+    (1..=Reaction::MAX_CHARS).contains(&n)
+        && s.chars().all(|c| !c.is_ascii() && !c.is_control() && !c.is_whitespace())
 }
 
 /// What an incoming envelope turned out to be.
@@ -565,6 +682,13 @@ pub struct ReceivedMessage {
     /// without the box every membership event would carry room for one.
     #[allow(clippy::doc_markdown)]
     pub signal: Option<Box<crate::call::CallSignal>>,
+    /// The message this one answers, when it is a reply. Unresolved: the quote is looked up
+    /// in the recipient's own history, never taken from the sender.
+    ///
+    /// Boxed, like the attachment, so membership events do not pay for it.
+    pub reply_to: Option<Box<MessageRef>>,
+    /// A reaction rather than text. Already checked with [`Reaction::is_valid`].
+    pub reaction: Option<Box<Reaction>>,
 }
 
 /// Franking material a recipient retains so a message can be reported later.
@@ -824,6 +948,37 @@ mod tests {
     }
 
     #[test]
+    fn a_reaction_carrying_text_is_dropped_on_receipt() {
+        // A hostile client is not bound by the sender-side check, and a reaction chip that
+        // displayed whatever it was sent would be a place to put words under someone else's
+        // message where they look like part of it.
+        let (mut alice, mut bob) = linked_pair();
+        let target = MessageRef { sender: UserId::new(), id: "ab".repeat(32) };
+        for emoji in ["you are a fraud", "👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍", "👍\n👍", ""]
+        {
+            let reaction = Reaction { target: target.clone(), emoji: Some(emoji.to_owned()) };
+            let sent = alice.send_reaction(reaction, 1_000).unwrap();
+            let got = bob.receive(&sent.envelope).unwrap();
+            assert!(matches!(got, TimelineEvent::Nothing), "{emoji:?} must not arrive as anything");
+        }
+
+        let good = Reaction { target: target.clone(), emoji: Some("❤️".to_owned()) };
+        let sent = alice.send_reaction(good.clone(), 1_000).unwrap();
+        let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
+        assert_eq!(got.reaction.as_deref(), Some(&good));
+    }
+
+    #[test]
+    fn a_malformed_reply_reference_leaves_an_ordinary_message() {
+        let (mut alice, mut bob) = linked_pair();
+        let bad = MessageRef { sender: UserId::new(), id: "AB".repeat(32) };
+        let sent = alice.send_reply(b"still said this", bad, 1_000).unwrap();
+        let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
+        assert_eq!(got.body, b"still said this", "the words survive");
+        assert!(got.reply_to.is_none(), "an uppercase id is not one spelling of a message");
+    }
+
+    #[test]
     fn recipient_rejects_a_commitment_that_does_not_open_to_the_message() {
         // Without this check a sender could have the server tag one commitment while
         // showing the recipient different text, leaving the recipient unable to prove
@@ -969,6 +1124,8 @@ mod attachment_tests {
             card: None,
             attachment: Some(attachment),
             signal: None,
+            reply_to: None,
+            reaction: None,
         };
 
         let encoded = serde_json::to_vec(&inner).unwrap();

@@ -44,6 +44,15 @@
     <symbol id="i-clip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.3 3.3 0 0 1 4.7 4.7l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/>
     </symbol>
+    <symbol id="i-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="13.5" r="7.5"/><path d="M12 13.5V9.5M10 2.5h4M18.5 6.5l1.5-1.5"/>
+    </symbol>
+    <symbol id="i-react" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="12" r="8.5"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9.3 9.8h.01M14.7 9.8h.01"/>
+    </symbol>
+    <symbol id="i-reply" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M9.5 6.5 4 12l5.5 5.5M4.5 12H14a6 6 0 0 1 6 6v.5"/>
+    </symbol>
     <symbol id="i-call" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <path d="M4.5 4.5h3l1.5 4-2 1.5a12 12 0 0 0 5.5 5.5l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A15.5 15.5 0 0 1 2.5 6.7 2 2 0 0 1 4.5 4.5Z"/>
     </symbol>
@@ -93,6 +102,12 @@
     <header class="topbar">
       <span id="room-id" class="mono grow"></span>
       <span id="room-tier" class="badge"></span>
+      <!-- Disappearing messages. Any member may set it; timer.js says what it does to
+           messages already sent, because the answer is not "nothing". -->
+      <label class="timer" title="Disappearing messages">
+        <svg width="14" height="14"><use href="#i-timer"/></svg>
+        <select id="room-timer" aria-label="Disappearing messages"></select>
+      </label>
       <button id="invite" class="ghost">Invite</button>
       <button id="start-voice" class="icon" title="Voice call">
         <svg width="15" height="15"><use href="#i-call"/></svg> Voice
@@ -148,6 +163,17 @@
 
     <ul id="timeline"></ul>
 
+    <!-- Shown while a reply is being written. The text here is a preview from this screen;
+         what recipients see quoted is resolved by Rust from their own transcripts. -->
+    <div id="reply-bar" hidden>
+      <svg width="15" height="15"><use href="#i-reply"/></svg>
+      <div class="reply-body">
+        <span class="reply-label">Replying to <span class="reply-who mono"></span></span>
+        <span class="reply-text"></span>
+      </div>
+      <button id="reply-cancel" type="button" class="ghost" title="Cancel reply (Esc)" aria-label="Cancel reply">&times;</button>
+    </div>
+
     <form id="composer">
       <button id="attach" type="button" class="icon" title="Attach a photo or file">
         <svg width="15" height="15"><use href="#i-clip"/></svg>
@@ -202,6 +228,8 @@
 
 <script src="call.js"></script>
 <script src="attachments.js"></script>
+<script src="timer.js"></script>
+<script src="messages.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -159,6 +159,7 @@ async function selectRoom(room) {
     // invite comparing the wrong one.
     closeSafety();
     openRoom = room;
+    CairnMessages.cancelReply();
     $("room-id").textContent = short(room);
     $("room-id").title = room;
     $("timeline").textContent = "";
@@ -179,6 +180,7 @@ async function selectRoom(room) {
             ? "Transport-encrypted. The instance can read this room."
             : "End-to-end encrypted. The instance stores ciphertext it cannot read.";
     } catch (_) {}
+    await CairnTimer.load();
     await refreshRooms();
     await refreshMembers();
     startPolling();
@@ -390,7 +392,8 @@ $("composer").onsubmit = async (ev) => {
     const text = $("text").value;
     if (!text.trim()) return;
     try {
-        await invoke("send", { text });
+        // Rust hands back the message as sent: polling never returns a device's own.
+        addMessage(await CairnMessages.send(text));
         $("text").value = "";
         fail($("error"), null);
     } catch (e) { fail($("error"), e); }
@@ -773,6 +776,8 @@ async function tick() {
     let membershipChanged = false;
 
     for (const ev of events) {
+        if (CairnMessages.handle(ev)) continue;
+        if (CairnTimer.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -801,25 +806,9 @@ async function tick() {
 
 // ---- rendering -------------------------------------------------------------
 
+// Drawing a message, and replying and reacting to it, are messages.js's.
 function addMessage(m) {
-    const li = document.createElement("li");
-    li.className = (m.historic ? "msg historic" : "msg") + (m.attachment ? " with-attachment" : "");
-    const who = document.createElement("span");
-    who.className = "mono who";
-    who.textContent = short(m.sender);
-    who.title = m.sender;
-    let body;
-    if (m.attachment) {
-        // The body of an attachment message is its filename, for clients that cannot show
-        // the attachment; the attachment's own caption already says it.
-        body = CairnAttach.render(m.attachment);
-    } else {
-        body = document.createElement("span");
-        // textContent, never innerHTML: a message body is attacker-controlled text and this
-        // is the one line standing between that and script execution in the client.
-        body.textContent = m.body;
-    }
-    li.append(who, body);
+    const li = CairnMessages.render(m);
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
 }
@@ -832,6 +821,8 @@ function addNotice(text) {
     li.scrollIntoView({ block: "end" });
     return li;
 }
+
+CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();
