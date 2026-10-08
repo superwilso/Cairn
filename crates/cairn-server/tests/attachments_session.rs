@@ -34,7 +34,9 @@ fn start() -> Server {
     let router = cairn_server::http::router(Arc::clone(&instance));
     runtime.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
     Server { addr, instance, _runtime: runtime }
 }
@@ -347,4 +349,54 @@ fn saving_writes_under_a_safe_name_and_never_overwrites() {
     assert_eq!(second, downloads.join("escape (1).txt"), "a second save must not overwrite");
     assert_eq!(std::fs::read(&first).unwrap(), b"contents");
     assert!(!downloads.parent().unwrap().join("escape.txt").exists());
+}
+
+#[test]
+fn an_expired_attachment_cannot_be_fetched_while_its_room_stays_open() {
+    // Probe, written when attachments and the in-room timer sweep were merged: the sweep
+    // took the message off the disk, but the session's in-memory key map is filled on
+    // open and receipt, not from the transcript. Without pruning it on each sweep, a photo
+    // whose message had expired still opened until the room was closed.
+    let server = start();
+    let (mut alice, _bob, _room, _) = two_in_a_group(&server, "expiry");
+    alice.set_room_timer(Some(1_500)).unwrap();
+    alice.set_timer_recheck_ms(0);
+    let id = alice.send_file("a.png", "image/png", &photo()).unwrap().attachment.unwrap().id;
+    assert!(alice.fetch_attachment(&id).is_ok());
+
+    std::thread::sleep(std::time::Duration::from_millis(1_700));
+    let events = alice.poll().unwrap();
+    assert!(events.iter().any(|e| matches!(e, Event::Expired { .. })));
+    assert!(
+        matches!(alice.fetch_attachment(&id), Err(SessionError::UnknownAttachment)),
+        "the key left with the message"
+    );
+}
+
+#[test]
+fn a_photo_can_be_answered_like_any_message() {
+    let server = start();
+    let (mut alice, mut bob, _room, _) = two_in_a_group(&server, "answer");
+    let sent = alice.send_file("a.png", "image/png", &photo()).unwrap();
+    let id = sent.id.clone().expect("a sent photo has an id to be answered by");
+
+    let mut arrived = None;
+    for _ in 0..10 {
+        for event in bob.poll().unwrap() {
+            if let Event::Message(m) = event {
+                if m.attachment.is_some() {
+                    arrived = Some(m);
+                }
+            }
+        }
+        if arrived.is_some() {
+            break;
+        }
+    }
+    let arrived = arrived.expect("the photo arrived");
+    assert_eq!(arrived.id.as_deref(), Some(id.as_str()), "both sides name it the same way");
+    let reactions = bob.react(&arrived.sender, &id, Some("\u{2764}\u{fe0f}")).unwrap();
+    assert_eq!(reactions.len(), 1);
+    let reply = bob.reply("nice", &arrived.sender, &id).unwrap();
+    assert!(reply.reply_to.is_some());
 }

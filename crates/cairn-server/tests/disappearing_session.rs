@@ -31,7 +31,9 @@ fn start() -> Server {
     let router = cairn_server::http::router(Arc::clone(&instance));
     runtime.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .unwrap();
     });
     Server { addr, instance, _runtime: runtime }
 }
