@@ -79,6 +79,16 @@ impl<'a> RequestBody<'a> {
     }
 }
 
+/// The most a client will read from one response.
+///
+/// **Found by probing, not reading.** `ureq` caps a response body at 10 MiB unless told
+/// otherwise, and the instance stores attachments up to 25 MiB. Every attachment between the
+/// two uploaded cleanly and then failed to download for every recipient — reported as a
+/// transport error on their side, long after the sender had watched it go. A bound is still
+/// kept, because the instance is semi-trusted and an unbounded read is a way for it to
+/// exhaust this device's memory; it sits above the largest blob with room for headers.
+pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Moves bytes to an instance and back. Synchronous, matching the rest of the client.
 ///
 /// Sync on purpose: `mls-rs` is sync in this build, so no async runtime has to be pumped
@@ -107,7 +117,7 @@ mod http {
     /// origin is a plaintext connection — every guarantee in `docs/01-threat-model.md` §2
     /// against A1 and A2 comes from the transport, not from MLS. MLS still hides content,
     /// but an active attacker sees and can tamper with everything around it.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct HttpTransport {
         base: String,
         agent: ureq::Agent,
@@ -188,8 +198,12 @@ mod http {
             };
 
             let status = response.status().as_u16();
-            let body =
-                response.body_mut().read_to_vec().map_err(|e| TransportError::Io(e.to_string()))?;
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(super::MAX_RESPONSE_BYTES)
+                .read_to_vec()
+                .map_err(|e| TransportError::Io(e.to_string()))?;
             Ok(Response { status, body })
         }
     }

@@ -462,6 +462,15 @@ pub struct Attachment {
     pub name: String,
     /// Plaintext length, for a progress indicator before the bytes arrive.
     pub size: usize,
+    /// The sender's claimed media type, e.g. `image/png` or `audio/webm`.
+    ///
+    /// **Also chosen by the sender**, and a claim about bytes nobody has checked. A client
+    /// uses it to pick a presentation — inline image, audio player, download chip — and
+    /// must decide which claims it is willing to act on; see
+    /// `crate::session::AttachmentView`. `default` so a descriptor from a client that
+    /// predates it (the CLI's `/send`) still decodes, as an untyped file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
 }
 
 /// What actually gets encrypted: the message and its franking opening.
@@ -921,6 +930,7 @@ mod attachment_tests {
             key,
             name: "notes.txt".into(),
             size: plaintext.len(),
+            mime: Some("text/plain".into()),
         };
         (attachment, plaintext, sealed)
     }

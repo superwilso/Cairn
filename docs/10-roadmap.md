@@ -131,13 +131,15 @@ metadata, and these would broadcast it continuously rather than per message.
 
 [ADR-007](adr/007-server-storage.md) came first and is **done**, so the dependency that
 blocked most of this list is gone: media, voice notes and history sit behind attachments,
-and attachments sat behind the storage rewrite. **Attachments are now half-built**: the server side landed — ciphertext blobs stored against
-a room, membership checked on upload and on fetch — and the encryption alongside it
-(`cairn_crypto::attachment`). The key now travels inside the
-encrypted body (`Conversation::send_with_attachment`), with a test asserting it never
-appears in the envelope the server sees. What remains is transport: `Transport::send` takes
-a `&str` body, so uploading bytes needs that seam widened — and a file picker in a client
-that has no UI yet.
+and attachments sat behind the storage rewrite. **Photos and files now work end to end in
+the desktop client**: ciphertext blobs stored against a room, membership checked on upload
+and on fetch, the per-file key inside the encrypted body
+(`Conversation::send_with_attachment`, with a test asserting it never appears in the
+envelope the server sees), and `Session`'s upload/download path behind a picker, drag and
+drop, and paste. Images are shown inline only for raster types Rust recognises; everything
+else is offered as a save into Downloads under a sanitised name. What does not exist yet:
+chunked or resumable transfer (one request, up to 25 MiB), and deletion of blobs on the
+instance — a disappearing timer removes this device's key, not the server's ciphertext.
 Usernames and disappearing messages remain the two items that can proceed in parallel,
 since neither needs attachments.
 
@@ -432,7 +434,8 @@ Only after M5. Native clients per ADR-006, mobile, communities at scale, authent
 embeds, voice. The feature scorecard in `08-feature-parity.md` is the target.
 
 - [ ] **Attachments.** Encrypted blob storage, chunked and resumable upload/download, a
-      per-attachment key carried inside the encrypted message. **A prerequisite, not a
+      per-attachment key carried inside the encrypted message. *Single-request transfer of
+      up to 25 MiB ships (see Sequencing above); chunked and resumable does not.* **A prerequisite, not a
       nice-to-have**: sending a photo or video needs it, and so does any embed that
       re-hosts media. Nothing in the envelope today can carry a file — `EnvelopePayload`
       has no attachment variant — and the server's snapshot storage rewrites all state per
