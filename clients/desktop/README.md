@@ -12,6 +12,7 @@ ui/app.js           the DOM — rooms, timeline, members, safety numbers, call c
 ui/call.js          WebRTC: peer connections, devices, screen share
 ui/timer.js         the disappearing-message control and its notices
 ui/messages.js      drawing a message; replying and reacting to it
+ui/profile.js       avatars, names, the profile card and editor (+ profile.css)
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -95,6 +96,16 @@ not in the encrypted group is marked, because they cannot read a word of it. The
 marked too: someone who holds a leaf in the encrypted group but whom the instance's member
 list leaves out appears as **unlisted** rather than not at all. The list is the instance's to
 write, and a reader of the room must not vanish because it omitted them.
+
+## Profiles
+
+Click your name, top left, to set a display name, pronouns, about me, avatar, banner,
+colours, a status and a nickname for the open room. They are sent **encrypted, into each room**,
+the next time that room is open — the instance never sees them
+([ADR-010](../../docs/adr/010-encrypted-profiles.md)). Click a member's avatar, or a message's
+author, for their card. A name that looks like another member's is shown with part of the
+id beside it, and the card always shows the full id: a name is a label, the id and the safety
+number are who someone is.
 
 ## Safety numbers
 

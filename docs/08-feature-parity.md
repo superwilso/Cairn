@@ -44,6 +44,7 @@ Discord is the benchmark; nobody else is close.
 | Screen share | ✅ | ⚠️ in call | ⚠️ in call | ❌ | ✅ | 🎯 v2 |
 | Stage / broadcast | ✅ | ❌ | ❌ | ⚠️ Live | ✅ | 🎯 v3 |
 | Custom emoji / stickers | ✅ | ⚠️ stickers | ⚠️ stickers | ⚠️ | ✅ | 🎯 v1 |
+| Profiles (bio, banner, status, nicknames) | ✅ server-side | ⚠️ name + avatar, encrypted | ⚠️ server-side | ✅ server-side | ✅ server-side | ✅ **end to end**, per room |
 | Bots & app platform | ✅ | ❌ | ⚠️ Business API | ❌ | ✅ | 🎯 v2 |
 | Server discovery | ✅ | ❌ | ❌ | ❌ | ✅ | 🎯 v2 |
 | Large public groups | ✅ | ⚠️ 1,000 | ⚠️ ~1,000 | ❌ | ✅ 200,000 | 🎯 T3 |
