@@ -48,6 +48,7 @@ use crate::transport::HttpTransport;
 use crate::verify::{self, SafetyView, VerifyError};
 
 mod attachments;
+mod gifs;
 pub use attachments::{
     kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
     PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
@@ -73,6 +74,8 @@ pub enum SessionError {
     Shape(#[from] cairn_proto::ShapeError),
     #[error(transparent)]
     Verify(#[from] VerifyError),
+    #[error(transparent)]
+    Gif(#[from] crate::gifs::GifError),
     #[error("not a valid id: {0}")]
     BadId(String),
     #[error("no room is open")]
@@ -260,6 +263,8 @@ pub struct Session {
     attachments: attachments::Known,
     /// How often polling re-reads the open room's timer. [`TIMER_RECHECK_MS`] outside tests.
     timer_recheck_ms: i64,
+    /// GIF search through the instance's relay, made on first use. See `crate::gifs`.
+    gifs: Option<Arc<crate::gifs::Gifs>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -328,6 +333,7 @@ impl Session {
             ringing: None,
             attachments: attachments::Known::new(),
             timer_recheck_ms: TIMER_RECHECK_MS,
+            gifs: None,
         };
         if !claimed {
             session.claim(invite)?;

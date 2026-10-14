@@ -130,6 +130,34 @@ struct UploadedBlobResponse {
 }
 
 #[derive(Deserialize)]
+struct GifCapabilityResponse {
+    providers: Vec<GifProviderGrant>,
+}
+
+/// One GIF provider an instance relays, as it described it.
+///
+/// The key is the operator's, shared with every member by design — the client builds the
+/// provider request inside its own TLS session, so it must hold the key. See
+/// `docs/14-gifs.md` §3.
+#[derive(Clone, Deserialize)]
+pub struct GifProviderGrant {
+    pub provider: String,
+    pub api_key: String,
+    /// The only hosts the relay will reach for this provider.
+    pub hosts: Vec<String>,
+}
+
+impl std::fmt::Debug for GifProviderGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GifProviderGrant")
+            .field("provider", &self.provider)
+            .field("api_key", &"<redacted>")
+            .field("hosts", &self.hosts)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 struct CreatedRoomResponse {
     room: RoomId,
     tier: String,
@@ -399,6 +427,31 @@ impl<T: Transport> Client<T> {
             None,
         )?;
         Ok(response.body)
+    }
+
+    /// Which GIF providers this instance relays, with the key and hosts for each. Empty when
+    /// the operator configured none.
+    pub fn gif_capability(&self) -> Result<Vec<GifProviderGrant>, ClientError> {
+        let response = self.call("GET", "/v1/gifs", &self.auth("gif_capability", None)?, None)?;
+        let parsed: GifCapabilityResponse = serde_json::from_slice(&response.body)?;
+        Ok(parsed.providers)
+    }
+
+    /// The path and signed headers that open a GIF relay tunnel to `host:443`.
+    ///
+    /// The tunnel itself is not an HTTP exchange the [`Transport`] can make — after the
+    /// upgrade the connection carries the client's own TLS to the provider — so the caller
+    /// sends these on a socket of its own. The signature covers the target, so these headers
+    /// open a tunnel to `host` and nowhere else; that is what keeps this from being the way
+    /// to obtain a signature for an arbitrary action that `auth` is private to
+    /// prevent.
+    pub fn gif_tunnel_request(
+        &self,
+        host: &str,
+    ) -> Result<(String, Vec<(&'static str, String)>), ClientError> {
+        let target = format!("{host}:443");
+        let headers = self.auth(&format!("gif_tunnel:{target}"), None)?;
+        Ok((format!("/v1/gifs/tunnel/{target}"), headers))
     }
 
     /// Claim this client's user id, registering its device as the account's first.

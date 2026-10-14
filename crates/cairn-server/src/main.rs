@@ -12,7 +12,7 @@
 
 #![forbid(unsafe_code)]
 
-use cairn_server::{address, backup, http, state, storage};
+use cairn_server::{address, backup, gif_relay, http, state, storage};
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -112,6 +112,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(token, "invite created");
         }
     }
+    // GIF providers. Each key is optional and they are independent: with neither set the
+    // picker says GIF search is not configured here (`docs/14-gifs.md` §5). An empty
+    // variable counts as unset, so a compose file can carry the line commented or blank.
+    let mut gifs = gif_relay::GifRelayConfig::new();
+    for provider in gif_relay::GifProvider::ALL {
+        match std::env::var(provider.env_var()) {
+            Ok(key) if !key.trim().is_empty() => gifs = gifs.with_provider(provider, &key)?,
+            _ => {}
+        }
+    }
+    if gifs.is_empty() {
+        tracing::info!("no GIF provider configured: the GIF picker will say so");
+    } else {
+        tracing::info!(providers = ?gifs.providers(), "relaying GIF search");
+    }
+    instance.set_gif_relay(Some(gifs));
+
     // Read before anything is served: a proxy list that half-parsed would quietly trust
     // the wrong hosts, so a typo stops the instance instead.
     let proxies = match std::env::var("CAIRN_TRUSTED_PROXIES") {
