@@ -21,8 +21,9 @@ use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
 use cairn_client_core::gifs::{GifProviderView, GifView};
+use cairn_client_core::custom::Kind as CustomKind;
 use cairn_client_core::session::{
-    Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
+    CustomLimits, CustomSetView, Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
     ProfileView, ReactionView, RoomSummary, Session,
 };
 use cairn_client_core::verify::SafetyView;
@@ -541,6 +542,86 @@ async fn fetch_profile_image(
     .await
 }
 
+// ---- custom emoji, stickers, soundboard -------------------------------------
+//
+// The set, who may change it, and every fetch are `cairn_client_core::session::custom`. The
+// UI gets a view with ids and asks for bytes by id; `custom_asset` reads this device's cache
+// and never the network, which is the property the whole design exists for.
+
+#[tauri::command]
+fn custom_set(state: State<'_, AppState>) -> CmdResult<CustomSetView> {
+    with(&state, |s| s.custom_set())
+}
+
+#[tauri::command]
+fn custom_limits() -> CustomLimits {
+    cairn_client_core::session::custom_limits()
+}
+
+/// Download every asset of the open room's set this device lacks — all of them, at once,
+/// off the main thread and with the session unlocked. Returns how many were cached.
+#[tauri::command]
+async fn custom_sync(app: tauri::AppHandle) -> CmdResult<usize> {
+    off_main(move || {
+        let sync = with_app(&app, |s| s.prepare_custom_sync())?;
+        Ok(sync.run())
+    })
+    .await
+}
+
+/// One item's bytes, from the local cache only.
+#[tauri::command]
+fn custom_asset(state: State<'_, AppState>, id: String) -> CmdResult<tauri::ipc::Response> {
+    with(&state, |s| s.custom_asset(&id)).map(tauri::ipc::Response::new)
+}
+
+#[derive(serde::Deserialize)]
+struct CustomMeta {
+    kind: CustomKind,
+    name: String,
+}
+
+/// Add an emoji, sticker or sound. Raw bytes as the IPC body, kind and name in a header —
+/// the shape of `send_file`. The type is sniffed from the bytes in Rust, not taken from here.
+#[tauri::command]
+async fn custom_add(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<CustomSetView> {
+    let meta: CustomMeta = request
+        .headers()
+        .get("x-cairn-custom")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or("the item's kind and name are missing")?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(value) => <Vec<u8> as serde::Deserialize>::deserialize(value)
+            .map_err(|_| "expected the file's bytes")?,
+    };
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_custom_upload(meta.kind, &meta.name, &bytes))?;
+        drop(bytes);
+        let uploaded = pending.upload().map_err(|e| e.to_string())?;
+        with_app(&app, |s| s.commit_custom(uploaded))
+    })
+    .await
+}
+
+#[tauri::command]
+fn custom_remove(
+    state: State<'_, AppState>,
+    kind: CustomKind,
+    name: String,
+) -> CmdResult<CustomSetView> {
+    with(&state, |s| s.remove_custom(kind, &name))
+}
+
+#[tauri::command]
+fn send_sticker(state: State<'_, AppState>, name: String) -> CmdResult<MessageView> {
+    with(&state, |s| s.send_sticker(&name))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -589,6 +670,13 @@ fn main() {
             set_link_previews,
             instagram_proxy_disclosure,
             open_link,
+            custom_set,
+            custom_limits,
+            custom_sync,
+            custom_asset,
+            custom_add,
+            custom_remove,
+            send_sticker,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");
