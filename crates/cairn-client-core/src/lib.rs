@@ -20,6 +20,7 @@ pub mod call;
 pub mod client;
 pub mod contacts;
 pub mod conversation;
+pub mod custom;
 pub mod embed;
 #[cfg(feature = "http")]
 pub mod gifs;

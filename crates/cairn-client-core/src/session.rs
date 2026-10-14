@@ -53,6 +53,11 @@ pub use attachments::{
     kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
     PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
 };
+mod custom;
+pub use custom::{
+    custom_limits, CustomItemView, CustomLimits, CustomSetView, CustomSync, PendingCustomUpload,
+    UploadedCustom,
+};
 mod profiles;
 pub use crate::profile::{ImageSlot, ImageView, ProfileView, StatusView};
 pub use profiles::{profile_limits, PendingProfileImage, ProfileEdit, ProfileLimits};
@@ -122,6 +127,12 @@ pub enum SessionError {
     RoomChanged,
     #[error("link preview settings could not be saved: {0}")]
     Preferences(String),
+    #[error(transparent)]
+    Custom(#[from] crate::custom::CustomError),
+    #[error(transparent)]
+    CustomStore(#[from] crate::custom::CustomStoreError),
+    #[error("that emoji, sticker or sound is not in this room's set on this device")]
+    UnknownCustomAsset,
 }
 
 /// A room as a frontend needs to show it.
@@ -201,6 +212,10 @@ pub struct MessageView {
     /// ([`crate::embed::Card::view_for`]).
     #[serde(default)]
     pub card: Option<Box<crate::embed::CardView>>,
+    /// The room sticker this message is, by name. A frontend draws it from the room's set on
+    /// this device ([`Session::custom_asset`]) and shows `body` (`:name:`) if it has none.
+    #[serde(default)]
+    pub sticker: Option<String>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -254,6 +269,12 @@ pub enum Event {
     Profiles {
         profiles: Vec<ProfileView>,
     },
+    /// The room's custom emoji, stickers and sounds changed. A frontend fetches the new
+    /// assets with `prepare_custom_sync` straight away — all of them, used or not — and
+    /// redraws; see `crate::custom` for why it must not wait for first use.
+    Custom {
+        set: CustomSetView,
+    },
 }
 
 struct OpenRoom {
@@ -272,6 +293,11 @@ struct OpenRoom {
     listed: Vec<UserId>,
     /// What to call everyone, and who needs their id shown. See [`crate::profile::labels`].
     labels: HashMap<UserId, Label>,
+    /// The instance's roles for this room, as last read: who may change its custom set.
+    /// `None` until first read.
+    roles: Option<HashMap<UserId, String>>,
+    /// When `roles` was last read. On the timer's clock — never because a set arrived.
+    roles_checked_ms: i64,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -291,6 +317,8 @@ pub struct Session {
     contacts: ContactStore,
     history: History,
     profiles: ProfileStore,
+    /// Each room's custom emoji, stickers and sounds, and the cache they are drawn from.
+    custom: crate::custom::CustomStore,
     open: Option<OpenRoom>,
     dir: PathBuf,
     tls: bool,
@@ -375,6 +403,7 @@ impl Session {
             contacts: ContactStore::open(&dir)?,
             history: History::open(&dir)?,
             profiles: ProfileStore::open(&dir)?,
+            custom: crate::custom::CustomStore::open(&dir)?,
             open: None,
             dir: dir.clone(),
             tls,
@@ -474,8 +503,11 @@ impl Session {
             thread: Thread::default(),
             listed: Vec::new(),
             labels: HashMap::new(),
+            roles: None,
+            roles_checked_ms: now_ms(),
         };
         self.relabel(&mut open);
+        self.refresh_roles(&mut open);
         self.open = Some(open);
         // Found by a probe: without this, creating a room left the previous room's
         // attachments fetchable from the new one.
@@ -568,7 +600,14 @@ impl Session {
             thread,
             listed: Vec::new(),
             labels,
+            roles: None,
+            roles_checked_ms: now_ms(),
         });
+        // Who may change the room's custom set, read now rather than when a set arrives.
+        if let Some(mut open) = self.open.take() {
+            self.refresh_roles(&mut open);
+            self.open = Some(open);
+        }
         Ok(views)
     }
 
@@ -631,6 +670,7 @@ impl Session {
             reply_to,
             reaction: None,
             card,
+            sticker: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
@@ -669,6 +709,7 @@ impl Session {
             reply_to: None,
             reaction: Some(reaction),
             card: None,
+            sticker: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
@@ -703,6 +744,7 @@ impl Session {
         };
         let mut events = Vec::new();
         let mut profiles_changed = false;
+        let mut custom_changed = false;
 
         for message in fetched {
             open.cursor = open.cursor.max(message.server_seq);
@@ -770,6 +812,19 @@ impl Session {
                         }
                         continue;
                     }
+                    // A room's custom set is state too. Whether its sender may change it is
+                    // checked against the roles last read — see `session::custom`.
+                    if let Some(set) = received.custom_set {
+                        if message.envelope.sender != self.client.user() {
+                            custom_changed |= self.receive_custom(
+                                &open,
+                                message.envelope.sender,
+                                message.server_seq,
+                                *set,
+                            );
+                        }
+                        continue;
+                    }
                     // Attributed to the envelope's sender, for a reaction as for a message:
                     // the payload has no field naming who reacted, so none can be forged.
                     let attachment = received.attachment.map(|a| *a);
@@ -783,6 +838,7 @@ impl Session {
                         reply_to: received.reply_to.map(|r| *r),
                         reaction: received.reaction.map(|r| *r),
                         card: received.card.map(|c| *c),
+                        sticker: received.sticker,
                     };
                     let _ = self.history.append(room, &entry);
                     open.thread.record(&entry);
@@ -810,6 +866,7 @@ impl Session {
                     // account's profile included, so it goes again once this poll is done.
                     if !added.is_empty() {
                         let _ = self.profiles.resend(&room);
+                        let _ = self.custom.mark_due(&room);
                     }
                     profiles_changed = true;
                     events.push(Event::Membership {
@@ -823,6 +880,7 @@ impl Session {
                     // same for what its members called themselves.
                     let _ = self.history.forget(room);
                     let _ = self.profiles.forget(&room);
+                    let _ = self.custom.forget(&room);
                     events.push(Event::Removed);
                 }
                 Ok(TimelineEvent::Nothing) => {}
@@ -849,6 +907,14 @@ impl Session {
         // After everything fetched has been processed, so the group is at its current epoch
         // and a member who just joined can read it. A failure is retried on the next poll.
         let _ = self.flush_profile(&mut open);
+        // Roles on their own clock, so the request says nothing about what just arrived.
+        if now_ms().saturating_sub(open.roles_checked_ms) >= self.timer_recheck_ms {
+            custom_changed |= self.refresh_roles(&mut open);
+        }
+        let _ = self.flush_custom(&mut open);
+        if custom_changed {
+            events.push(Event::Custom { set: self.custom_view(&open) });
+        }
         if profiles_changed {
             self.relabel(&mut open);
             let mut users: Vec<&UserId> = open.labels.keys().collect();
@@ -1110,6 +1176,9 @@ impl Session {
         // too, then attach each member's profile.
         if let Some(mut open) = self.open.take() {
             open.listed = listed.iter().map(|(u, _)| *u).collect();
+            // A member list is a role list; a set held for want of one may now apply. A
+            // change shows up on the next poll's `custom` event or the next `custom_set`.
+            self.apply_roles(&mut open, &listed);
             self.relabel(&mut open);
             for v in &mut views {
                 if let Ok(user) = v.user.parse::<UserId>() {
@@ -1205,6 +1274,7 @@ impl Session {
         // This device committed the add, so no poll will report it here — and the new member
         // still needs this account's profile, sent after the welcome.
         let _ = self.profiles.resend(&room);
+        let _ = self.custom.mark_due(&room);
         Ok(())
     }
 
@@ -1500,6 +1570,7 @@ fn view(
         // Rendered from what arrived inside the envelope. Nothing is fetched to draw it —
         // the recipient-fetches-nothing rule (`docs/05-embeds.md`).
         card: entry.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),
+        sticker: entry.sticker.clone(),
         body,
     }
 }
