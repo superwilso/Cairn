@@ -1,9 +1,7 @@
-> **Amended by [ADR-009](adr/009-instance-side-unfurl.md).** The unfurl has moved from the
-> sender's device to the instance: one adapter set, a shared cache, and thumbnails, at the
-> cost of the instance seeing URLs its users send. **The recipient-fetches-nothing rule is
-> unchanged and remains the important half.** Sections below describing sender-side fetching
-> as the design describe the superseded arrangement; the privacy reasoning in them still
-> applies to the recipient.
+> **This is the design that ships.** [ADR-009](adr/009-instance-side-unfurl.md) proposed
+> moving the unfurl to the instance; it was superseded before it was built, and says why.
+> Link previews are fetched by the sender's device, per platform, every platform off by
+> default, and the card travels inside the encrypted message. Recipients fetch nothing.
 
 # Embeds — Authenticated On-Device Unfurl
 
@@ -403,10 +401,24 @@ provider as untrusted (`01-threat-model.md` §8).
 
 ## Status
 
-**Cards with thumbnails ship, sender-side, in the desktop client and the CLI.** This is the
-arrangement [ADR-009](adr/009-instance-side-unfurl.md) supersedes; it is what runs until the
-instance unfurl service exists, and the recipient half — the important half — is the same
-under both.
+**Cards with thumbnails ship, sender-side, in the desktop client and the CLI**, behind
+per-platform switches that all start off. [ADR-009](adr/009-instance-side-unfurl.md)'s
+instance-side unfurl was superseded before it was built.
+
+**Opt-in per platform, as §1 requires.** Instagram, YouTube, TikTok, X, Reddit and "other
+websites" each have a switch (`embed::Sites`), persisted per profile and **all off by
+default**; the Instagram proxy has its own, which does nothing unless Instagram is on. The
+desktop client shows them in the sidebar, under copy that says the site sees the sender's IP
+address; the CLI reads `CAIRN_LINK_PREVIEWS` (`youtube,web`, `all`), unset meaning none. A
+settings file from the earlier single switch loads as all off.
+
+The switches are **enforced per request** in `embed::fetch`, not only on the pasted link:
+each redirect hop, the oEmbed endpoint and the thumbnail are classified by host — each
+platform's own domains and image CDNs (`ytimg.com`, `cdninstagram.com`, `twimg.com`…) — and
+refused if that platform is off. Otherwise a shortener on an enabled site could forward to a
+disabled one, or an article's preview image could sit on a disabled platform's CDN. Tested
+with a listener that must see no connection when its site is off, and with the same listener
+contacted once the switch is on.
 
 Implemented in `cairn-client-core::embed` and wired into `cairn-cli chat` and the desktop
 client (`Session::begin_send` / `PendingSend::unfurl` / `Session::finish_send`): the sender's
@@ -503,10 +515,12 @@ Known gaps, recorded rather than implied away:
   loopback, RFC 1918, link-local, CGNAT, multicast, reserved and documentation ranges, and
   IPv6 forms embedding any of them; a network that routes some *public* range internally is
   not something it can know about.
-- **The fetch is not opt-in per platform.** §1 requires that. The desktop client has one
-  switch for all previews, **on by default**, whose description says the linked site sees
-  the sender's IP; the CLI has none. The default is an owner decision that departs from §1,
-  recorded here so it is visible.
+- **The per-platform list is a fixed set of domains.** A platform serving from a domain not
+  on it falls under "other websites" rather than its own switch. The error is towards the
+  more general switch, never towards contacting a named platform the user turned off; but a
+  user with only "other websites" on can still reach such a domain.
+- **No "visible indication when an authenticated fetch is about to happen" beyond the
+  composer's status line**, because there is no authenticated fetch yet.
 - **No authenticated rung.** `Authenticated` needs per-platform session storage.
 - **No inline video.** A reel's card shows its thumbnail with a play glyph; clicking opens
   the platform. Playing it inside Cairn means the sender re-hosting the video as an

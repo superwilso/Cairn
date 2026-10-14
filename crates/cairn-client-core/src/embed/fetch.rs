@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use super::Thumbnail;
 use super::UnfurlError;
-use super::{instagram, is_fetchable, oembed, parse_metadata, thumbnail, Card, CardSource};
+use super::{instagram, is_fetchable, oembed, parse_metadata, thumbnail, Card, CardSource, Sites};
 
 /// The most one preview may take, every request in it included.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,16 +44,27 @@ const MAX_IMAGE: u64 = 2 * 1024 * 1024;
 /// owner.
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; Cairn link preview)";
 
+/// What one preview may spend: time, shared by every request in it, and which sites it may
+/// contact at all.
 #[derive(Clone, Copy)]
-struct Deadline(Instant);
+struct Budget {
+    until: Instant,
+    sites: Sites,
+}
 
-impl Deadline {
+impl Budget {
+    fn new(sites: Sites) -> Self {
+        Self { until: Instant::now() + FETCH_TIMEOUT, sites }
+    }
+
+    /// Every site allowed: for tests of the transport, which are not about the switches.
+    #[cfg(test)]
     fn start() -> Self {
-        Self(Instant::now() + FETCH_TIMEOUT)
+        Self::new(Sites::all())
     }
 
     fn remaining(self) -> Result<Duration, UnfurlError> {
-        let left = self.0.saturating_duration_since(Instant::now());
+        let left = self.until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(UnfurlError::Fetch("timed out".into()));
         }
@@ -134,12 +145,12 @@ fn hop_allowed(url: &str, check: fn(&str) -> Result<(), UnfurlError>) -> Result<
 /// proxy, so [`PublicOnly`] would vet the proxy's address instead of the destination and a
 /// link to an intranet name would be fetched by a machine that can reach it. A user behind
 /// a mandatory proxy gets bare links rather than previews, which is the honest outcome.
-fn agent(deadline: Deadline) -> Result<ureq::Agent, UnfurlError> {
+fn agent(budget: Budget) -> Result<ureq::Agent, UnfurlError> {
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .proxy(None)
         .max_redirects(0)
-        .timeout_global(Some(deadline.remaining()?))
+        .timeout_global(Some(budget.remaining()?))
         .build();
     Ok(ureq::Agent::with_parts(
         config,
@@ -157,14 +168,21 @@ fn agent(deadline: Deadline) -> Result<ureq::Agent, UnfurlError> {
 fn get(
     url: &str,
     accept: &str,
-    deadline: Deadline,
+    budget: Budget,
     redirects: Redirects,
     check: fn(&str) -> Result<(), UnfurlError>,
 ) -> Result<ureq::http::Response<ureq::Body>, UnfurlError> {
     let mut current = url.to_string();
     for _ in 0..=MAX_HOPS {
         hop_allowed(&current, check)?;
-        let response = agent(deadline)?
+        // The user's per-platform switches, on every hop: a redirect or an image on a
+        // switched-off platform is refused like a link to it. The one exception is a
+        // third-party proxy (`Redirects::Refuse`), whose own switch is the consent and whose
+        // host is by construction none of the platforms.
+        if redirects == Redirects::Follow {
+            budget.sites.permits(&current)?;
+        }
+        let response = agent(budget)?
             .get(&current)
             .header("user-agent", USER_AGENT)
             .header("accept", accept)
@@ -258,23 +276,24 @@ fn content_type(response: &ureq::http::Response<ureq::Body>) -> String {
 ///
 /// A failure is not an error worth surfacing loudly — it degrades to a bare link, which is
 /// the last step of the fallback chain and always works.
-pub fn unfurl(url: &str) -> Result<Card, UnfurlError> {
+pub fn unfurl(url: &str, sites: Sites) -> Result<Card, UnfurlError> {
+    sites.permits(url)?;
     hop_allowed(url, is_fetchable)?;
-    let deadline = Deadline::start();
-    let mut card = direct(url, deadline)?;
-    attach_thumbnail(&mut card, deadline);
+    let budget = Budget::new(sites);
+    let mut card = direct(url, budget)?;
+    attach_thumbnail(&mut card, budget);
     Ok(card)
 }
 
-fn direct(url: &str, deadline: Deadline) -> Result<Card, UnfurlError> {
+fn direct(url: &str, budget: Budget) -> Result<Card, UnfurlError> {
     // oEmbed first for the four platforms whose pages do not serve usable OpenGraph. Same
     // organisation, same device: no new party learns the link (see `oembed`).
     if let Some(link) = oembed::parse(url) {
-        if let Ok(card) = fetch_oembed(&link, url, deadline) {
+        if let Ok(card) = fetch_oembed(&link, url, budget) {
             return Ok(card);
         }
     }
-    let mut card = fetch_and_parse_within(url, deadline, Redirects::Follow)?;
+    let mut card = fetch_and_parse_within(url, budget, Redirects::Follow)?;
     if instagram::parse(url).is_some() {
         instagram::tidy(&mut card);
     }
@@ -299,14 +318,21 @@ fn direct(url: &str, deadline: Deadline) -> Result<Card, UnfurlError> {
 /// A card built this way carries [`CardSource::Proxy`], whose `caveat()` a client must
 /// display. Returning a proxy-built card marked `Public` would be the specific lie
 /// `docs/05-embeds.md` forbids.
-pub fn unfurl_with_proxy(url: &str, policy: &instagram::ProxyPolicy) -> Result<Card, UnfurlError> {
+pub fn unfurl_with_proxy(
+    url: &str,
+    sites: Sites,
+    policy: &instagram::ProxyPolicy,
+) -> Result<Card, UnfurlError> {
+    // Before anything else: a switched-off platform's link is not even the occasion for a
+    // DNS query, let alone a proxy request.
+    sites.permits(url)?;
     hop_allowed(url, is_fetchable)?;
-    let deadline = Deadline::start();
-    let direct = direct(url, deadline);
+    let budget = Budget::new(sites);
+    let direct = direct(url, budget);
     if let Ok(card) = &direct {
         if card.is_useful() {
             let mut card = card.clone();
-            attach_thumbnail(&mut card, deadline);
+            attach_thumbnail(&mut card, budget);
             return Ok(card);
         }
     }
@@ -323,7 +349,7 @@ pub fn unfurl_with_proxy(url: &str, policy: &instagram::ProxyPolicy) -> Result<C
         if is_fetchable(&candidate).is_err() {
             continue;
         }
-        if let Ok(mut card) = fetch_and_parse_within(&candidate, deadline, Redirects::Refuse) {
+        if let Ok(mut card) = fetch_and_parse_within(&candidate, budget, Redirects::Refuse) {
             if card.is_useful() {
                 // The card describes the *original* link, not the proxy's URL. A recipient
                 // evaluating where a message points must see where it really points — the
@@ -334,7 +360,7 @@ pub fn unfurl_with_proxy(url: &str, policy: &instagram::ProxyPolicy) -> Result<C
                 instagram::tidy(&mut card);
                 // The proxy names its own copy of the image; fetching it tells that same
                 // proxy nothing it was not just told.
-                attach_thumbnail(&mut card, deadline);
+                attach_thumbnail(&mut card, budget);
                 return Ok(card);
             }
         }
@@ -352,8 +378,11 @@ pub fn unfurl_with_proxy(url: &str, policy: &instagram::ProxyPolicy) -> Result<C
 ///
 /// Never panics. A hostile page that tripped a bug in the parser would otherwise take the
 /// message down with it, and a preview is never worth a message.
-pub fn preview(url: &str, policy: &instagram::ProxyPolicy) -> Option<Card> {
-    let attempt = std::panic::catch_unwind(|| unfurl_with_proxy(url, policy));
+pub fn preview(url: &str, sites: Sites, policy: &instagram::ProxyPolicy) -> Option<Card> {
+    if sites.permits(url).is_err() {
+        return None;
+    }
+    let attempt = std::panic::catch_unwind(|| unfurl_with_proxy(url, sites, policy));
     settle(url, attempt.ok().and_then(Result::ok))
 }
 
@@ -367,15 +396,10 @@ fn settle(url: &str, fetched: Option<Card>) -> Option<Card> {
     }
 }
 
-fn fetch_oembed(
-    link: &oembed::OembedLink,
-    url: &str,
-    deadline: Deadline,
-) -> Result<Card, UnfurlError> {
+fn fetch_oembed(link: &oembed::OembedLink, url: &str, budget: Budget) -> Result<Card, UnfurlError> {
     let endpoint = link.endpoint();
     is_fetchable(&endpoint)?;
-    let mut response =
-        get(&endpoint, "application/json", deadline, Redirects::Follow, is_fetchable)?;
+    let mut response = get(&endpoint, "application/json", budget, Redirects::Follow, is_fetchable)?;
     if !response.status().is_success() {
         return Err(UnfurlError::Fetch(format!("oEmbed answered {}", response.status())));
     }
@@ -399,16 +423,16 @@ fn fetch_oembed(
 /// check first — a caller cannot reach this to skip it.
 #[cfg(test)]
 pub(super) fn fetch_and_parse(url: &str) -> Result<Card, UnfurlError> {
-    fetch_and_parse_within(url, Deadline::start(), Redirects::Follow)
+    fetch_and_parse_within(url, Budget::start(), Redirects::Follow)
 }
 
 fn fetch_and_parse_within(
     url: &str,
-    deadline: Deadline,
+    budget: Budget,
     redirects: Redirects,
 ) -> Result<Card, UnfurlError> {
     let mut response =
-        get(url, "text/html,application/xhtml+xml", deadline, redirects, is_fetchable)?;
+        get(url, "text/html,application/xhtml+xml", budget, redirects, is_fetchable)?;
     let content_type = content_type(&response);
     if !content_type.is_empty() && !content_type.contains("html") {
         return Err(UnfurlError::NotHtml);
@@ -427,7 +451,7 @@ fn fetch_and_parse_within(
 
 /// Fetch the card's image and shrink it into [`Card::thumbnail`]. Any failure leaves the
 /// card without one, which is a perfectly good card.
-fn attach_thumbnail(card: &mut Card, deadline: Deadline) {
+fn attach_thumbnail(card: &mut Card, budget: Budget) {
     if card.thumbnail.is_some() {
         return;
     }
@@ -435,7 +459,7 @@ fn attach_thumbnail(card: &mut Card, deadline: Deadline) {
     if thumbnail_url_allowed(image_url).is_err() {
         return;
     }
-    card.thumbnail = fetch_image(image_url, deadline)
+    card.thumbnail = fetch_image(image_url, budget)
         .ok()
         .and_then(|b| thumbnail::from_image_bytes(&b))
         .map(Box::new);
@@ -456,11 +480,11 @@ fn thumbnail_url_allowed(url: &str) -> Result<(), UnfurlError> {
 }
 
 /// The image transport, policy already applied. Only `image/*`, at most [`MAX_IMAGE`].
-fn fetch_image(url: &str, deadline: Deadline) -> Result<Vec<u8>, UnfurlError> {
+fn fetch_image(url: &str, budget: Budget) -> Result<Vec<u8>, UnfurlError> {
     let accept = "image/jpeg,image/png,image/webp";
     // Every hop, not only the first, must be https and public: a page can name an https
     // image that redirects anywhere.
-    let mut response = get(url, accept, deadline, Redirects::Follow, thumbnail_url_allowed)?;
+    let mut response = get(url, accept, budget, Redirects::Follow, thumbnail_url_allowed)?;
     if !response.status().is_success() {
         return Err(UnfurlError::Fetch(format!("image answered {}", response.status())));
     }
@@ -480,7 +504,7 @@ fn fetch_image(url: &str, deadline: Deadline) -> Result<Vec<u8>, UnfurlError> {
 /// Exposed for the thumbnail module's tests and nothing else.
 #[cfg(test)]
 pub(super) fn thumbnail_from(url: &str) -> Result<Option<Thumbnail>, UnfurlError> {
-    Ok(thumbnail::from_image_bytes(&fetch_image(url, Deadline::start())?))
+    Ok(thumbnail::from_image_bytes(&fetch_image(url, Budget::start())?))
 }
 
 #[cfg(test)]
@@ -544,7 +568,7 @@ mod tests {
         assert!(result.is_err(), "a page that never finishes is not a card");
         assert!(
             took < FETCH_TIMEOUT + Duration::from_secs(2),
-            "took {took:?}; the deadline is {FETCH_TIMEOUT:?}"
+            "took {took:?}; the budget is {FETCH_TIMEOUT:?}"
         );
     }
 
@@ -553,7 +577,7 @@ mod tests {
         // Probed: one Instagram proxy answered every request with a redirect to an
         // advertising network. Following it hands the user's IP to a party nobody chose.
         let url = serve("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/ads", Vec::new());
-        let result = fetch_and_parse_within(&url, Deadline::start(), Redirects::Refuse);
+        let result = fetch_and_parse_within(&url, Budget::start(), Redirects::Refuse);
         assert!(result.is_err(), "a redirecting proxy must count as no answer: {result:?}");
     }
 
@@ -619,7 +643,7 @@ mod tests {
         // a lookup found something.
         assert_eq!(settle("https://example.com/", None), None);
         // And the public entry point refuses a private address without fetching anything.
-        assert_eq!(preview("http://127.0.0.1/", &Default::default()), None);
+        assert_eq!(preview("http://127.0.0.1/", Sites::all(), &Default::default()), None);
     }
 
     #[test]
@@ -690,7 +714,7 @@ mod address_policy {
         // the connection; `localhost` resolves on every CI platform, unlike `vm`.
         let target = Bystander::new();
         let url = format!("http://localhost:{}/admin", target.port());
-        let result = get(&url, "text/html", Deadline::start(), Redirects::Follow, |_| Ok(()));
+        let result = get(&url, "text/html", Budget::start(), Redirects::Follow, |_| Ok(()));
         assert!(
             matches!(result, Err(UnfurlError::PrivateAddress(_))),
             "a name resolving to loopback must be refused: {:?}",
@@ -714,7 +738,7 @@ mod address_policy {
         ] {
             let target = Bystander::new();
             let start = redirector(location(target.port()));
-            let result = unfurl(&start);
+            let result = unfurl(&start, Sites::all());
             assert!(result.is_err(), "a redirect into loopback must not produce a card");
             assert!(
                 !target.was_contacted(),
@@ -722,6 +746,66 @@ mod address_policy {
                 location(target.port())
             );
         }
+    }
+
+    #[test]
+    fn a_switched_off_site_is_never_contacted() {
+        // An allowed address (so the address policy is not what stops it), classified as
+        // "other websites", with that switch off. Nothing may connect — not the page, not a
+        // proxy, not a DNS-free fallback.
+        let target = Bystander::new();
+        let addr = target.0.local_addr().unwrap();
+        test_allow::allow(addr);
+        let url = format!("http://{addr}/page");
+        let only_youtube = Sites { youtube: true, ..Sites::default() };
+
+        assert!(matches!(unfurl(&url, Sites::default()), Err(UnfurlError::NotEnabled(_))));
+        assert!(matches!(unfurl(&url, only_youtube), Err(UnfurlError::NotEnabled(_))));
+        let proxy = instagram::ProxyPolicy::with_hosts(["kkinstagram.com"]);
+        assert_eq!(preview(&url, only_youtube, &proxy), None);
+        assert!(!target.was_contacted(), "a switched-off site must get no request at all");
+
+        // The counterfactual: switched on, the same address is contacted.
+        let _ = unfurl(&url, Sites { web: true, ..Sites::default() });
+        assert!(target.was_contacted(), "the test must be able to see a contact");
+    }
+
+    #[test]
+    fn a_redirect_onto_a_switched_off_platform_is_refused() {
+        // A link on an enabled site that forwards to a disabled one — a shortener is the
+        // ordinary case — must stop at the hop, before any DNS query for the platform.
+        let start = redirector("https://www.youtube.com/watch?v=dQw4w9WgXcQ".into());
+        let web_only = Sites { web: true, ..Sites::default() };
+        let result = unfurl(&start, web_only);
+        assert!(
+            matches!(result, Err(UnfurlError::NotEnabled("YouTube"))),
+            "the YouTube hop must be refused by its switch: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_thumbnail_on_a_switched_off_platforms_cdn_is_not_fetched() {
+        let web_only = Sites { web: true, ..Sites::default() };
+        let mut card = Card {
+            url: "https://example.com/".into(),
+            title: Some("t".into()),
+            image_url: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".into()),
+            ..Card::default()
+        };
+        // The refusal is the switch's, before the network: an unreachable CDN would also
+        // leave no thumbnail, so the hop check is asserted directly as well.
+        attach_thumbnail(&mut card, Budget::new(web_only));
+        assert!(card.thumbnail.is_none());
+        assert!(matches!(
+            get(
+                "https://i.ytimg.com/vi/x/hqdefault.jpg",
+                "image/jpeg",
+                Budget::new(web_only),
+                Redirects::Follow,
+                thumbnail_url_allowed,
+            ),
+            Err(UnfurlError::NotEnabled("YouTube"))
+        ));
     }
 
     #[test]
@@ -740,7 +824,7 @@ mod address_policy {
                 );
             }
         });
-        let result = unfurl(&format!("http://{addr}/"));
+        let result = unfurl(&format!("http://{addr}/"), Sites::all());
         assert!(matches!(result, Err(UnfurlError::Fetch(_))), "{result:?}");
     }
 
@@ -752,7 +836,7 @@ mod address_policy {
             "<html><head><meta property='og:title' content='After a hop'></head></html>",
         );
         let start = redirector(page);
-        let card = unfurl(&start).expect("a public redirect is followed");
+        let card = unfurl(&start, Sites::all()).expect("a public redirect is followed");
         assert_eq!(card.title.as_deref(), Some("After a hop"));
     }
 

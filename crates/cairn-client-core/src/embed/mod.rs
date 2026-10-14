@@ -32,10 +32,12 @@
 
 pub mod instagram;
 pub mod oembed;
+mod sites;
 mod target;
 pub mod thumbnail;
 mod view;
 
+pub use sites::{Site, Sites};
 pub use target::destination_host;
 pub use thumbnail::Thumbnail;
 pub use view::{openable, CardView};
@@ -166,6 +168,8 @@ pub enum UnfurlError {
     Fetch(String),
     #[error("the page is not html")]
     NotHtml,
+    #[error("link previews from {0} are switched off")]
+    NotEnabled(&'static str),
 }
 
 /// Reject URLs that point somewhere a link preview has no business reaching.
@@ -604,7 +608,7 @@ mod tests {
         // listening there — one the test allowlist was not told about.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/page", listener.local_addr().unwrap());
-        assert!(matches!(unfurl(&url), Err(UnfurlError::PrivateAddress(_))));
+        assert!(matches!(unfurl(&url, Sites::all()), Err(UnfurlError::PrivateAddress(_))));
     }
 
     #[test]

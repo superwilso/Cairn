@@ -1,6 +1,30 @@
 # ADR-009: The instance unfurls links, not the sender
 
-**Status:** Accepted. **Amends [`05-embeds.md`](../05-embeds.md).**
+**Status:** Superseded before it was built (2026-10). The sender-side unfurl of
+[`05-embeds.md`](../05-embeds.md) is what ships, with per-platform opt-in, every platform off
+by default. The text below is kept as the record of why the instance-side design was
+considered.
+
+## Why it was superseded
+
+- **It was a concession the threat model had to carry** (`01-threat-model.md` §3a): the
+  instance would have seen every URL its users send, in every tier, T1 DMs included. The
+  sender-side unfurl keeps the URL inside the encrypted message, so that concession is not
+  needed.
+- **Its main practical argument fell away.** "No thumbnails" was the strongest item below;
+  the sender's device now fetches, shrinks and re-encodes the thumbnail and carries it in the
+  encrypted card (`05-embeds.md`, Status).
+- **The SSRF argument cuts both ways, and sender-side is now defended.** The sender's fetcher
+  refuses non-public addresses after DNS resolution and on every redirect hop, which this
+  ADR assumed only a server would bother to do.
+- **What is accepted instead:** the sender's device reveals its IP address to each site it
+  previews. That is why each platform has its own switch and all are off by default. Also
+  accepted: there is no shared cache, every client carries every adapter, and two senders
+  can produce different cards for one link.
+
+The recipient-fetches-nothing rule, which this ADR kept, is unchanged.
+
+---
 
 ## Context
 

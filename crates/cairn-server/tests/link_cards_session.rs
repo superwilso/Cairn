@@ -10,7 +10,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cairn_client_core::embed::{Card, Thumbnail};
+use cairn_client_core::embed::{Card, Sites, Thumbnail};
 use cairn_client_core::session::{Event, LinkPreviewSettings, MessageView, Session};
 use cairn_server::state::{Instance, RegistrationPolicy};
 
@@ -157,12 +157,11 @@ fn a_card_for_a_link_the_message_does_not_contain_is_not_shown_to_the_recipient(
 }
 
 #[test]
-fn with_previews_off_the_sender_contacts_nothing() {
+fn by_default_the_sender_contacts_nothing() {
+    // No setting touched: previews are off for every site, so a pasted link is not fetched.
     let server = start();
     let (mut alice, _bob, _, _) = two_in_a_group(&server);
-    alice
-        .set_link_previews(LinkPreviewSettings { enabled: false, instagram_proxy: false })
-        .unwrap();
+    assert_eq!(alice.link_previews(), LinkPreviewSettings::default());
     let site = Site::new();
     let body = format!("look {}", site.url("/page"));
 
@@ -175,11 +174,49 @@ fn with_previews_off_the_sender_contacts_nothing() {
 }
 
 #[test]
-fn a_link_to_the_senders_own_network_is_never_fetched() {
-    // Previews on, and the link points at loopback: the address policy, not a setting, is
-    // what keeps a pasted link from probing the sender's own machine.
+fn a_switched_off_platforms_link_produces_no_network_request() {
+    // Every switch on except the one this link falls under ("other websites": a loopback
+    // listener is not a named platform). Turning the others on must not leak into it.
     let server = start();
     let (mut alice, _bob, _, _) = two_in_a_group(&server);
+    let everything_but_web = Sites { web: false, ..Sites::all() };
+    alice
+        .set_link_previews(LinkPreviewSettings { sites: everything_but_web, instagram_proxy: true })
+        .unwrap();
+    let site = Site::new();
+    let body = format!("look {}", site.url("/page"));
+
+    let mut pending = alice.begin_send(&body, None).unwrap();
+    assert_eq!(pending.preview_url(), None, "a switched-off site is not planned");
+    pending.unfurl();
+    let sent = alice.finish_send(pending).unwrap();
+    assert!(sent.card.is_none());
+    assert!(!site.was_contacted(), "a switched-off site must receive no request at all");
+
+    // The same holds for a named platform: Instagram off, its proxy switch on — nothing is
+    // planned, so neither Instagram nor the proxy is asked.
+    alice
+        .set_link_previews(LinkPreviewSettings {
+            sites: Sites { instagram: false, ..Sites::all() },
+            instagram_proxy: true,
+        })
+        .unwrap();
+    let pending = alice.begin_send("https://www.instagram.com/reel/C5nYxQyOZ6V/", None).unwrap();
+    assert_eq!(pending.preview_url(), None);
+}
+
+#[test]
+fn a_link_to_the_senders_own_network_is_never_fetched() {
+    // Previews on for this kind of link, and the link points at loopback: the address
+    // policy, not a setting, is what keeps a pasted link from probing the sender's machine.
+    let server = start();
+    let (mut alice, _bob, _, _) = two_in_a_group(&server);
+    alice
+        .set_link_previews(LinkPreviewSettings {
+            sites: Sites { web: true, ..Sites::default() },
+            instagram_proxy: false,
+        })
+        .unwrap();
     let site = Site::new();
     let body = format!("look {}", site.url("/admin"));
 

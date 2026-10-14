@@ -1111,29 +1111,22 @@ impl Session {
 ///
 /// Its own file rather than a shared preferences file, so it can never clobber — or be
 /// clobbered by — another setting written by code that does not know about this one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Everything off by default.** Building a preview means this device contacting the
+/// linked site, which sees the sender's IP address; `docs/05-embeds.md` §1 requires that to
+/// be opted into per platform. A file written by an earlier version — one global `enabled`
+/// switch — loads as all off: nobody chose these per-platform switches yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LinkPreviewSettings {
-    /// Whether this device fetches a link to build a card when sending it. **On by
-    /// default**: the fetch is the sender's own, recipients fetch nothing, and the card
-    /// travels inside the encrypted message. What it reveals is the sender's IP address to
-    /// the linked site — said in the setting's description, not hidden behind the default.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// One switch per platform, and one for every other website.
+    #[serde(flatten)]
+    pub sites: crate::embed::Sites,
     /// Whether an Instagram link the site will not describe may be sent to a third-party
     /// proxy ([`crate::embed::instagram::SUGGESTED_PROXY`]). **Off by default** — the proxy
     /// sees the link, and `docs/05-embeds.md` forbids taking a less private path silently.
+    /// Has no effect unless Instagram previews are on.
     #[serde(default)]
     pub instagram_proxy: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for LinkPreviewSettings {
-    fn default() -> Self {
-        Self { enabled: true, instagram_proxy: false }
-    }
 }
 
 /// A message on its way out, holding everything needed to build its preview **without the
@@ -1148,8 +1141,17 @@ pub struct PendingSend {
     room: RoomId,
     text: String,
     reply_to: Option<MessageRef>,
-    preview: Option<(String, crate::embed::instagram::ProxyPolicy)>,
+    preview: Option<Plan>,
     card: Option<crate::embed::Card>,
+}
+
+/// What one preview may do: which URL, which sites it may contact on the way (every hop is
+/// checked, not only the link), and whether a third-party proxy may be asked.
+#[derive(Debug)]
+struct Plan {
+    url: String,
+    sites: crate::embed::Sites,
+    proxy: crate::embed::instagram::ProxyPolicy,
 }
 
 impl PendingSend {
@@ -1158,14 +1160,14 @@ impl PendingSend {
     /// Never fails: no card is a perfectly good outcome, and a preview is never worth
     /// holding back a message.
     pub fn unfurl(&mut self) {
-        if let Some((url, policy)) = &self.preview {
-            self.card = crate::embed::preview(url, policy);
+        if let Some(plan) = &self.preview {
+            self.card = crate::embed::preview(&plan.url, plan.sites, &plan.proxy);
         }
     }
 
     /// The URL a preview will be fetched for, if any. For a UI to say what is happening.
     pub fn preview_url(&self) -> Option<&str> {
-        self.preview.as_ref().map(|(url, _)| url.as_str())
+        self.preview.as_ref().map(|plan| plan.url.as_str())
     }
 
     /// Attach a card built some other way — by a test, or a platform-supplied fetcher.
@@ -1240,22 +1242,20 @@ impl Session {
     }
 }
 
-/// Which link to fetch for `text`, and through which proxies — or nothing.
-fn preview_plan(
-    settings: LinkPreviewSettings,
-    text: &str,
-) -> Option<(String, crate::embed::instagram::ProxyPolicy)> {
+/// Which link to fetch for `text`, under which switches — or nothing.
+///
+/// `None` unless the first link's own site is switched on: a link to a platform the user has
+/// not enabled is not fetched, and neither is a proxy asked about it.
+fn preview_plan(settings: LinkPreviewSettings, text: &str) -> Option<Plan> {
     use crate::embed::instagram::{ProxyPolicy, SUGGESTED_PROXY};
-    if !settings.enabled {
-        return None;
-    }
     let url = crate::embed::first_url(text)?;
-    let policy = if settings.instagram_proxy {
+    settings.sites.permits(url).ok()?;
+    let proxy = if settings.instagram_proxy && settings.sites.instagram {
         ProxyPolicy::with_hosts([SUGGESTED_PROXY])
     } else {
         ProxyPolicy::disabled()
     };
-    Some((url.to_string(), policy))
+    Some(Plan { url: url.to_string(), sites: settings.sites, proxy })
 }
 
 fn describe_member(m: &cairn_crypto::mls::GroupMember) -> String {
@@ -1482,26 +1482,34 @@ mod link_preview_tests {
     }
 
     #[test]
-    fn previews_are_on_and_the_instagram_proxy_off_until_someone_changes_them() {
+    fn every_preview_switch_is_off_until_someone_changes_it() {
         let (session, dir) = offline("defaults");
         let settings = session.link_previews();
-        assert!(settings.enabled);
+        assert_eq!(settings, LinkPreviewSettings::default());
+        assert!(!settings.sites.any(), "no site may be contacted by default");
         assert!(!settings.instagram_proxy, "a third party must never see links by default");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_settings_file_from_the_single_switch_era_loads_as_all_off() {
+        let (session, dir) = offline("migrate");
+        std::fs::write(dir.join("link-previews.json"), br#"{"enabled":true}"#).unwrap();
+        assert_eq!(session.link_previews(), LinkPreviewSettings::default());
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn a_preview_setting_survives_a_restart() {
         let (session, dir) = offline("persist");
-        session
-            .set_link_previews(LinkPreviewSettings { enabled: false, instagram_proxy: true })
-            .unwrap();
+        let chosen = LinkPreviewSettings {
+            sites: crate::embed::Sites { youtube: true, web: true, ..Default::default() },
+            instagram_proxy: true,
+        };
+        session.set_link_previews(chosen).unwrap();
         drop(session);
         let reopened = Session::open("persist", "http://127.0.0.1:9", Some(&dir)).unwrap();
-        assert_eq!(
-            reopened.link_previews(),
-            LinkPreviewSettings { enabled: false, instagram_proxy: true }
-        );
+        assert_eq!(reopened.link_previews(), chosen);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1524,18 +1532,32 @@ mod link_preview_tests {
     }
 
     #[test]
-    fn with_previews_off_a_link_is_never_fetched() {
-        let text = "look https://www.instagram.com/reel/abc123/";
-        let off = LinkPreviewSettings { enabled: false, instagram_proxy: true };
-        assert!(preview_plan(off, text).is_none(), "off means nothing is fetched at all");
+    fn only_a_link_to_a_switched_on_site_is_planned() {
+        use crate::embed::Sites;
+        let reel = "look https://www.instagram.com/reel/abc123/";
+        let video = "watch https://youtu.be/dQw4w9WgXcQ";
 
-        let on = LinkPreviewSettings::default();
-        let (url, policy) = preview_plan(on, text).expect("on, a link is previewed");
-        assert_eq!(url, "https://www.instagram.com/reel/abc123/");
-        assert!(!policy.is_enabled(), "the proxy stays off unless separately switched on");
+        let off = LinkPreviewSettings { sites: Sites::default(), instagram_proxy: true };
+        assert!(preview_plan(off, reel).is_none(), "off means nothing is fetched at all");
+        assert!(preview_plan(off, video).is_none());
 
-        let proxied = LinkPreviewSettings { enabled: true, instagram_proxy: true };
-        assert!(preview_plan(proxied, text).unwrap().1.is_enabled());
-        assert!(preview_plan(on, "no links here").is_none());
+        let youtube = LinkPreviewSettings {
+            sites: Sites { youtube: true, ..Sites::default() },
+            instagram_proxy: true,
+        };
+        assert!(preview_plan(youtube, reel).is_none(), "YouTube on does not mean Instagram on");
+        let plan = preview_plan(youtube, video).expect("an enabled platform is previewed");
+        assert_eq!(plan.url, "https://youtu.be/dQw4w9WgXcQ");
+        assert!(!plan.proxy.is_enabled(), "the Instagram proxy needs Instagram on too");
+        assert!(!plan.sites.web, "and the switches travel with the plan, for every hop");
+
+        let instagram = LinkPreviewSettings {
+            sites: Sites { instagram: true, ..Sites::default() },
+            instagram_proxy: false,
+        };
+        assert!(!preview_plan(instagram, reel).unwrap().proxy.is_enabled());
+        let proxied = LinkPreviewSettings { instagram_proxy: true, ..instagram };
+        assert!(preview_plan(proxied, reel).unwrap().proxy.is_enabled());
+        assert!(preview_plan(proxied, "no links here").is_none());
     }
 }

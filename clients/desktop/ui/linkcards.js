@@ -24,11 +24,16 @@ const CairnLinkCards = (() => {
     function bind(opts) {
         if (opts.invoke) invoke = opts.invoke;
         if (opts.onError) onError = opts.onError;
-        const previews = $("pref-previews");
+        for (const box of siteBoxes()) box.addEventListener("change", save);
         const proxy = $("pref-ig-proxy");
-        if (previews) previews.addEventListener("change", save);
         if (proxy) proxy.addEventListener("change", save);
     }
+
+    // One checkbox per site, keyed by the field name Rust uses (embed::Sites).
+    const siteBoxes = () => [...document.querySelectorAll("#prefs-previews input[data-site]")];
+    // What Rust last confirmed. Used only to word the composer's status line; whether a
+    // link is fetched is decided in Rust, against the stored settings.
+    let current = {};
 
     const text = (cls, value) => {
         const el = document.createElement("div");
@@ -108,52 +113,55 @@ const CairnLinkCards = (() => {
         return card;
     }
 
-    // ---- the setting -------------------------------------------------------
+    // ---- the settings ------------------------------------------------------
     //
-    // Stored per profile by Rust. The proxy's disclosure text comes from Rust too, so every
-    // client says the same thing about who sees the link.
+    // Stored per profile and enforced in Rust (cairn_client_core::embed::Sites): every site
+    // is off until switched on, and Rust refuses each request — redirects and thumbnails
+    // included — to a site that is off. This only shows the switches and hands them back.
+    // The proxy's disclosure text comes from Rust too, so every client says the same thing.
+
+    function draw(s) {
+        current = s || {};
+        for (const box of siteBoxes()) box.checked = !!current[box.dataset.site];
+        const proxy = $("pref-ig-proxy");
+        if (proxy) {
+            proxy.checked = !!current.instagram_proxy;
+            // The proxy is a way to preview Instagram; with Instagram off it has no job.
+            proxy.disabled = !current.instagram;
+        }
+    }
 
     async function loadSettings() {
-        const previews = $("pref-previews");
-        const proxy = $("pref-ig-proxy");
-        if (!previews) return;
+        if (!siteBoxes().length) return;
         try {
-            const s = await invoke("link_previews");
-            previews.checked = !!s.enabled;
-            if (proxy) {
-                proxy.checked = !!s.instagram_proxy;
-                proxy.disabled = !s.enabled;
-            }
+            draw(await invoke("link_previews"));
             const note = $("ig-proxy-note");
             if (note) note.textContent = await invoke("instagram_proxy_disclosure");
         } catch (e) { onError(e); }
     }
 
     async function save() {
-        const previews = $("pref-previews");
+        const settings = {};
+        for (const box of siteBoxes()) settings[box.dataset.site] = box.checked;
         const proxy = $("pref-ig-proxy");
-        const settings = {
-            enabled: previews.checked,
-            instagram_proxy: previews.checked && !!proxy && proxy.checked,
-        };
-        if (proxy) proxy.disabled = !settings.enabled;
+        settings.instagram_proxy = !!settings.instagram && !!proxy && proxy.checked;
         try {
             await invoke("set_link_previews", { settings });
+            draw(settings);
         } catch (e) {
             onError(e);
             await loadSettings();
         }
     }
 
-    // While a message with a link is waiting for its preview (up to five seconds, in Rust),
-    // say so — otherwise the composer just looks stuck. Returns a function that clears it.
+    // While a message with a link waits for its preview (up to five seconds, in Rust), say
+    // so, or the composer just looks stuck. Shown only when some site is switched on; Rust
+    // decides whether this particular link is fetched. Returns a function that clears it.
     function sending(message) {
         const status = $("preview-status");
-        const previews = $("pref-previews");
-        if (!status || (previews && !previews.checked) || !/https?:\/\//.test(message)) {
-            return () => {};
-        }
-        status.textContent = "Fetching a link preview… the linked site can see this device's IP address.";
+        const anyOn = siteBoxes().some((b) => current[b.dataset.site]);
+        if (!status || !anyOn || !/https?:\/\//.test(message)) return () => {};
+        status.textContent = "Checking for a link preview\u2026 if this site's previews are on, it can see this device's IP address.";
         status.hidden = false;
         return () => { status.hidden = true; status.textContent = ""; };
     }

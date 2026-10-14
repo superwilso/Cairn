@@ -113,17 +113,36 @@ claimed. Users trust *their instance operator*, plus the cryptography for E2EE t
 
 ## 3a. Conceded by the 2026-08 direction change
 
-Two protections were given up deliberately, pre-launch, and belong here rather than in the
-documents that made the changes. Neither is a bug; both are choices, and #3 requires them to
-be as visible as the guarantees.
+Protections given up deliberately, pre-launch, belong here rather than in the documents that
+made the changes. None is a bug; each is a choice, and #3 requires them to be as visible as
+the guarantees. One concession proposed at the same time — the instance seeing every URL its
+users send — is **not in effect**; what ships instead is recorded first, so nobody reads the
+old text as current.
 
-**The instance sees URLs its users send.** [ADR-009](adr/009-instance-side-unfurl.md) moved
-link unfurling from the sender's device to the instance, so a link posted in *any* tier —
-including a T1 DM — is disclosed to the instance that hosts it. It sees the URL and which
-account asked; not the message it sits in, not who else is in the room. Bounded by three
-things: it is the user's own instance rather than the linked platform, the instance already
-holds who-talks-to-whom under §3, and answers are cached so a repeat discloses nothing. A
-client must offer to turn it off, and off means a bare link.
+**Link previews: who learns what.**
+[ADR-009](adr/009-instance-side-unfurl.md) proposed having the instance unfurl links, which
+would have shown it every URL its users send. That design is superseded and was never built.
+What ships is the sender-side unfurl of [`05-embeds.md`](05-embeds.md):
+
+- **Off by default, per platform.** Instagram, YouTube, TikTok, X, Reddit and "other
+  websites" each have their own switch, all off until the user turns one on. The switches
+  are enforced in `cairn-client-core` on every request — the link, each redirect, the
+  oEmbed endpoint and the thumbnail — not only on the pasted link.
+- **The sender's device contacts the linked site** (and, for a thumbnail, its image host)
+  when that site's switch is on. That site learns the sender's IP address, that someone
+  there asked for that URL at that time, and Cairn's user-agent. If the Instagram proxy
+  switch is also on, a third-party proxy learns the same. This is a leak by construction
+  and is the reason the switches exist.
+- **The card travels inside the message.** In an end-to-end encrypted room the instance
+  relays it as ciphertext and sees neither the URL nor anything on the card. It does see
+  the ciphertext's size, and a card with a thumbnail adds up to about 64 KB, so a large
+  message may be guessable as one carrying a preview. (In T3 the instance can read
+  messages, cards included, as it can everything else there.)
+- **Recipients fetch nothing** to show a card: no page, no image, no oEmbed call. Opening
+  the link is the recipient's own click, handed to their system browser.
+- **A card is the sender's claim.** A modified client can put any title or image on any
+  link, and can ignore its own switches; the switches protect a user from their own
+  client, not from anyone else's (§7, A12).
 
 **In a browser, the instance serves the code that does the encryption.**
 [ADR-008](adr/008-client-architecture.md) made the client a web application. An instance

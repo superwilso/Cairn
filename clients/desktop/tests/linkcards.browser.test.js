@@ -12,7 +12,8 @@
 // - a reel lays out as a reel, and a reel with nothing fetched still says what it is;
 // - clicking asks Rust to open the link, and nothing in the page loads a remote image —
 //   not even when a card names one;
-// - the setting that turns previews off is on screen, says what it costs, and reaches Rust.
+// - previews start off for every site; each site has its own switch, which says what it
+//   costs and reaches Rust; the Instagram proxy cannot be on without Instagram.
 //
 // Run: node --test clients/desktop/tests/linkcards.browser.test.js
 // Set CAIRN_SCREENSHOT=/path/to.png to keep a picture of the timeline.
@@ -103,7 +104,11 @@ const history = [
     },
 ];
 
+// The stand-in for Rust's stored settings: every site off, as a fresh profile starts.
+const OFF = { instagram: false, youtube: false, tiktok: false, x: false, reddit: false, web: false, instagram_proxy: false };
+
 function stub(page, calls) {
+    let stored = { ...OFF };
     return page.exposeFunction("__invoke", async (cmd, args) => {
         calls.push([cmd, args]);
         switch (cmd) {
@@ -121,8 +126,8 @@ function stub(page, calls) {
                 await new Promise((r) => setTimeout(r, 400));
                 return { sender: ME, body: args.text, sent_at_ms: 9, historic: false, card: history[1].card };
             case "call_config": return { ice_servers: [], has_relay: false, max_participants: 6 };
-            case "link_previews": return { enabled: true, instagram_proxy: false };
-            case "set_link_previews": return null;
+            case "link_previews": return stored;
+            case "set_link_previews": stored = { ...args.settings }; return null;
             case "instagram_proxy_disclosure":
                 return "Instagram shows nothing to logged-out visitors, so a preview has to come " +
                     "from a third-party proxy. That proxy will see the link. The proxy used is zzinstagram.com.";
@@ -223,24 +228,56 @@ test(
             assert.strictEqual(claims, 4, "every card says it is the sender's");
 
             // The settings explain themselves; the proxy disclosure comes from Rust.
-            assert.ok((await page.innerText(".prefs")).includes("site sees your IP"));
+            const prefs = await page.innerText("#prefs-previews");
+            assert.ok(prefs.includes("Off for every site"), prefs);
+            assert.ok(prefs.includes("site sees your IP"), prefs);
             assert.ok((await page.innerText("#ig-proxy-note")).includes("will see the link"));
-            assert.strictEqual(await page.isChecked("#pref-ig-proxy"), false);
 
-            if (process.env.CAIRN_SCREENSHOT) {
-                await page.screenshot({ path: process.env.CAIRN_SCREENSHOT });
+            // Every site starts off, and the proxy cannot be switched on without Instagram.
+            const sites = ["instagram", "youtube", "tiktok", "x", "reddit", "web"];
+            for (const site of sites) {
+                assert.strictEqual(await page.isChecked(`input[data-site=${site}]`), false, `${site} must start off`);
             }
+            assert.strictEqual(await page.isChecked("#pref-ig-proxy"), false);
+            assert.strictEqual(await page.isDisabled("#pref-ig-proxy"), true);
 
-            // Turning previews off reaches Rust and greys out the proxy, which depends on it.
+            // With everything off, sending a link says nothing about fetching one.
+            await page.evaluate(() => CairnLinkCards.sending("https://example.com/")());
+            assert.strictEqual(await page.isHidden("#preview-status"), true);
+
+            // One switch is one platform: turning YouTube on sends exactly that to Rust.
             calls.length = 0;
-            await page.click("#pref-previews");
+            await page.check("input[data-site=youtube]");
+            await page.waitForTimeout(50);
+            assert.deepStrictEqual(
+                calls.find(([c]) => c === "set_link_previews"),
+                ["set_link_previews", { settings: { ...OFF, youtube: true } }],
+            );
+            assert.strictEqual(await page.isDisabled("#pref-ig-proxy"), true, "YouTube on is not Instagram on");
+
+            // Instagram on enables its proxy switch, which stays off until chosen.
+            await page.check("input[data-site=instagram]");
+            await page.waitForFunction(() => !document.getElementById("pref-ig-proxy").disabled);
+            assert.strictEqual(await page.isChecked("#pref-ig-proxy"), false);
+            await page.check("#pref-ig-proxy");
+            await page.waitForTimeout(50);
+            // And turning Instagram off again takes the proxy with it.
+            calls.length = 0;
+            await page.uncheck("input[data-site=instagram]");
             await page.waitForFunction(() => document.getElementById("pref-ig-proxy").disabled);
             assert.deepStrictEqual(
                 calls.find(([c]) => c === "set_link_previews"),
-                ["set_link_previews", { settings: { enabled: false, instagram_proxy: false } }],
+                ["set_link_previews", { settings: { ...OFF, youtube: true, instagram_proxy: false } }],
             );
-            await page.click("#pref-previews");
-            assert.strictEqual(await page.isDisabled("#pref-ig-proxy"), false);
+            await page.check("input[data-site=instagram]");
+            await page.waitForTimeout(50);
+
+            if (process.env.CAIRN_SCREENSHOT) {
+                await page.screenshot({ path: process.env.CAIRN_SCREENSHOT });
+                await page.locator("#prefs-previews").screenshot({
+                    path: process.env.CAIRN_SCREENSHOT.replace(/\.png$/, "-settings.png"),
+                });
+            }
 
             // A double-click on a card opens the link; it does not also send a heart.
             calls.length = 0;
