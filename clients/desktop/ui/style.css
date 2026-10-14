@@ -557,6 +557,24 @@ header.topbar button { padding: 6px 11px; }
   font-size: var(--msg-size);
 }
 
+/* New messages that arrived while the reader was up in the history. Sits over the foot of
+   the timeline (the negative margin), so showing it never moves anything. */
+.jump-new {
+  position: relative; z-index: 2;
+  align-self: center;
+  height: 30px; margin: -42px 0 12px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--surface-2);
+  color: var(--text);
+  font: 600 12px/1 var(--body, inherit);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+.jump-new:hover { background: var(--accent); color: var(--accent-ink, var(--bg)); }
+.jump-new[hidden] { display: none; }
+
 /* Nothing to show yet — a cairn, and an invitation to add to it. */
 #timeline:empty {
   display: grid;

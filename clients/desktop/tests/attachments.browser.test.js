@@ -298,6 +298,39 @@ test("attachments in the real UI", { skip }, async (t) => {
             await page.close();
         });
 
+        await t.test("a message arriving while the reader is up in the history is counted, not scrolled to", async () => {
+            const page = await openScrolled(browser, base);
+            await page.evaluate(() => window.__release());
+            await photoLoaded(page);
+            await page.$eval("#timeline", (t) => { t.scrollTop = 120; });
+            await page.waitForFunction(() => document.getElementById("timeline").scrollTop === 120);
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            await page.evaluate(() => addMessage({ sender: "usr_bob00000", body: "are you there?", sent_at_ms: 99, historic: false }));
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            assert.strictEqual(await page.$eval("#timeline", (t) => t.scrollTop), 120, "the reader was moved");
+            assert.strictEqual(await page.isVisible("#jump-new"), true);
+            assert.strictEqual(await page.innerText("#jump-new"), "1 new message \u2193");
+
+            // The button takes them down and goes away.
+            await page.click("#jump-new");
+            await page.waitForFunction(() => {
+                const t = document.getElementById("timeline");
+                return t.scrollHeight - t.scrollTop - t.clientHeight <= 2;
+            });
+            assert.strictEqual(await page.isVisible("#jump-new"), false);
+
+            // A message of one's own always brings the reader to it.
+            await page.$eval("#timeline", (t) => { t.scrollTop = 120; });
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            await page.evaluate(() => addMessage({ sender: "usr_me000000", body: "here", sent_at_ms: 100, historic: false }));
+            await page.waitForFunction(() => {
+                const t = document.getElementById("timeline");
+                return t.scrollHeight - t.scrollTop - t.clientHeight <= 2;
+            });
+            assert.strictEqual(await page.isVisible("#jump-new"), false);
+            await page.close();
+        });
+
         await t.test("an oversized file is refused before it is read or sent", async () => {
             const { page } = await openApp(browser, base, { maxBytes: 1000, hostileName });
             await page.setInputFiles("#file-input", { name: "big.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(2000) });

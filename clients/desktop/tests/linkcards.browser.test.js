@@ -228,6 +228,7 @@ test(
             assert.strictEqual(claims, 4, "every card says it is the sender's");
 
             // The settings explain themselves; the proxy disclosure comes from Rust.
+            await page.click("#open-settings");
             const prefs = await page.innerText("#prefs-previews");
             assert.ok(prefs.includes("Off for every site"), prefs);
             assert.ok(prefs.includes("site sees your IP"), prefs);
@@ -278,6 +279,9 @@ test(
                     path: process.env.CAIRN_SCREENSHOT.replace(/\.png$/, "-settings.png"),
                 });
             }
+
+            // The previews live in the settings panel now; close it to get back to the cards.
+            await page.click("#settings-close");
 
             // A double-click on a card opens the link; it does not also send a heart.
             calls.length = 0;

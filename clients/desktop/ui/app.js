@@ -845,7 +845,7 @@ function addMessage(m) {
     // Avatar, timestamp and grouping are appearance, and settings.js's (CairnLook).
     const li = CairnLook.decorate(CairnMessages.render(m), m);
     $("timeline").append(li);
-    li.scrollIntoView({ block: "end" });
+    CairnMessages.arrived(li, m.sender === myUser);
 }
 
 function addNotice(text) {
@@ -853,7 +853,7 @@ function addNotice(text) {
     li.className = "notice";
     li.textContent = text;
     $("timeline").append(li);
-    li.scrollIntoView({ block: "end" });
+    CairnMessages.arrived(li, false);
     return li;
 }
 

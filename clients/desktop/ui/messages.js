@@ -325,6 +325,37 @@ const CairnMessages = (() => {
     // bytes arrive.
     const PIN_PX = 48;
     let pinned = true;
+    // New messages that arrived while the reader was up in the history. They are counted on
+    // a button rather than scrolled to: a message landing should not take someone's place.
+    let unseen = 0;
+    let jump = null;
+
+    function showJump() {
+        if (!jump) return;
+        jump.hidden = unseen === 0;
+        jump.textContent = unseen === 1 ? "1 new message \u2193" : unseen + " new messages \u2193";
+    }
+
+    function toBottom(timeline) {
+        pinned = true;
+        unseen = 0;
+        showJump();
+        timeline.scrollTop = timeline.scrollHeight;
+    }
+
+    // Called by the app for every message or notice it appends. The reader's own messages
+    // always bring them down to it; anything else only does if they were already there.
+    function arrived(li, mine) {
+        const timeline = $("timeline");
+        if (!timeline) return;
+        if (pinned || mine) {
+            toBottom(timeline);
+            li.scrollIntoView({ block: "end" });
+        } else {
+            unseen += 1;
+            showJump();
+        }
+    }
 
     function follow(timeline) {
         const atBottom = () =>
@@ -336,8 +367,10 @@ const CairnMessages = (() => {
         let lastTop = timeline.scrollTop;
         timeline.addEventListener("scroll", () => {
             const top = timeline.scrollTop;
-            if (atBottom()) pinned = true;
-            else if (top < lastTop) pinned = false;
+            if (atBottom()) {
+                pinned = true;
+                if (unseen) { unseen = 0; showJump(); }
+            } else if (top < lastTop) pinned = false;
             lastTop = top;
         }, { passive: true });
         const sizes = new ResizeObserver(() => {
@@ -354,8 +387,16 @@ const CairnMessages = (() => {
                 for (const n of r.removedNodes) if (n.nodeType === 1) sizes.unobserve(n);
             }
             // A cleared timeline is a newly opened room, which starts at its newest message.
-            if (!timeline.firstElementChild) { pinned = true; lastTop = 0; }
+            if (!timeline.firstElementChild) { pinned = true; lastTop = 0; unseen = 0; showJump(); }
         }).observe(timeline, { childList: true });
+
+        jump = document.createElement("button");
+        jump.type = "button";
+        jump.id = "jump-new";
+        jump.className = "jump-new";
+        jump.hidden = true;
+        jump.addEventListener("click", () => toBottom(timeline));
+        timeline.after(jump);
     }
 
     function init(h) {
@@ -371,5 +412,5 @@ const CairnMessages = (() => {
         });
     }
 
-    return { init, render, send, handle, cancelReply, QUICK };
+    return { init, render, send, handle, cancelReply, arrived, QUICK };
 })();

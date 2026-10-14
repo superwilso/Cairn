@@ -108,7 +108,7 @@
     <div class="mast">
       <svg class="stones" aria-hidden="true"><use href="#i-cairn"/></svg>
       <span class="wordmark">Cairn</span>
-      <button id="open-settings" class="ghost" title="Appearance" aria-label="Appearance">
+      <button id="open-settings" class="ghost" title="Settings" aria-label="Settings">
         <svg width="17" height="17"><use href="#i-gear"/></svg>
       </button>
     </div>
@@ -245,26 +245,6 @@
       <p id="relay-note" class="note"></p>
     </div>
 
-    <!-- Link previews. The descriptions say what each setting reveals and to whom, because
-         a toggle that hides its cost is a choice made for the user. -->
-    <div class="prefs" id="prefs-previews">
-      <h2 class="section">Link previews</h2>
-      <p class="note lead">Off for every site until you turn it on. To build a preview, this
-        device opens the link, so that site sees your IP address. In an encrypted room the
-        preview then travels inside the message, so your instance never sees the link, and
-        people you send it to fetch nothing.</p>
-      <fieldset class="sites">
-        <legend>Preview links I send to</legend>
-        <label class="toggle"><input type="checkbox" data-site="instagram"> Instagram</label>
-        <label class="toggle"><input type="checkbox" data-site="youtube"> YouTube</label>
-        <label class="toggle"><input type="checkbox" data-site="tiktok"> TikTok</label>
-        <label class="toggle"><input type="checkbox" data-site="x"> X</label>
-        <label class="toggle"><input type="checkbox" data-site="reddit"> Reddit</label>
-        <label class="toggle"><input type="checkbox" data-site="web"> Other websites</label>
-      </fieldset>
-      <label class="toggle"><input type="checkbox" id="pref-ig-proxy"> Use a proxy for Instagram</label>
-      <p id="ig-proxy-note" class="note"></p>
-    </div>
   </section>
 </div>
 
@@ -292,6 +272,28 @@
 </div>
 
 <!-- Appearance. Built by settings.js; nothing in it reaches the encryption indicators. -->
+<!-- Parked here until the settings panel is first built; settings.js moves it into the
+     panel's Privacy section. linkcards.js binds these nodes on load, so moving them keeps
+     the bindings. -->
+<!-- Link previews. The descriptions say what each setting reveals and to whom, because
+         a toggle that hides its cost is a choice made for the user. -->
+    <div class="prefs" id="prefs-previews" hidden>
+            <p class="note lead">Off for every site until you turn it on. To build a preview, this
+        device opens the link, so that site sees your IP address. In an encrypted room the
+        preview then travels inside the message, so your instance never sees the link, and
+        people you send it to fetch nothing.</p>
+      <fieldset class="sites">
+        <legend>Preview links I send to</legend>
+        <label class="toggle"><input type="checkbox" data-site="instagram"> Instagram</label>
+        <label class="toggle"><input type="checkbox" data-site="youtube"> YouTube</label>
+        <label class="toggle"><input type="checkbox" data-site="tiktok"> TikTok</label>
+        <label class="toggle"><input type="checkbox" data-site="x"> X</label>
+        <label class="toggle"><input type="checkbox" data-site="reddit"> Reddit</label>
+        <label class="toggle"><input type="checkbox" data-site="web"> Other websites</label>
+      </fieldset>
+      <label class="toggle"><input type="checkbox" id="pref-ig-proxy"> Use a proxy for Instagram</label>
+      <p id="ig-proxy-note" class="note"></p>
+    </div>
 <div id="settings" class="sheet" hidden></div>
 
 <script src="call.js"></script>

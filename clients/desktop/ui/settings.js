@@ -517,6 +517,16 @@ const CairnLook = (() => {
         return el("div", { class: "range" }, el("label", { for: "set-" + key, text: label }), input, out);
     }
 
+    // Link previews live here rather than in the members column, where seven toggles and
+    // their explanations pushed the member list out of sight. The nodes come from
+    // index.html, already bound by linkcards.js, so they are moved rather than rebuilt.
+    function privacy() {
+        const prefs = $("prefs-previews");
+        if (!prefs) return el("span");
+        prefs.hidden = false;
+        return section("Link previews", null, prefs);
+    }
+
     function build() {
         const sheet = $("settings");
         if (!sheet || sheet.dataset.built) return;
@@ -629,7 +639,7 @@ const CairnLook = (() => {
 
         const panel = el("div", { class: "panel set-panel", role: "dialog", "aria-modal": "true", "aria-labelledby": "settings-title" },
             el("header", {},
-                el("h3", { id: "settings-title", text: "Appearance" }),
+                el("h3", { id: "settings-title", text: "Settings" }),
                 el("span", { class: "grow mono", text: "this device only" }),
                 close),
             el("div", { class: "set-body" },
@@ -660,6 +670,7 @@ const CairnLook = (() => {
                     json,
                     el("div", { class: "row" }, exp, copy, el("span", { class: "grow" }), pick, imp),
                     file, status),
+                privacy(),
                 el("div", { class: "row end" }, reset)));
         sheet.append(panel);
         sheet.addEventListener("click", (ev) => { if (ev.target === sheet) closePanel(); });

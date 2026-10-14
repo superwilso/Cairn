@@ -406,12 +406,7 @@ fn fetch_oembed(link: &oembed::OembedLink, url: &str, budget: Budget) -> Result<
     if !content_type(&response).contains("json") {
         return Err(UnfurlError::NotHtml);
     }
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_OEMBED)
-        .read_to_string()
-        .map_err(|e| UnfurlError::Fetch(e.to_string()))?;
+    let body = read_text(&mut response, MAX_OEMBED, budget)?;
     oembed::card_from_response(link, url, &body)
         .ok_or_else(|| UnfurlError::Fetch("oEmbed answer had nothing to show".into()))
 }
@@ -437,12 +432,7 @@ fn fetch_and_parse_within(
     if !content_type.is_empty() && !content_type.contains("html") {
         return Err(UnfurlError::NotHtml);
     }
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_to_string()
-        .map_err(|e| UnfurlError::Fetch(e.to_string()))?;
+    let body = read_text(&mut response, MAX_BODY, budget)?;
 
     let mut card = parse_metadata(&body, url);
     card.source = CardSource::Public;
@@ -493,12 +483,44 @@ fn fetch_image(url: &str, budget: Budget) -> Result<Vec<u8>, UnfurlError> {
     if !content_type(&response).starts_with("image/") {
         return Err(UnfurlError::NotHtml);
     }
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_IMAGE)
-        .read_to_vec()
-        .map_err(|e| UnfurlError::Fetch(e.to_string()))
+    read_body(&mut response, MAX_IMAGE, budget)
+}
+
+/// Read a body, at most `limit` bytes, and stop when the preview's deadline passes.
+///
+/// **Why the deadline is checked here as well as in the client.** The client's own global
+/// timeout is the first line, and it held in every isolated run. But one full CI run on
+/// 2026-10-14 saw `a_server_that_trickles_forever_cannot_hold_the_preview_past_its_deadline`
+/// take 40s — the whole trickle — so that line alone cannot be what the budget rests on.
+/// Each read here returns as soon as any byte arrives, so a server that trickles one byte at
+/// a time is cut off within one read of the deadline whatever the client does.
+fn read_body(
+    response: &mut ureq::http::Response<ureq::Body>,
+    limit: u64,
+    budget: Budget,
+) -> Result<Vec<u8>, UnfurlError> {
+    use std::io::Read;
+    let mut reader = response.body_mut().with_config().limit(limit).reader();
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        budget.remaining()?;
+        let n = reader.read(&mut chunk).map_err(|e| UnfurlError::Fetch(e.to_string()))?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// [`read_body`], as UTF-8 text.
+fn read_text(
+    response: &mut ureq::http::Response<ureq::Body>,
+    limit: u64,
+    budget: Budget,
+) -> Result<String, UnfurlError> {
+    String::from_utf8(read_body(response, limit, budget)?)
+        .map_err(|_| UnfurlError::Fetch("the body is not UTF-8".into()))
 }
 
 /// Exposed for the thumbnail module's tests and nothing else.
