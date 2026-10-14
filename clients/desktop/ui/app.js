@@ -49,6 +49,7 @@ $("go").onclick = async () => {
         $("whoami").textContent = short(me.user);
         $("whoami").title = me.user;
         $("avatar").textContent = initials(me.user);
+        await CairnProfile.signedIn(me.user);
 
         // The transport badge is not cosmetic. MLS protects message bodies either way, but
         // over http:// every id, every membership change and every request is in the clear
@@ -166,6 +167,7 @@ async function selectRoom(room) {
     CairnAttach.reset();
     try {
         const history = await invoke("open_room", { room });
+        await CairnProfile.load();
         for (const m of history) addMessage(m);
     } catch (e) { fail($("error"), e); }
 
@@ -206,6 +208,7 @@ async function refreshMembers() {
         who.textContent = short(m.user) + (m.role === "owner" ? " · owner" : "");
 
         li.append(av, who);
+        CairnProfile.member(li, av, who, m);
         li.title = m.user;
 
         if (!m.in_group) {
@@ -778,6 +781,7 @@ async function tick() {
     for (const ev of events) {
         if (CairnMessages.handle(ev)) continue;
         if (CairnTimer.handle(ev)) continue;
+        if (CairnProfile.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -822,7 +826,14 @@ function addNotice(text) {
     return li;
 }
 
-CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
+CairnMessages.init({
+    me: () => myUser, short, onError: (e) => fail($("error"), e),
+    author: (li, who, m) => CairnProfile.author(li, who, m),
+});
+CairnProfile.init({
+    invoke, openSafety: (user) => openSafety(user), roomOpen: () => !!openRoom,
+    onError: (e) => fail($("error"), e),
+});
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();
