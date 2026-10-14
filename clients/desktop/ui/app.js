@@ -842,7 +842,8 @@ async function tick() {
 
 // Drawing a message, and replying and reacting to it, are messages.js's.
 function addMessage(m) {
-    const li = CairnMessages.render(m);
+    // Avatar, timestamp and grouping are appearance, and settings.js's (CairnLook).
+    const li = CairnLook.decorate(CairnMessages.render(m), m);
     $("timeline").append(li);
     li.scrollIntoView({ block: "end" });
 }

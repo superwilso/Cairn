@@ -135,6 +135,12 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/linkcards.browser.test.js
+      - name: Appearance settings in a browser
+        # Themes and custom CSS are client-side only; this proves they work and that they
+        # cannot hide or repaint the encryption badge (docs/13-customisation.md section 5).
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/settings.browser.test.js
 
   lint:
     name: fmt + clippy
