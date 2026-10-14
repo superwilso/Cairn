@@ -166,10 +166,14 @@ async function selectRoom(room) {
     $("room-id").title = room;
     $("timeline").textContent = "";
     CairnAttach.reset();
+    CairnEmoji.reset();
     try {
         const history = await invoke("open_room", { room });
         await CairnProfile.load();
         for (const m of history) addMessage(m);
+        // Not awaited: the room's set is drawn from the cache at once, and anything missing
+        // is downloaded — all of it — and swapped in, without holding up the room.
+        CairnEmoji.load();
     } catch (e) { fail($("error"), e); }
 
     // Derived in Rust from the room's sealed shape, never taken from the instance. An empty
@@ -493,6 +497,32 @@ CairnGifs.bind({
     onError: (e) => fail($("error"), e),
 });
 
+// ---- emoji, stickers, sounds ------------------------------------------------
+//
+// emoji.js draws a room's set from this device's cache and owns the picker; customise.js is
+// the panel that changes it; soundboard.js plays clips into a call. Rust decides who may
+// change the set and downloads all of it when it changes.
+
+CairnEmoji.bind({
+    invoke,
+    button: $("emoji"),
+    input: $("text"),
+    canSend: () => (openRoom ? true : (fail($("error"), "Open a room first."), false)),
+    onSent: (view) => { fail($("error"), null); addMessage(view); },
+    onError: (e) => fail($("error"), e),
+});
+CairnCustomise.bind({
+    invoke,
+    button: $("customise-btn"),
+    roomOpen: () => !!openRoom,
+    onError: (e) => fail($("error"), e),
+});
+CairnSoundboard.bind({
+    bar: document.querySelector("#stage .callbar"),
+    inCall: () => inCall,
+    onError: (e) => fail($("error"), e),
+});
+
 // ---- calls -----------------------------------------------------------------
 
 CairnCall.bind({
@@ -812,6 +842,7 @@ async function tick() {
         if (CairnMessages.handle(ev)) continue;
         if (CairnTimer.handle(ev)) continue;
         if (CairnProfile.handle(ev)) continue;
+        if (CairnEmoji.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -828,6 +859,7 @@ async function tick() {
             for (const who of ev.left) addNotice("left the group: " + short(who));
         } else if (ev.kind === "removed") {
             addNotice("You were removed from this room.");
+            CairnEmoji.reset();
             closeSafety();
             if (inCall) await hangUp();
             clearInterval(pollTimer);
