@@ -20,11 +20,11 @@
 use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
-use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::custom::Kind as CustomKind;
+use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
-    CustomLimits, CustomSetView, Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
-    ProfileView, ReactionView, RoomSummary, Session,
+    CustomLimits, CustomSetView, Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView,
+    ProfileEdit, ProfileLimits, ProfileView, ReactionView, RoomSummary, Session,
 };
 use cairn_client_core::verify::SafetyView;
 use tauri::State;

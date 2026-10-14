@@ -319,7 +319,11 @@ fn someone_who_joins_later_receives_the_set() {
     drain(&mut carol);
     let set = carol.custom_set().unwrap();
     assert_eq!(names(&set, Kind::Emoji), ["party_parrot"]);
-    assert_eq!(carol.sync_custom().unwrap(), 3, "the blobs uploaded before she joined open for her");
+    assert_eq!(
+        carol.sync_custom().unwrap(),
+        3,
+        "the blobs uploaded before she joined open for her"
+    );
 }
 
 #[test]
@@ -339,7 +343,10 @@ fn a_sticker_is_sent_by_name_and_drawn_from_the_cache() {
         .unwrap();
     assert_eq!(got.body, ":wave:");
     let set = bob.custom_set().unwrap();
-    assert_eq!(bob.custom_asset(&id_of(&set, Kind::Sticker, "wave")).unwrap(), png(b"wave sticker"));
+    assert_eq!(
+        bob.custom_asset(&id_of(&set, Kind::Sticker, "wave")).unwrap(),
+        png(b"wave sticker")
+    );
     assert!(alice.send_sticker("nope").is_err(), "only a sticker in the room's set");
 
     // It survives a reopen as a sticker, not as text.
