@@ -396,6 +396,15 @@ Four calls made by the owner, so a session does not re-litigate them:
       that is somebody's short id) are flagged and shown with the id rather than trusted.
       **Not done:** binding the decrypted ciphertext to the envelope's signer (needs the MLS
       sender from `cairn-crypto`), and sending changes into rooms that are not open.
+- [x] **Custom emoji, stickers and a soundboard the instance cannot read** — a room's set
+      travels as one encrypted record, every member downloads all of it when it changes, and
+      drawing one makes no request (`13-customisation.md` §3a). Clips are mixed into the
+      caller's microphone, so playing one sends nothing.
+
+      **Probed:** a plain member whose client believed it was the owner sent a set, and every
+      other member ignored it. **Not done:** roles are the instance's word, so a malicious
+      instance can grant a member the right to change a set; listeners cannot turn down a
+      mixed clip apart from the voice it rides in; a user's personal emoji in DMs.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
