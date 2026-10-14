@@ -1,6 +1,7 @@
 # Customisation, and why most of Nitro is free here
 
-**Status:** Design. Nothing here is built.
+**Status:** Design. §4's themes and §5's protection are built in the desktop client
+(`clients/desktop/ui/settings.js`); custom emoji, plugins and the rest are not.
 
 The question this answers: can Cairn match Discord's customisation, and give away what Nitro
 charges for? Mostly yes — and the reason is not generosity. **Most of Nitro is artificial
@@ -135,6 +136,20 @@ control.** Not "themes are discouraged from restyling them" — structurally unr
 same way the tier has no setter. A customisation system that can repaint the security
 indicators has made those indicators worthless, and per non-negotiable #3 an indicator that
 can lie is worse than no indicator.
+
+**As built (desktop client).** Three layers, and the limit of the third stated plainly:
+
+1. Themes are data — hex colour tokens and enumerated choices, validated key by key on
+   import. A theme cannot carry a selector, and the indicators take no colour from tokens.
+2. The indicators' rules live in the first-declared CSS cascade layer with every
+   declaration `!important`; for important declarations the earliest layer beats every
+   later layer and all unlayered CSS, so no theme or user CSS can restyle the badge element.
+   User CSS that declares or joins a layer is refused, checked by the browser's own parser.
+3. User CSS can still act on an ancestor or paint over a badge. A tripwire measures each
+   indicator (visibility, size, ancestor opacity and filters, the colours the layer paints,
+   and a hit-test at its centre) and switches user CSS off when one fails. That is a check of
+   what the page can measure, not structural: an overlay with `pointer-events: none` is
+   invisible to hit-testing. Regression tests: `clients/desktop/tests/settings.browser.test.js`.
 
 ## 6. What this is worth
 

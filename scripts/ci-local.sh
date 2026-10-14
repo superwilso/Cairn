@@ -111,6 +111,13 @@ if command -v node >/dev/null 2>&1; then
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/messaging.browser.test.js
+
+        # Appearance settings: that themes, accent, custom CSS and theme import/export work,
+        # and that none of them can hide or repaint an encryption indicator.
+        run "desktop appearance settings in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/settings.browser.test.js
     fi
 else
     printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'
