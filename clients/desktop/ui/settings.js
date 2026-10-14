@@ -527,6 +527,19 @@ const CairnLook = (() => {
         return section("Link previews", null, prefs);
     }
 
+    // Voice & video, moved in from the members column for the same reason: device pickers,
+    // input mode and the relay switch are settings, and they crowded out the people. The
+    // nodes keep their ids, which call.js, app.js and callui.js are bound to.
+    function voice() {
+        const prefs = $("prefs-voice");
+        if (!prefs) return el("span");
+        prefs.hidden = false;
+        return section("Voice & video",
+            "Everything here stays on this device. Nobody in a call is told your settings, " +
+            "only whether you are muted or deafened.",
+            prefs);
+    }
+
     function build() {
         const sheet = $("settings");
         if (!sheet || sheet.dataset.built) return;
@@ -670,6 +683,7 @@ const CairnLook = (() => {
                     json,
                     el("div", { class: "row" }, exp, copy, el("span", { class: "grow" }), pick, imp),
                     file, status),
+                voice(),
                 privacy(),
                 el("div", { class: "row end" }, reset)));
         sheet.append(panel);
