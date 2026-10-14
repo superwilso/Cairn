@@ -143,6 +143,13 @@ instance — a disappearing timer removes this device's key, not the server's ci
 Usernames and disappearing messages remain the two items that can proceed in parallel,
 since neither needs attachments.
 
+**Voice notes and a GIF picker** now ride on attachments in the desktop client. A voice note
+is a MediaRecorder recording (Opus) sent through the attachment path, played back with a
+waveform decoded locally. GIFs follow [`14-gifs.md`](14-gifs.md): search tunnels through the
+user's own instance with TLS to the provider, and a chosen GIF is re-hosted as an encrypted
+attachment. Both KLIPY and GIPHY are supported; neither is on until an operator adds a key,
+and KLIPY needs its written approval first (§1 there).
+
 ### Direction: Discord's real-time features
 
 Voice calls, group calls and screen sharing are what keep communities on Discord, and

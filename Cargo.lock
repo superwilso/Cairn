@@ -337,12 +337,15 @@ dependencies = [
  "cairn-crypto",
  "cairn-proto",
  "hex",
+ "httparse",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tracing",
  "ureq",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -396,8 +399,11 @@ dependencies = [
  "cairn-crypto",
  "cairn-proto",
  "hex",
+ "hyper",
+ "hyper-util",
  "rand 0.8.7",
  "redb",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

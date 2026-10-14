@@ -115,6 +115,16 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/messaging.browser.test.js
+      - name: Voice notes in the real UI
+        # Chromium's fake microphone feeds MediaRecorder, so a real recording is made, sent
+        # as bytes, and played back through the waveform player.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/voice.browser.test.js
+      - name: The GIF picker in the real UI
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/gifs.browser.test.js
 
   lint:
     name: fmt + clippy

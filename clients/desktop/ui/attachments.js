@@ -76,13 +76,17 @@ const CairnAttach = (() => {
         return sendBytes(bytes, file.name || "file", file.type);
     }
 
-    async function objectUrl(att) {
+    async function load(att) {
         const bytes = bytesOf(await invoke("fetch_attachment", { id: att.id }));
         // The type is Rust's normalised one, and only reaches a Blob for kinds Rust chose to
         // show inline. A "file" never becomes a URL the webview could navigate to.
         const url = URL.createObjectURL(new Blob([bytes], { type: att.mime }));
         urls.add(url);
-        return url;
+        return { bytes, url };
+    }
+
+    async function objectUrl(att) {
+        return (await load(att)).url;
     }
 
     async function save(att) {
@@ -131,6 +135,9 @@ const CairnAttach = (() => {
             img.alt = att.name;
             box.append(img, caption(att));
             objectUrl(att).then((url) => { img.src = url; }, (e) => { img.remove(); failed(box, e); });
+        } else if (att.kind === "audio" && typeof CairnVoice !== "undefined") {
+            // voice.js draws a player with a waveform, decoded from the same bytes.
+            box.append(CairnVoice.player(att, () => load(att)), caption(att));
         } else if (att.kind === "audio") {
             const audio = document.createElement("audio");
             audio.controls = true;

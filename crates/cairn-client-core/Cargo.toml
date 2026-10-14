@@ -23,7 +23,13 @@ uuid.workspace = true
 # `ureq` is blocking and rustls-backed, which matches the rest of the client: `mls-rs` is
 # sync here, so no async runtime has to cross the FFI boundary (ADR-006).
 ureq = { version = "3", optional = true }
+# The GIF relay (`gifs`): this client speaks TLS to the provider *through* a tunnel the
+# instance opens, which `ureq` cannot be pointed at. The same rustls and roots `ureq`
+# already brings in, named directly; `httparse` is already in the tree under the server.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+webpki-roots = { version = "1", optional = true }
+httparse = { version = "1", optional = true }
 
 [features]
 default = ["http"]
-http = ["dep:ureq"]
+http = ["dep:ureq", "dep:rustls", "dep:webpki-roots", "dep:httparse"]

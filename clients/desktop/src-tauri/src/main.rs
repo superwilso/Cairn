@@ -20,6 +20,7 @@
 use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
+use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
     Event, MemberView, MessageView, ReactionView, RoomSummary, Session,
 };
@@ -361,6 +362,57 @@ fn set_room_timer(state: State<'_, AppState>, ttl_ms: Option<i64>) -> CmdResult<
     with(&state, |s| s.set_room_timer(ttl_ms))
 }
 
+// ---- GIFs ------------------------------------------------------------------
+//
+// Search, previews and the fetch for sending all run through the instance's relay, off the
+// main thread and without the session lock — `Gifs` is shared out of the session for that.
+// The UI only ever holds opaque result ids; see `cairn_client_core::gifs`.
+
+fn gifs_of(app: &tauri::AppHandle) -> CmdResult<std::sync::Arc<cairn_client_core::gifs::Gifs>> {
+    with_app(app, |s| s.gifs())
+}
+
+/// The providers this instance relays, with each one's required placeholder and
+/// attribution. Empty when the operator configured none.
+#[tauri::command]
+async fn gif_providers(app: tauri::AppHandle) -> CmdResult<Vec<GifProviderView>> {
+    off_main(move || gifs_of(&app)?.providers().map_err(|e| e.to_string())).await
+}
+
+/// Search one provider, or list what is trending when `query` is blank.
+#[tauri::command]
+async fn gif_search(
+    app: tauri::AppHandle,
+    provider: String,
+    query: String,
+) -> CmdResult<Vec<GifView>> {
+    off_main(move || gifs_of(&app)?.search(&provider, &query).map_err(|e| e.to_string())).await
+}
+
+/// A result's preview, as raw bytes, by the id a search returned.
+#[tauri::command]
+async fn gif_preview(app: tauri::AppHandle, id: String) -> CmdResult<tauri::ipc::Response> {
+    off_main(move || {
+        let media = gifs_of(&app)?.preview(&id).map_err(|e| e.to_string())?;
+        Ok(tauri::ipc::Response::new(media.bytes))
+    })
+    .await
+}
+
+/// Send a result to the open room as an encrypted attachment. The same three steps as
+/// `send_file`, with the fetch through the relay in front.
+#[tauri::command]
+async fn send_gif(app: tauri::AppHandle, id: String) -> CmdResult<MessageView> {
+    off_main(move || {
+        let file = gifs_of(&app)?.fetch_for_sending(&id).map_err(|e| e.to_string())?;
+        let pending = with_app(&app, |s| s.prepare_upload(&file.name, file.mime, &file.bytes))?;
+        drop(file);
+        let uploaded = pending.upload().map_err(|e| e.to_string())?;
+        with_app(&app, |s| s.send_uploaded(uploaded))
+    })
+    .await
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -393,6 +445,10 @@ fn main() {
             set_room_timer,
             reply,
             react,
+            gif_providers,
+            gif_search,
+            gif_preview,
+            send_gif,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

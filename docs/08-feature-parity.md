@@ -24,7 +24,7 @@ Legend: ✅ has it · ⚠️ partial or qualified · ❌ lacks it · 🎯 Cairn 
 | Typing indicators | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | ⚠️ local history stored, search unbuilt |
 | Scheduled messages | ❌ | ❌ | ⚠️ | ❌ | ✅ | 🎯 v2 |
-| Voice messages | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
+| Voice messages | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ desktop — recorded Opus, sent as an encrypted attachment |
 
 **Note on search.** Telegram's server-side search over all history is a genuine advantage
 that E2EE products structurally cannot match. Cairn's tiering means public communities get
@@ -74,7 +74,7 @@ question in `01-threat-model.md` §10.
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
 | Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ end to end |
-| GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 — designed in [`14-gifs.md`](14-gifs.md); Tenor's API shut down June 2026, and the naive build leaks search terms and readers to the provider |
+| GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ desktop — KLIPY and/or GIPHY through the instance relay, sent as an encrypted attachment ([`14-gifs.md`](14-gifs.md)); off until the operator adds a key |
 | Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
 | Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |
 | Large file limits | ⚠️ paywalled | ⚠️ | ⚠️ 2 GB | ⚠️ | ✅ 2 GB free | 🎯 operator-set |

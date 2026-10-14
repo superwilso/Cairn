@@ -120,6 +120,23 @@ pub enum ServerError {
     RoomInviteInvalid,
     #[error("an invite may admit at most {MAX_INVITE_USES} people; an unlimited one would be a public invite")]
     InviteUsesTooHigh,
+    /// The operator has configured no GIF provider. Not an error in the client's eyes: the
+    /// picker is meant to say so, and this is how a client that asked anyway finds out.
+    #[error("this instance has no GIF provider configured")]
+    GifsDisabled,
+    /// A tunnel to somewhere other than a configured provider's hosts on port 443.
+    ///
+    /// The relay is a door into the instance's network if this check is wrong, so every
+    /// refusal is the same refusal: someone probing for internal hosts learns nothing from
+    /// the message about which part of the target was disallowed.
+    #[error("the GIF relay only connects to the configured providers' own hosts, on port 443")]
+    GifTargetRefused,
+    /// The provider could not be reached from the instance.
+    #[error("the GIF provider could not be reached from this instance")]
+    GifUpstreamUnreachable,
+    /// Operator configuration for the GIF relay that would not work. Startup only.
+    #[error("GIF relay configuration: {0}")]
+    GifConfigInvalid(String),
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -222,7 +239,8 @@ pub const MIN_INVITE_TOKEN_LEN: usize = 16;
 /// attacker could drive.
 const MAX_TRACKED_ADDRESSES: usize = 10_000;
 
-/// The window the claim, upload, send, and registration limits are all measured over.
+/// The window the claim, upload, send, registration, and GIF relay limits are all measured
+/// over.
 pub const CLAIM_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 /// How far outside the present a signed request's timestamp may be.
@@ -554,6 +572,12 @@ pub struct Instance {
     /// Bounds message flooding. Sending is authenticated, so unlike registration this needs
     /// no knowledge of the caller's address and lives entirely here with the other rules.
     send_budget: Mutex<WindowBudget>,
+    /// The operator's GIF providers, if any. Configuration, not state: read from the
+    /// environment at startup and never persisted, so removing a key turns that provider
+    /// off. See [`crate::gif_relay`].
+    pub(crate) gif_relay: Mutex<Option<crate::gif_relay::GifRelayConfig>>,
+    /// Bounds what one account can relay. Not persisted, as above.
+    pub(crate) gif_limiter: Mutex<crate::gif_relay::GifRelayLimiter>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -589,6 +613,8 @@ impl Instance {
             lookup_limiter: Mutex::new(HashMap::new()),
             upload_budget: Mutex::default(),
             send_budget: Mutex::default(),
+            gif_relay: Mutex::new(None),
+            gif_limiter: Mutex::default(),
             registration_limiter: Mutex::default(),
             franking_key,
             storage,

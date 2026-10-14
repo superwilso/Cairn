@@ -1,6 +1,7 @@
 # GIF pickers, and the provider problem
 
-**Status:** Design. Nothing here is built.
+**Status:** Built, in the shape below — relay on the instance, picker in the desktop client,
+both KLIPY and GIPHY. See §7 for what exists and §1 for what KLIPY's terms turned out to say.
 
 A GIF picker is table stakes — `08-feature-parity.md` lists it, and it is one of the
 everyday things whose absence makes a messenger feel unfinished. It is also, built the
@@ -21,11 +22,22 @@ Tenor's shutdown is the important one: it was the default free choice, and every
 that depended on it needed a migration this summer. That is why Klipy exists in the shape it
 does — it is a drop-in for the thing that just died.
 
-**One thing I could not verify:** `docs.klipy.com` and `dev.to` are both blocked from this
-environment, so the free tier's actual terms — rate limits, whether the Ads API is genuinely
-optional, what tracking the client is expected to permit — are **unread**. Everything below
-about Klipy comes from its GitHub README and secondary sources. Read the terms before
-committing to it; the ad question in §4 turns entirely on them.
+**KLIPY's terms, read October 2026** (`docs.klipy.com` was reachable this time). The content
+API works without the Ads API: search and trending parameters such as `customer_id` are
+documented as optional, and an advert arrives as a result with `type: "ad"` carrying HTML to
+render. But KLIPY's standard
+[integration requirements](https://docs.klipy.com/integration-requirements) say requests and
+media must come from the end-user's device and *not* through partner proxies, that media must
+not be re-hosted, and that search results must not be filtered — each "without prior written
+approval". This design does all three deliberately: §3's relay, §3's re-hosting, and §4's ad
+removal. So **KLIPY is usable on an instance only with KLIPY's written approval**, and
+`11-self-hosting.md` tells operators so before they set the key. KLIPY also *requires* the
+search box placeholder "Search KLIPY", which the client shows.
+
+GIPHY's API terms page was not reachable from this environment (403), so its terms remain
+unread here; its API documentation was, and confirms the "Powered by GIPHY" attribution and
+that trending must be called "from the client side" — which the tunnel satisfies, since the
+request is built and encrypted on the client.
 
 ## 2. The privacy problem, which is the real design
 
@@ -122,7 +134,8 @@ dependency each operator inherits:
 - **An API key is per-instance.** A shipped default key would be rate-limited into
   uselessness by the first ten instances, and would put the project's name on everyone's
   quota. So it is operator configuration, like `CAIRN_INVITES`.
-- **No key must degrade gracefully.** The picker is hidden, not broken, and the docs should
+- **No key must degrade gracefully.** The picker says GIF search isn't configured on this instance,
+  rather than breaking or vanishing without explanation, and the docs
   say a fresh instance has no GIF search until the operator adds a key.
 - **The relay costs the operator bandwidth**, since every search and preview goes through
   them. Modest next to attachments, but it belongs in the same sizing conversation as
@@ -132,13 +145,45 @@ dependency each operator inherits:
 
 Behind attachments, which are behind the transport work already in flight. Concretely:
 
-1. Attachments end to end *(in progress)*.
-2. Relay endpoint on the instance, plus the operator key configuration.
+1. Attachments end to end *(done)*.
+2. Relay endpoint on the instance, plus the operator key configuration *(done, §7)*.
 3. Picker in a client that has a UI — per ADR-006 this is native-client work, and a terminal
-   is not where a GIF picker earns its keep.
+   is not where a GIF picker earns its keep. *(Done in the desktop client, which ADR-008
+   made the one web client.)*
 
 Nothing here goes below the FFI line: the picker chooses bytes, and `client-core` seals and
 sends them exactly as it would any other attachment.
+
+## 7. What was built
+
+- **Relay** — `crates/cairn-server/src/gif_relay.rs` holds the rules; `http.rs` the plumbing.
+  `GET /v1/gifs` (signed) returns each configured provider with its key and host list;
+  `GET /v1/gifs/tunnel/{host}:443` (signed over the target) upgrades to a byte pipe. Hosts
+  are a fixed list per provider, port 443 only, one canonical spelling of the target,
+  addresses that resolve inward are never dialled, and each account is bounded at 600
+  tunnels and 200 MiB an hour, with idle and lifetime limits per tunnel. An HTTP/1.1
+  `Upgrade` rather than `CONNECT`, because a path-routing reverse proxy will not forward
+  `CONNECT`.
+- **Client** — `crates/cairn-client-core/src/gifs/`. TLS to the provider runs inside the
+  tunnel and is verified against the provider's name, so an instance answering in the
+  provider's place fails the handshake (tested). Results are parsed into opaque ids; KLIPY
+  adverts and any result type other than `gif` are dropped; media URLs off the relayed hosts
+  are dropped; bytes are sniffed and only GIF or WebP is accepted. No `customer_id`, locale
+  or device parameters are sent. A sent GIF is fetched through the relay and then sealed,
+  uploaded and sent by the attachment path, so recipients fetch ciphertext from the instance
+  and contact no provider (tested: the stand-in provider sees no request from the recipient).
+- **Desktop** — `ui/gifs.js`: trending on open, search, a tab per provider, each provider's
+  required placeholder and attribution (decided in Rust), and "GIF search isn't configured on
+  this instance" when there is none. The page never holds a provider URL.
+- **Probed** (`crates/cairn-server/tests/gifs_http.rs`): the relay was asked, with valid
+  signatures, for the instance itself, loopback, cloud metadata, private ranges, the
+  providers on other ports, and look-alike and percent-encoded names; all refused with
+  nothing dialled. One got through — `api.klipy.com:0443` was accepted as port 443. Harmless
+  (same host, same port), but the target is what the device signs, so it now has exactly one
+  spelling.
+- **Not done:** response-size padding (§3 — a relay operator can still infer something from
+  how big an answer was); pagination beyond the first 24 results; the instance cannot tell a
+  member's quota abuse from a busy picker beyond the per-account limits.
 
 ---
 

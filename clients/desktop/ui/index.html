@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <title>Cairn</title>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="voice.css">
+<link rel="stylesheet" href="gifs.css">
 </head>
 <body>
 <!--
@@ -179,7 +181,11 @@
         <svg width="15" height="15"><use href="#i-clip"/></svg>
       </button>
       <input id="file-input" type="file" multiple hidden>
+      <button id="gif" type="button" class="icon" title="Send a GIF" aria-label="Send a GIF">GIF</button>
       <input id="text" placeholder="Message" autocomplete="off" spellcheck="false">
+      <button id="voice" type="button" class="icon" title="Hold to record a voice note, or click to start" aria-label="Record a voice note" aria-pressed="false">
+        <svg width="15" height="15"><use href="#i-mic"/></svg>
+      </button>
       <button type="submit" class="primary">Send</button>
     </form>
     <p id="error" class="error" style="padding: 0 16px 10px"></p>
@@ -228,6 +234,8 @@
 
 <script src="call.js"></script>
 <script src="attachments.js"></script>
+<script src="voice.js"></script>
+<script src="gifs.js"></script>
 <script src="timer.js"></script>
 <script src="messages.js"></script>
 <script src="app.js"></script>
