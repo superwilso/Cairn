@@ -760,6 +760,9 @@ main.dropping #timeline { outline: 2px dashed var(--accent); outline-offset: -8p
   object-fit: contain;
   box-shadow: 0 12px 26px -16px rgba(0, 0, 0, 0.7);
 }
+/* Until its bytes arrive, a photo holds a typical photo's space, so loading moves the
+   timeline as little as possible. (messages.js keeps a reader at the bottom either way.) */
+.attach-image img:not([src]) { width: min(360px, 100%); aspect-ratio: 4 / 3; }
 .attach audio { width: 100%; max-width: 320px; }
 .attach-caption {
   display: flex;

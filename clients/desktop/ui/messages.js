@@ -304,8 +304,56 @@ const CairnMessages = (() => {
         return false;
     }
 
+    // ---- keeping the newest message in view ------------------------------------
+    //
+    // A photo's bytes arrive after its message is drawn, so it grows from a placeholder to
+    // its real height after the timeline has already scrolled to the bottom — and pushes
+    // the newest messages out of view. Anything else that grows late (audio controls, a
+    // reply bar, the call stage shrinking the timeline) does the same.
+    //
+    // So: whether the reader is at the bottom is decided only when *they* scroll, and while
+    // they are, any change of size keeps them there. Someone who scrolled up to read history
+    // is never moved. Measured by ResizeObserver, not timers, so it holds however slowly the
+    // bytes arrive.
+    const PIN_PX = 48;
+    let pinned = true;
+
+    function follow(timeline) {
+        const atBottom = () =>
+            timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight <= PIN_PX;
+        // Only an upward scroll unpins. A scroll event is dispatched a frame after the
+        // scroll, and if a photo grew in between, the bottom has moved away from a reader who
+        // never moved: judging by distance alone unpinned them under load. Growth, scroll
+        // anchoring and our own scrolling all move down; leaving the bottom means moving up.
+        let lastTop = timeline.scrollTop;
+        timeline.addEventListener("scroll", () => {
+            const top = timeline.scrollTop;
+            if (atBottom()) pinned = true;
+            else if (top < lastTop) pinned = false;
+            lastTop = top;
+        }, { passive: true });
+        const sizes = new ResizeObserver(() => {
+            if (pinned) timeline.scrollTop = timeline.scrollHeight;
+            // Content that shrank (a font swapping in) clamps scrollTop upward without anyone
+            // scrolling. Recording where this left it means that clamp is not later mistaken
+            // for the reader moving up — which a probe under load showed it was.
+            lastTop = timeline.scrollTop;
+        });
+        sizes.observe(timeline);
+        new MutationObserver((records) => {
+            for (const r of records) {
+                for (const n of r.addedNodes) if (n.nodeType === 1) sizes.observe(n);
+                for (const n of r.removedNodes) if (n.nodeType === 1) sizes.unobserve(n);
+            }
+            // A cleared timeline is a newly opened room, which starts at its newest message.
+            if (!timeline.firstElementChild) { pinned = true; lastTop = 0; }
+        }).observe(timeline, { childList: true });
+    }
+
     function init(h) {
         hooks = { ...hooks, ...h };
+        const timeline = $("timeline");
+        if (timeline) follow(timeline);
         const cancel = $("reply-cancel");
         if (cancel) cancel.addEventListener("click", cancelReply);
         document.addEventListener("keydown", (e) => {
