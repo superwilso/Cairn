@@ -414,6 +414,7 @@ impl App {
                 id: None,
                 reply_to: None,
                 reaction: None,
+                card: None,
             },
         );
     }
@@ -1049,6 +1050,7 @@ impl App {
                             id: None,
                             reply_to: None,
                             reaction: None,
+                            card: received.card.as_deref().cloned(),
                         },
                     );
                     if let Some(attachment) = &received.attachment {

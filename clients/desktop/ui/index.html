@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>Cairn</title>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="linkcards.css">
 </head>
 <body>
 <!--
@@ -182,6 +183,7 @@
       <input id="text" placeholder="Message" autocomplete="off" spellcheck="false">
       <button type="submit" class="primary">Send</button>
     </form>
+    <p id="preview-status" class="note" role="status" hidden></p>
     <p id="error" class="error" style="padding: 0 16px 10px"></p>
   </main>
 
@@ -199,6 +201,18 @@
       <select id="dev-out"></select>
       <p id="device-note" class="note">Device names appear after the first call.</p>
       <p id="relay-note" class="note"></p>
+    </div>
+
+    <!-- Link previews. The descriptions say what each setting reveals and to whom, because
+         a toggle that hides its cost is a choice made for the user. -->
+    <div class="prefs">
+      <h2 class="section">Link previews</h2>
+      <label class="toggle"><input type="checkbox" id="pref-previews"> Preview links I send</label>
+      <p class="note">This device opens the link to build the preview, so the site sees your IP
+        address. The preview travels inside the encrypted message; people you send it to
+        fetch nothing.</p>
+      <label class="toggle"><input type="checkbox" id="pref-ig-proxy"> Use a proxy for Instagram</label>
+      <p id="ig-proxy-note" class="note"></p>
     </div>
   </section>
 </div>
@@ -229,6 +243,7 @@
 <script src="call.js"></script>
 <script src="attachments.js"></script>
 <script src="timer.js"></script>
+<script src="linkcards.js"></script>
 <script src="messages.js"></script>
 <script src="app.js"></script>
 </body>

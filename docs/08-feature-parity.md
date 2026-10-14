@@ -75,8 +75,8 @@ question in `01-threat-model.md` §10.
 |---|---|---|---|---|---|---|
 | Image/video/file sharing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ end to end |
 | GIF picker | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 — designed in [`14-gifs.md`](14-gifs.md); Tenor's API shut down June 2026, and the naive build leaks search terms and readers to the provider |
-| Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** |
-| Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** |
+| Link previews | ✅ server | ⚠️ sender-side | ⚠️ sender-side | ✅ | ✅ server | 🎯 **authenticated, sender-side** — public rung ships in the desktop client and CLI: card and thumbnail inside the encrypted body |
+| Social embeds (X, Instagram) | ⚠️ often broken | ❌ | ❌ | ⚠️ own only | ⚠️ | 🎯 **the differentiator** — oEmbed cards for YouTube, TikTok, X and Reddit ship; Instagram reels and posts get a reel-shaped card with caption, handle and thumbnail when Instagram answers an anonymous fetch, and a URL-only card when it walls it |
 | Large file limits | ⚠️ paywalled | ⚠️ | ⚠️ 2 GB | ⚠️ | ✅ 2 GB free | 🎯 operator-set |
 
 **Attachments exist server-side**: a client uploads ciphertext to a room, the server stores

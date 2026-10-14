@@ -68,6 +68,7 @@ $("go").onclick = async () => {
         await refreshRooms();
         await describeRelay();
         await listDevices();
+        await CairnLinkCards.loadSettings();
     } catch (e) {
         fail($("signin-error"), e);
     }
@@ -387,16 +388,22 @@ document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && !$("safety").hidden) closeSafety();
 });
 
+// One send at a time: a message with a link waits for its preview, and a second Enter
+// meanwhile must neither send it twice nor let a later message overtake it.
+let sending = false;
 $("composer").onsubmit = async (ev) => {
     ev.preventDefault();
     const text = $("text").value;
-    if (!text.trim()) return;
+    if (!text.trim() || sending) return;
+    sending = true;
+    const done = CairnLinkCards.sending(text);
     try {
         // Rust hands back the message as sent: polling never returns a device's own.
         addMessage(await CairnMessages.send(text));
         $("text").value = "";
         fail($("error"), null);
     } catch (e) { fail($("error"), e); }
+    finally { sending = false; done(); }
 };
 
 // ---- attachments -----------------------------------------------------------
@@ -823,6 +830,7 @@ function addNotice(text) {
 }
 
 CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
+CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

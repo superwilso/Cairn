@@ -24,6 +24,16 @@ uuid.workspace = true
 # sync here, so no async runtime has to cross the FFI boundary (ADR-006).
 ureq = { version = "3", optional = true }
 
+# Thumbnails: decode what a page names as its image, downscale it, and re-encode it small
+# enough to travel inside the encrypted card. Pure Rust, no default features, and only the
+# three formats link previews actually use — every codec left out is parser surface that
+# never meets a hostile file. Optional with `http`, because only a client that fetches
+# makes thumbnails; any client can *display* one.
+# Held at 0.25.6, the newest release checked to build under this workspace's 1.85 floor;
+# 0.25.10 requires rustc 1.88.
+image = { version = ">=0.25.6, <0.25.7", optional = true, default-features = false, features = ["jpeg", "png", "webp"] }
+base64 = "0.22"
+
 [features]
 default = ["http"]
-http = ["dep:ureq"]
+http = ["dep:ureq", "dep:image"]

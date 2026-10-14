@@ -16,9 +16,10 @@
 //!
 //! ## What a proxy actually buys, stated plainly
 //!
-//! Instagram serves a login wall to anonymous fetches, so the ordinary OpenGraph path
-//! returns nothing worth showing. A proxy host re-serves the post with real OpenGraph tags,
-//! which is why people use them.
+//! Instagram often serves a login wall to anonymous fetches, and then the ordinary
+//! OpenGraph path returns nothing worth showing. (Not always: on 2026-10-07 a real public
+//! post fetched anonymously came back with full metadata — see [`tidy`].) A proxy host
+//! re-serves the post with real OpenGraph tags, which is why people use them.
 //!
 //! **It does not make anything private. It moves the leak.** Instagram stops seeing the
 //! sender's fetch and a third party starts. `CardSource::Proxy` carries the caveat a client
@@ -136,20 +137,18 @@ impl ProxyPolicy {
 /// Declines everything it is not certain about. A false negative costs a preview; a false
 /// positive sends somebody else's URL to a third-party host.
 pub fn parse(url: &str) -> Option<InstagramLink> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => (rest, ""),
-    };
-
-    // Userinfo is stripped before the host is read: `https://instagram.com@evil.test/p/x`
-    // has authority `instagram.com@evil.test` and host `evil.test`, and reading it the
-    // other way round is a classic way to be fooled about where a URL points.
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = authority.split(':').next()?.to_ascii_lowercase();
-    if !INSTAGRAM_HOSTS.contains(&host.as_str()) {
+    // The host is read the way a browser reads it (`super::target`). The hand-split version
+    // this replaced accepted `https://evil.test\@instagram.com/p/abc/` as an Instagram post
+    // — found by probing — while a browser opens `evil.test`. Userinfo and ports now decline
+    // outright: no link Instagram mints carries either.
+    let target = super::target::target(url)?;
+    if target.has_userinfo || target.port.is_some() || target.rest.contains('\\') {
         return None;
     }
+    if !INSTAGRAM_HOSTS.contains(&target.host.as_str()) {
+        return None;
+    }
+    let path = target.rest.strip_prefix('/').unwrap_or(target.rest);
 
     // The query is dropped, deliberately and before anything else looks at it. Instagram
     // share links carry `?igsh=...`, a share-tracking token tied to the person who copied
@@ -201,6 +200,63 @@ pub fn proxy_urls(link: &InstagramLink, policy: &ProxyPolicy) -> Vec<String> {
         .collect()
 }
 
+/// Reshape the metadata Instagram serves into a card that reads like a post.
+///
+/// Instagram's own OpenGraph, as fetched live on 2026-10-07, is
+/// `og:title = "Name (@handle) • Instagram video"` and
+/// `og:description = "3,696 likes, 71 comments - handle on June 16, 2015: \"caption\"."`.
+/// Shown raw, the caption — the part people want — is buried at the end of the description.
+/// This lifts the handle into `author` and the caption into the title, and keeps the counts.
+///
+/// Parsing a format Instagram can change at any time, so every step is optional and a
+/// card it does not recognise is left exactly as fetched. Nothing is added that the page did
+/// not say. Comment *text* is never present and never fetched (`docs/05-embeds.md`).
+pub fn tidy(card: &mut super::Card) {
+    let mut display = None;
+    if let Some(title) = &card.title {
+        if let Some((name, rest)) = title.split_once(" (@") {
+            if let Some((handle, _)) = rest.split_once(')') {
+                if is_handle(handle) {
+                    card.author.get_or_insert_with(|| format!("@{handle}"));
+                    display = Some(name.trim().to_string());
+                }
+            }
+        }
+    }
+    let Some(description) = &card.description else { return };
+    let Some((counts, rest)) = description.split_once(" - ") else { return };
+    let Some((_, caption)) = rest.split_once(": \"") else { return };
+    let caption = caption.trim_end_matches('.').trim_end_matches('"').trim();
+    if caption.is_empty() {
+        return;
+    }
+    let counts = counts.trim().to_string();
+    card.title = Some(caption.to_string());
+    card.description = Some(match display {
+        Some(name) if !name.is_empty() => format!("{name} · {counts}"),
+        _ => counts,
+    });
+}
+
+fn is_handle(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 30
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+}
+
+/// The proxy a client offers when its user switches the proxy rung on.
+///
+/// Chosen from a probe on 2026-10-07 rather than from the list in circulation, and that
+/// probe is the only evidence for it. Of the hosts tried: `zzinstagram.com` served real
+/// OpenGraph — handle, caption, thumbnail — though only to user-agents it recognised as a
+/// chat app's crawler, and redirected Cairn's own user-agent to instagram.com (which
+/// `unfurl_with_proxy` then refuses). `kkinstagram.com` redirected straight to the video
+/// file or to an "open in app" page; `instagramez.com` redirected to an advertising
+/// network; `ddinstagram.com` did not answer; `eeinstagram.com` answered "Post not found"
+/// for a post that exists. **So with an honest user-agent this rung yields nothing today**,
+/// and the setting is offered so the decision is visible rather than so it works.
+pub const SUGGESTED_PROXY: &str = "zzinstagram.com";
+
 /// The sentence a user must see before a proxy is used on their behalf.
 ///
 /// Returned as text rather than printed so every client shows the same thing — this is a
@@ -233,6 +289,10 @@ mod tests {
             "https://instagram.com@evil.test/p/abc123/",
             "https://www.instagram.com.co/p/abc123/",
             "https://fakeinstagram.com/p/abc123/",
+            // Found by probing: a browser opens evil.test for these, and the old parser
+            // read the host as instagram.com.
+            "https://evil.test\\@instagram.com/p/abc123/",
+            "https://evil.test\\@www.instagram.com/reel/abc123/",
         ] {
             assert_eq!(link(hostile), None, "{hostile} must not be treated as Instagram");
         }
@@ -403,6 +463,42 @@ mod tests {
                 "{input} rewrote to {out}, whose authority is not the configured proxy"
             );
         }
+    }
+
+    #[test]
+    fn instagrams_own_metadata_becomes_a_card_that_reads_like_the_post() {
+        // Exactly what a live fetch of a real post returned, entities already decoded.
+        let mut card = crate::embed::Card {
+            url: "https://www.instagram.com/reel/fA9uwTtkSN/".into(),
+            title: Some("Diego Moreno Quinteiro (@diegoquinteiro) • Instagram video".into()),
+            description: Some(
+                "3,696 likes, 71 comments - diegoquinteiro on June 16, 2015: \"Wii Gato (Lipe Sleep)\"."
+                    .into(),
+            ),
+            site_name: Some("Instagram".into()),
+            ..Default::default()
+        };
+        tidy(&mut card);
+        assert_eq!(card.title.as_deref(), Some("Wii Gato (Lipe Sleep)"));
+        assert_eq!(card.author.as_deref(), Some("@diegoquinteiro"));
+        assert_eq!(
+            card.description.as_deref(),
+            Some("Diego Moreno Quinteiro · 3,696 likes, 71 comments")
+        );
+    }
+
+    #[test]
+    fn metadata_in_a_shape_instagram_has_not_used_is_left_alone() {
+        // A format change must degrade to the raw card, never to a mangled one.
+        let original = crate::embed::Card {
+            url: "https://www.instagram.com/p/abc/".into(),
+            title: Some("Something else entirely".into()),
+            description: Some("No dash, no quote".into()),
+            ..Default::default()
+        };
+        let mut card = original.clone();
+        tidy(&mut card);
+        assert_eq!(card, original);
     }
 
     #[test]

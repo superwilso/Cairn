@@ -66,7 +66,13 @@ const CairnMessages = (() => {
         }
         const reactions = document.createElement("div");
         reactions.className = "reactions";
-        content.append(body, reactions);
+        content.append(body);
+        // A link card, already vetted by Rust against this message's own text.
+        if (m.card && typeof CairnLinkCards !== "undefined") {
+            content.append(CairnLinkCards.render(m.card));
+            li.classList.add("with-card");
+        }
+        content.append(reactions);
         li.append(who, content);
 
         // A message recorded before replies existed has no id and cannot be answered.

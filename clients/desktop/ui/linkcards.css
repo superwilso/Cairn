@@ -1,0 +1,148 @@
+/* Link cards and the link-preview setting.
+
+   Built only from the variables style.css defines, so a redesign of the palette carries
+   through without touching this file.
+
+   Deliberately unlike anything that means "verified": no tick, no accent border, no badge.
+   A card is the sender's claim (docs/05-embeds.md §3), and the line that says where the
+   link really goes is styled to be read, not skimmed. */
+
+.msg.with-card { align-items: flex-start; }
+.msg.with-card .who { padding-top: 2px; }
+
+.link-card {
+  display: flex;
+  align-self: flex-start;
+  width: min(440px, 100%);
+  margin: 2px 0;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.msg:hover .link-card { background: var(--surface); }
+.link-card:hover, .link-card:focus-visible {
+  border-color: var(--muted);
+  outline: none;
+}
+.link-card:focus-visible { box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/* ---- the picture ---- */
+
+.lc-media {
+  position: relative;
+  flex: none;
+  align-self: stretch;
+  width: 132px;
+  min-height: 96px;
+  background: var(--bg);
+  display: grid;
+  place-items: center;
+  border-right: 1px solid var(--line-soft);
+}
+.lc-media img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.link-card.portrait .lc-media { width: 112px; aspect-ratio: 9 / 16; align-self: flex-start; }
+
+/* A recognised post with nothing fetched: the tile says what the URL says, and no more. */
+.lc-media.empty { background: linear-gradient(160deg, var(--raised), var(--bg)); }
+.link-card.portrait .lc-media.empty { place-items: end center; }
+.lc-media-label {
+  margin-bottom: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+.link-card.portrait .lc-media.empty .lc-media-label { margin-bottom: 14px; }
+
+/* Says "opening this plays it" — in the browser. Not a player. */
+.lc-play {
+  position: absolute; inset: 0; margin: auto;
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--bg) 62%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 40%, transparent);
+}
+.lc-play::after {
+  content: "";
+  position: absolute; left: 15px; top: 11px;
+  border-style: solid;
+  border-width: 8px 0 8px 13px;
+  border-color: transparent transparent transparent var(--text);
+}
+
+/* ---- the words ---- */
+
+.lc-meta {
+  min-width: 0;
+  flex: 1;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.lc-eyebrow {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.lc-title {
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.lc-author { font-size: 12.5px; color: var(--muted); }
+.lc-desc {
+  font-size: 12.5px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+/* Where the link really goes. Computed in Rust from the URL, never from the card. */
+.lc-dest {
+  margin-top: auto;
+  padding-top: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.lc-warn { font-size: 11.5px; color: var(--warn); }
+.lc-claim { font-size: 10.5px; color: var(--dim); }
+
+/* Narrow windows: the picture goes on top rather than squeezing the words. */
+@media (max-width: 560px) {
+  .link-card:not(.portrait) { flex-direction: column; }
+  .link-card:not(.portrait) .lc-media {
+    width: 100%; aspect-ratio: 1.91 / 1; min-height: 0;
+    border-right: 0; border-bottom: 1px solid var(--line-soft);
+  }
+}
+
+/* ---- composer status and the setting ---- */
+
+#preview-status { margin: 0; padding: 0 16px 6px; }
+#preview-status[hidden] { display: none; }
+
+.prefs { padding: 4px 12px 14px; border-top: 1px solid var(--line-soft); }
+.prefs h2.section { margin-left: 0; }
+.prefs .toggle {
+  display: flex; gap: 8px; align-items: center;
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.prefs .toggle input { width: auto; flex: none; margin: 0; accent-color: var(--accent); }
+.prefs .toggle:has(input:disabled) { color: var(--dim); cursor: default; }
+.prefs .note { margin-top: 4px; }

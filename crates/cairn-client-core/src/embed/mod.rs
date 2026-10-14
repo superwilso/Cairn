@@ -22,14 +22,23 @@
 //! the card's own contents** — that would be asking the attacker what to believe. See
 //! [`Card::claimed_source`], which is named to make misuse awkward.
 //!
-//! ## No images yet
+//! ## Thumbnails, small and inside the envelope
 //!
-//! [`Card::image_url`] records where an image *was*, and nothing fetches or re-hosts it.
-//! Re-hosting means bytes in the envelope, and `docs/05-embeds.md` requires the server's
-//! per-message full-state rewrite to be fixed first. Text cards are a few hundred bytes and
-//! do not move that; thumbnails would. Images land with attachments (M6).
+//! [`Card::image_url`] records where an image was. [`Card::thumbnail`] is that image,
+//! fetched **by the sender**, shrunk and re-encoded to at most [`thumbnail::MAX_BYTES`],
+//! and carried in the encrypted card — so the recipient sees it without contacting anyone.
+//! The blocker `docs/05-embeds.md` named, the server's per-message full-state rewrite, was
+//! closed by ADR-007. Full-size media and video still wait for attachments.
 
 pub mod instagram;
+pub mod oembed;
+mod target;
+pub mod thumbnail;
+mod view;
+
+pub use target::destination_host;
+pub use thumbnail::Thumbnail;
+pub use view::{openable, CardView};
 
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +59,8 @@ pub struct Card {
     /// The site name the page claimed, e.g. `og:site_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site_name: Option<String>,
-    /// Where the preview image was, if the page named one. **Not fetched, not re-hosted.**
+    /// Where the preview image was, if the page named one. A recipient never loads this —
+    /// [`Card::thumbnail`] is the image, already fetched by the sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
     /// Which step of the fallback chain produced this.
@@ -59,6 +69,15 @@ pub struct Card {
     /// (`docs/05-embeds.md`, "Fallback chain").
     #[serde(default)]
     pub source: CardSource,
+    /// Who the page says made the content — a handle or a channel. A claim like the rest.
+    ///
+    /// `default` (as with every field added after cards first shipped) so a card from an
+    /// older client still decodes, and an older client ignores this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// The preview image, fetched and shrunk by the sender, carried inside the envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<Box<Thumbnail>>,
 }
 
 /// How a card was obtained. Ordered most private first.
@@ -126,6 +145,8 @@ impl Card {
         self.description = cut(self.description, MAX_DESCRIPTION);
         self.site_name = cut(self.site_name, MAX_SITE_NAME);
         self.image_url = cut(self.image_url, MAX_URL);
+        self.author = cut(self.author, MAX_SITE_NAME);
+        self.thumbnail = self.thumbnail.and_then(|t| t.clamp().map(Box::new));
         self
     }
 }
@@ -154,56 +175,105 @@ pub enum UnfurlError {
 /// `192.168.x.x` turns a chat message into a probe of the sender's own network, with the
 /// result rendered back into the conversation. Cheap to refuse, so refuse.
 ///
-/// Host-based and therefore **incomplete**: it does not resolve DNS, so a hostname that
-/// resolves to a private address still passes, and redirects are followed by the HTTP
-/// client without re-checking. Closing those needs a resolver hook, which is recorded in
-/// `docs/05-embeds.md` rather than implied away here.
+/// This is the **first** of two checks and, alone, not enough: it reads the URL, so a
+/// hostname that resolves to a private address passes it. The fetcher closes that by
+/// applying [`is_public_ip`] to every address a name resolves to, at connect time, and by
+/// re-running this check on every redirect hop (`fetch`). Refusing literals here as well
+/// still earns its place: it is what stops a request before any DNS query is made.
+///
+/// The host is read by [`target::target`], the way a browser reads it. The string-splitting
+/// version this replaced passed `http://2130706433/` and `http://127.1/` as public names, and
+/// the HTTP client then connected to loopback — found by probing, see that module.
 pub fn is_fetchable(url: &str) -> Result<(), UnfurlError> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or(UnfurlError::NotHttp)?;
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // An IPv6 literal is bracketed and full of colons, so the port cannot be split off
-    // before the brackets are stripped — doing it the other way round turns `[::1]:80`
-    // into `[`, which parses as no address at all and would sail through as public.
-    let host = match authority.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
-        Some((inside, _port)) => inside.to_ascii_lowercase(),
-        None => authority.split(':').next().unwrap_or("").to_ascii_lowercase(),
-    };
+    let host = target::target(url).ok_or(UnfurlError::NotHttp)?.host;
 
     if host.is_empty() {
         return Err(UnfurlError::NotHttp);
     }
-    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".internal") {
+    // A trailing dot is the same name, fully qualified: `localhost.` is localhost.
+    let name = host.strip_suffix('.').unwrap_or(&host);
+    if name == "localhost" || name.ends_with(".localhost") || name.ends_with(".internal") {
         return Err(UnfurlError::PrivateAddress(host));
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let private = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_unspecified()
-                    // 100.64.0.0/10, carrier-grade NAT and Tailscale's range.
-                    || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    // fc00::/7 unique-local and fe80::/10 link-local.
-                    || (v6.octets()[0] & 0xfe) == 0xfc
-                    || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
-            }
-        };
-        if private {
+    // An IPv6 literal also ends in digits; only a colon-free host is a candidate IPv4.
+    let as_v4 = if host.contains(':') { None } else { target::whatwg_ipv4(&host) };
+    let ip = match as_v4 {
+        // Shaped like a number but not a valid address. A browser refuses it too.
+        Some(Err(())) => return Err(UnfurlError::NotHttp),
+        Some(Ok(v4)) => Some(std::net::IpAddr::V4(v4)),
+        None => host.parse::<std::net::IpAddr>().ok(),
+    };
+    if let Some(ip) = ip {
+        if !is_public_ip(ip) {
             return Err(UnfurlError::PrivateAddress(host));
         }
     }
     Ok(())
+}
+
+/// Whether a link preview may connect to `ip`.
+///
+/// The one address policy, used twice: by [`is_fetchable`] on an IP literal in the URL, and
+/// by the fetcher's resolver on **every address a name resolves to, at the moment it
+/// connects**. The second use is the one that matters — a hostname is just a pointer, and
+/// before it existed `http://vm:PORT/` (a name `/etc/hosts` maps to 127.0.0.1) was fetched
+/// and the loopback page's title came back as a card. Found by probing.
+///
+/// Refuses everything that is not a globally routed unicast address: loopback, RFC 1918,
+/// link-local (cloud metadata lives at 169.254.169.254), CGNAT, `0.0.0.0/8`, multicast,
+/// broadcast, the documentation and benchmarking ranges, and `240/4`; on IPv6, loopback,
+/// unspecified, unique-local, link-local, site-local, multicast, and any IPv6 form that
+/// embeds a refused IPv4 address (mapped, compatible, 6to4, NAT64).
+pub(crate) fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    fn public_v4(v4: std::net::Ipv4Addr) -> bool {
+        let [a, b, c, _] = v4.octets();
+        !(v4.is_loopback()
+            || v4.is_private()
+            || v4.is_link_local()
+            || v4.is_broadcast()
+            || v4.is_unspecified()
+            || v4.is_multicast()
+            || v4.is_documentation()
+            || a == 0
+            // 100.64.0.0/10, carrier-grade NAT and Tailscale's range.
+            || (a == 100 && (64..128).contains(&b))
+            // 192.0.0.0/24, IETF protocol assignments.
+            || (a == 192 && b == 0 && c == 0)
+            // 198.18.0.0/15, benchmarking — and in practice, some vendors' internal ranges.
+            || (a == 198 && (b & 0xfe) == 18)
+            // 240.0.0.0/4, reserved.
+            || a >= 240)
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => public_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            let o = v6.octets();
+            let seg = v6.segments();
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 unique-local.
+                || (o[0] & 0xfe) == 0xfc
+                // fe80::/10 link-local and the deprecated fec0::/10 site-local.
+                || (o[0] == 0xfe && (o[1] & 0x80) == 0x80)
+            {
+                return false;
+            }
+            // `::ffff:127.0.0.1` and `::127.0.0.1` are IPv4 written as IPv6.
+            if let Some(v4) = v6.to_ipv4() {
+                return public_v4(v4);
+            }
+            // 2002::/16, 6to4: the next 32 bits are an IPv4 address a relay will reach.
+            if seg[0] == 0x2002 {
+                return public_v4(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+            }
+            // 64:ff9b::/96, NAT64: the last 32 bits are the IPv4 destination.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return public_v4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+            }
+            true
+        }
+    }
 }
 
 /// Pull OpenGraph and `<title>` metadata out of an HTML document.
@@ -221,9 +291,19 @@ pub fn parse_metadata(html: &str, url: &str) -> Card {
     let head = head.unwrap_or(html);
 
     let mut card = Card { url: url.to_string(), ..Card::default() };
+    let mut image_alt = None;
 
-    for tag in head.split('<').filter(|t| t.len() > 4 && t[..4].eq_ignore_ascii_case("meta")) {
-        let Some(content) = attribute(tag, "content") else { continue };
+    // `get(..4)` rather than `[..4]`: a tag starting with a multi-byte character would put
+    // byte 4 inside it, and slicing there panics. Found by probing — `<€€` in a hostile
+    // page's head was enough to take the unfurl down.
+    let metas =
+        head.split('<').filter(|t| t.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("meta")));
+    for tag in metas {
+        // An empty value is no value: an empty `og:title` would otherwise block the `<title>`
+        // fallback and ship a card with a blank heading (seen live on rust-lang.org).
+        let Some(content) = attribute(tag, "content").filter(|c| !c.trim().is_empty()) else {
+            continue;
+        };
         let key = attribute(tag, "property").or_else(|| attribute(tag, "name")).unwrap_or_default();
 
         match key.to_ascii_lowercase().as_str() {
@@ -233,8 +313,14 @@ pub fn parse_metadata(html: &str, url: &str) -> Card {
             }
             "og:site_name" => card.site_name.get_or_insert(content),
             "og:image" | "twitter:image" => card.image_url.get_or_insert(content),
+            "twitter:creator" => card.author.get_or_insert(content),
+            // Instagram's fixers put the caption here and nowhere else.
+            "og:image:alt" | "twitter:image:alt" => image_alt.get_or_insert(content),
             _ => continue,
         };
+    }
+    if card.description.is_none() {
+        card.description = image_alt;
     }
 
     // `<title>` is the last resort, since og:title is what the page chose for sharing.
@@ -253,7 +339,7 @@ pub fn parse_metadata(html: &str, url: &str) -> Card {
     }
 
     if card.site_name.is_none() {
-        card.site_name = host_of(url).map(str::to_string);
+        card.site_name = destination_host(url);
     }
 
     card.clamp()
@@ -294,23 +380,12 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 }
 
 /// The handful of entities that actually appear in titles.
+///
+/// One pass, numeric entities included. The chained `replace` this replaced decoded
+/// `&amp;lt;` twice, into `<`, and left Instagram's `&#064;handle` titles undecoded — seen
+/// on a live fetch.
 fn decode_entities(text: &str) -> String {
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-        .trim()
-        .to_string()
-}
-
-fn host_of(url: &str) -> Option<&str> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let host = rest.split(['/', '?', '#']).next()?;
-    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-    Some(host.split(':').next().unwrap_or(host))
+    oembed::decode_entities(text).trim().to_string()
 }
 
 /// The first http(s) URL in a message, if any.
@@ -319,124 +394,9 @@ pub fn first_url(text: &str) -> Option<&str> {
 }
 
 #[cfg(feature = "http")]
-mod fetch {
-    use super::{is_fetchable, parse_metadata, Card, CardSource, UnfurlError};
-
-    /// Bytes of a page to read before giving up.
-    ///
-    /// Metadata lives in the head, so a page that has not declared itself in 512 KB is not
-    /// going to. Bounded because the response is attacker-controlled length.
-    const MAX_BODY: u64 = 512 * 1024;
-
-    /// Fetch `url` and build a card from its metadata.
-    ///
-    /// **Only ever call this for a URL the local user supplied.** Calling it for one that
-    /// arrived in a message would contact the platform from the recipient's address, which
-    /// is precisely what this design exists to avoid.
-    ///
-    /// A failure is not an error worth surfacing loudly — it degrades to a bare link, which
-    /// is the last step of the fallback chain and always works.
-    pub fn unfurl(url: &str) -> Result<Card, UnfurlError> {
-        is_fetchable(url)?;
-        fetch_and_parse(url)
-    }
-
-    /// Unfurl, falling back to a configured proxy for links the site itself will not serve.
-    ///
-    /// Only Instagram today, and only because Instagram shows a login wall to anonymous
-    /// visitors — the ordinary path returns a card with nothing in it. Everything else takes
-    /// the direct path unchanged.
-    ///
-    /// The proxy is tried **only after** the direct fetch has failed to produce anything
-    /// useful, so a link that works without one never reaches a third party. Order matters
-    /// here in a way it does not for an ordinary fallback: each attempt is a URL disclosed to
-    /// somebody.
-    ///
-    /// A card built this way carries [`CardSource::Proxy`], whose `caveat()` a client must
-    /// display. Returning a proxy-built card marked `Public` would be the specific lie
-    /// `docs/05-embeds.md` forbids.
-    pub fn unfurl_with_proxy(
-        url: &str,
-        policy: &super::instagram::ProxyPolicy,
-    ) -> Result<Card, UnfurlError> {
-        let direct = unfurl(url);
-        if let Ok(card) = &direct {
-            if card.is_useful() {
-                return direct;
-            }
-        }
-
-        // Not an Instagram post, or proxying is off: keep whatever the direct path said,
-        // including its error. Falling through to a proxy for arbitrary URLs would send
-        // links to a third party that the user never opted into sharing.
-        let Some(link) = super::instagram::parse(url) else { return direct };
-        if !policy.is_enabled() {
-            return direct;
-        }
-
-        for candidate in super::instagram::proxy_urls(&link, policy) {
-            if is_fetchable(&candidate).is_err() {
-                continue;
-            }
-            if let Ok(mut card) = fetch_and_parse(&candidate) {
-                if card.is_useful() {
-                    // The card describes the *original* link, not the proxy's URL. A
-                    // recipient evaluating where a message points must see where it really
-                    // points — the proxy is an implementation detail of how the preview was
-                    // obtained, and `source` is where that is disclosed.
-                    card.url = url.to_string();
-                    card.source = CardSource::Proxy;
-                    return Ok(card);
-                }
-            }
-        }
-        direct
-    }
-
-    /// The transport half, with the address policy already applied.
-    ///
-    /// Split out so tests can drive the HTTP and parsing path against a loopback server,
-    /// which [`is_fetchable`] refuses by design. Private, and the only public entry point
-    /// applies the check first — a caller cannot reach this to skip it.
-    pub(super) fn fetch_and_parse(url: &str) -> Result<Card, UnfurlError> {
-        let agent = ureq::Agent::new_with_config(
-            ureq::Agent::config_builder().http_status_as_error(false).build(),
-        );
-        // A generic desktop user-agent: many sites serve no OpenGraph at all without one.
-        // It is also the sender's fingerprint, which is the leak `docs/05-embeds.md` §1
-        // says must be opt-in per platform — recorded there, not solved here.
-        let mut response = agent
-            .get(url)
-            .header("user-agent", "Mozilla/5.0 (compatible; Cairn link preview)")
-            .header("accept", "text/html,application/xhtml+xml")
-            .call()
-            .map_err(|e| UnfurlError::Fetch(e.to_string()))?;
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !content_type.is_empty() && !content_type.contains("html") {
-            return Err(UnfurlError::NotHtml);
-        }
-
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_BODY)
-            .read_to_string()
-            .map_err(|e| UnfurlError::Fetch(e.to_string()))?;
-
-        let mut card = parse_metadata(&body, url);
-        card.source = CardSource::Public;
-        Ok(card)
-    }
-}
-
+mod fetch;
 #[cfg(feature = "http")]
-pub use fetch::{unfurl, unfurl_with_proxy};
+pub use fetch::{preview, unfurl, unfurl_with_proxy, FETCH_TIMEOUT};
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +512,17 @@ mod tests {
             "http://100.64.1.1/",
             "http://box.internal/",
             "http://user@127.0.0.1/",
+            // Found by probing: every one below passed the old check, and the first four
+            // then connected to a listener on loopback. The rest were stopped only by the
+            // HTTP client happening to reject them.
+            "http://2130706433/",
+            "http://127.1/",
+            "http://0x7f000001/",
+            "http://0177.0.0.1/",
+            "http://127.0.0.1\\@example.com/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:192.168.1.1]:8080/",
+            "http://127%2e0%2e0%2e1/",
         ] {
             assert!(
                 matches!(is_fetchable(url), Err(UnfurlError::PrivateAddress(_))),
@@ -589,6 +560,8 @@ mod tests {
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        // Loopback is refused by design; this one server, and no other port, is let through.
+        super::fetch::test_allow::allow(addr);
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 4096];
@@ -627,9 +600,10 @@ mod tests {
     #[test]
     #[cfg(feature = "http")]
     fn the_public_entry_point_still_enforces_the_address_policy() {
-        // The seam above must not be a way around the check. `unfurl` is the only public
-        // door, and it refuses loopback even though a server is listening there.
-        let url = serve_once("text/html", "<html></html>");
+        // `unfurl` is the only public door, and it refuses loopback even though a server is
+        // listening there — one the test allowlist was not told about.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/page", listener.local_addr().unwrap());
         assert!(matches!(unfurl(&url), Err(UnfurlError::PrivateAddress(_))));
     }
 
