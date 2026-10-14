@@ -1026,6 +1026,14 @@ impl App {
                         emoji.map_or("withdrew a reaction".to_owned(), |e| format!("reacted {e}"))
                     );
                 }
+                // A profile is not a message, and its body is empty. The CLI does not keep
+                // profiles; it says one arrived rather than printing a blank line.
+                Ok(TimelineEvent::Message(received)) if received.profile.is_some() => {
+                    println!(
+                        "\n  {} updated their profile",
+                        short(&message.envelope.sender.as_uuid().to_string())
+                    );
+                }
                 Ok(TimelineEvent::Message(received)) => {
                     println!(
                         "\n  [{}] {}: {}",

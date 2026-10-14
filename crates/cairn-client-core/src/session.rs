@@ -53,6 +53,12 @@ pub use attachments::{
     kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
     PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
 };
+mod profiles;
+pub use crate::profile::{ImageSlot, ImageView, ProfileView, StatusView};
+pub use profiles::{profile_limits, PendingProfileImage, ProfileEdit, ProfileLimits};
+
+use crate::profile::{Label, ProfileError, ProfileStore, ProfileStoreError};
+use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -106,6 +112,12 @@ pub enum SessionError {
     UnknownMessage,
     #[error("a reaction is a single emoji")]
     BadReaction,
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
+    #[error(transparent)]
+    ProfileStore(#[from] ProfileStoreError),
+    #[error("that profile image is not one this device holds for the open room")]
+    UnknownProfileImage,
 }
 
 /// A room as a frontend needs to show it.
@@ -140,6 +152,10 @@ pub struct MemberView {
     /// At least one of this account's devices changed key after being verified. Sticky until
     /// the new number is compared — see [`ContactStore::observe`].
     pub key_changed: bool,
+    /// Their profile in this room, labelled against everyone else's. **Presentation only**:
+    /// `user` above is who they are, and `verified` is about their keys, not their name.
+    #[serde(default)]
+    pub profile: Option<ProfileView>,
 }
 
 /// The role reported for a group member the instance's member list omits.
@@ -153,6 +169,14 @@ pub const UNLISTED: &str = "unlisted";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageView {
     pub sender: String,
+    /// What to call the sender in this room — their nickname or display name, or their
+    /// short id — as labelled when this view was made. `sender` is who they are.
+    #[serde(default)]
+    pub sender_label: String,
+    /// Another member's name or id looks like `sender_label`, so a frontend must show the
+    /// sender's id beside it.
+    #[serde(default)]
+    pub sender_ambiguous: bool,
     pub body: String,
     pub sent_at_ms: i64,
     /// True when replayed from the local transcript rather than just received.
@@ -171,6 +195,10 @@ pub struct MessageView {
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
+///
+/// The size lint is allowed: events live for one poll on their way to being serialised, and
+/// most of them are messages, so boxing the large variant would allocate for the common case.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -211,6 +239,12 @@ pub enum Event {
         from: String,
         signal: CallSignal,
     },
+    /// Somebody's profile arrived, or the room's membership changed. Every profile in the
+    /// room, not the one that changed: a new name can make two *other* members ambiguous, so
+    /// a frontend redraws every label rather than keeping its own copy of that rule.
+    Profiles {
+        profiles: Vec<ProfileView>,
+    },
 }
 
 struct OpenRoom {
@@ -224,6 +258,11 @@ struct OpenRoom {
     /// Replies and reactions, folded over the transcript. Rebuilt whenever the timer sweeps
     /// it, so nothing here outlives the message it describes.
     thread: Thread,
+    /// The accounts the instance last listed for this room, so a name can be checked
+    /// against members who are waiting as well as those in the group.
+    listed: Vec<UserId>,
+    /// What to call everyone, and who needs their id shown. See [`crate::profile::labels`].
+    labels: HashMap<UserId, Label>,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -242,6 +281,7 @@ pub struct Session {
     index: ConversationIndex,
     contacts: ContactStore,
     history: History,
+    profiles: ProfileStore,
     open: Option<OpenRoom>,
     dir: PathBuf,
     tls: bool,
@@ -325,6 +365,7 @@ impl Session {
             index: ConversationIndex::open(&dir)?,
             contacts: ContactStore::open(&dir)?,
             history: History::open(&dir)?,
+            profiles: ProfileStore::open(&dir)?,
             open: None,
             dir: dir.clone(),
             tls,
@@ -415,14 +456,18 @@ impl Session {
         self.index.record(created.room, &created.seal, convo.group_id())?;
         let cursor = self.index.cursor(&created.room);
         // A room is created without a timer; nobody has had the chance to set one.
-        self.open = Some(OpenRoom {
+        let mut open = OpenRoom {
             convo,
             seal: created.seal,
             cursor,
             ttl: None,
             ttl_checked_ms: now_ms(),
             thread: Thread::default(),
-        });
+            listed: Vec::new(),
+            labels: HashMap::new(),
+        };
+        self.relabel(&mut open);
+        self.open = Some(open);
         // Found by a probe: without this, creating a room left the previous room's
         // attachments fetchable from the new one.
         self.attachments.clear();
@@ -499,12 +544,22 @@ impl Session {
         // A room's attachments are fetchable only while it is open.
         attachments::remember(&mut self.attachments, &entries);
         let thread = Thread::build(&entries);
+        let labels = profiles::labels_for(&self.profiles, self.client.user(), &convo, &[]);
         let views = entries
             .iter()
             .filter(|e| e.reaction.is_none())
-            .map(|e| view(e, &thread, true))
+            .map(|e| view(e, &thread, &labels, true))
             .collect();
-        self.open = Some(OpenRoom { convo, seal, cursor, ttl, ttl_checked_ms: now_ms(), thread });
+        self.open = Some(OpenRoom {
+            convo,
+            seal,
+            cursor,
+            ttl,
+            ttl_checked_ms: now_ms(),
+            thread,
+            listed: Vec::new(),
+            labels,
+        });
         Ok(views)
     }
 
@@ -570,7 +625,7 @@ impl Session {
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
-        Ok(view(&entry, &open.thread, false))
+        Ok(view(&entry, &open.thread, &open.labels, false))
     }
 
     /// React to a message on this device's screen, or withdraw this user's reaction to it
@@ -637,6 +692,7 @@ impl Session {
             }
         };
         let mut events = Vec::new();
+        let mut profiles_changed = false;
 
         for message in fetched {
             open.cursor = open.cursor.max(message.server_seq);
@@ -663,6 +719,11 @@ impl Session {
                             joined: vec![self.client.user().to_string()],
                             left: Vec::new(),
                         });
+                        // Nothing sent before the welcome is readable here, so whatever was
+                        // last sent to this room — by this device, in an earlier membership —
+                        // is unknown to the group as it now is.
+                        let _ = self.profiles.resend(&room);
+                        profiles_changed = true;
                     }
                 }
                 continue;
@@ -682,6 +743,20 @@ impl Session {
                             if let Some(signal) = self.reconcile(*signal) {
                                 events.push(Event::Signal { from, signal });
                             }
+                        }
+                        continue;
+                    }
+                    // A profile is state, not a message: it updates who is called what and
+                    // never enters the transcript. Filed under the envelope's sender, which
+                    // `receive` has already checked against the roster — the record itself
+                    // has no field naming whose profile it is.
+                    if let Some(profile) = received.profile {
+                        if message.envelope.sender != self.client.user() {
+                            let _ = self.profiles.receive(room, message.envelope.sender, *profile);
+                            // At once, so a message later in this same batch is labelled
+                            // with the name its sender had when they sent it.
+                            self.relabel(&mut open);
+                            profiles_changed = true;
                         }
                         continue;
                     }
@@ -711,10 +786,21 @@ impl Session {
                             reactions: open.thread.reactions(target),
                         });
                     } else {
-                        events.push(Event::Message(view(&entry, &open.thread, false)));
+                        events.push(Event::Message(view(
+                            &entry,
+                            &open.thread,
+                            &open.labels,
+                            false,
+                        )));
                     }
                 }
                 Ok(TimelineEvent::Membership { added, removed, .. }) => {
+                    // A new member cannot read anything sent before they joined, this
+                    // account's profile included, so it goes again once this poll is done.
+                    if !added.is_empty() {
+                        let _ = self.profiles.resend(&room);
+                    }
+                    profiles_changed = true;
                     events.push(Event::Membership {
                         joined: added.iter().map(describe_member).collect(),
                         left: removed.iter().map(describe_member).collect(),
@@ -722,8 +808,10 @@ impl Session {
                 }
                 Ok(TimelineEvent::RemovedFromRoom { .. }) => {
                     // Being ejected means the local transcript goes too: the room is no
-                    // longer readable and keeping a plaintext copy is not a courtesy.
+                    // longer readable and keeping a plaintext copy is not a courtesy. The
+                    // same for what its members called themselves.
                     let _ = self.history.forget(room);
+                    let _ = self.profiles.forget(&room);
                     events.push(Event::Removed);
                 }
                 Ok(TimelineEvent::Nothing) => {}
@@ -746,6 +834,16 @@ impl Session {
         if let Some(live) = self.recheck_timer(&mut open, &mut events) {
             // An expired message takes the only in-memory key to its attachment with it.
             attachments::remember(&mut self.attachments, &live);
+        }
+        // After everything fetched has been processed, so the group is at its current epoch
+        // and a member who just joined can read it. A failure is retried on the next poll.
+        let _ = self.flush_profile(&mut open);
+        if profiles_changed {
+            self.relabel(&mut open);
+            let mut users: Vec<&UserId> = open.labels.keys().collect();
+            users.sort();
+            let profiles = users.into_iter().map(|u| self.view_of(&open, u)).collect();
+            events.push(Event::Profiles { profiles });
         }
         let _ = self.index.advance(room, open.cursor);
         self.open = Some(open);
@@ -995,7 +1093,21 @@ impl Session {
             verify::observe_roster(&open.convo, &mut self.contacts)?;
         }
         let listed = self.client.room_members(room)?;
-        Ok(member_views(listed, &open.convo.members(), &self.contacts))
+        let mut views = member_views(listed.clone(), &open.convo.members(), &self.contacts);
+
+        // Remember who the instance listed, so a name is labelled against waiting members
+        // too, then attach each member's profile.
+        if let Some(mut open) = self.open.take() {
+            open.listed = listed.iter().map(|(u, _)| *u).collect();
+            self.relabel(&mut open);
+            for v in &mut views {
+                if let Ok(user) = v.user.parse::<UserId>() {
+                    v.profile = Some(self.view_of(&open, &user));
+                }
+            }
+            self.open = Some(open);
+        }
+        Ok(views)
     }
 
     /// The safety number for each of `user`'s devices in the open room's group.
@@ -1077,7 +1189,11 @@ impl Session {
                 self.client.send(open.convo.room(), &wrapped)?;
             }
         }
-        self.index.record(open.convo.room(), &open.seal, open.convo.group_id())?;
+        let room = open.convo.room();
+        self.index.record(room, &open.seal, open.convo.group_id())?;
+        // This device committed the add, so no poll will report it here — and the new member
+        // still needs this account's profile, sent after the welcome.
+        let _ = self.profiles.resend(&room);
         Ok(())
     }
 
@@ -1153,6 +1269,7 @@ fn member_views(
                 in_group: found.is_some(),
                 verified: found.is_some_and(|s| s.verified),
                 key_changed: found.is_some_and(|s| s.changed),
+                profile: None,
             }
         })
         .collect();
@@ -1164,6 +1281,7 @@ fn member_views(
             in_group: true,
             verified: seen.verified,
             key_changed: seen.changed,
+            profile: None,
         });
     }
     views
@@ -1197,10 +1315,19 @@ fn human_bytes(n: usize) -> String {
 }
 
 /// A transcript entry as a frontend shows it, with its quote and reactions resolved.
-fn view(entry: &HistoryEntry, thread: &Thread, historic: bool) -> MessageView {
+fn view(
+    entry: &HistoryEntry,
+    thread: &Thread,
+    labels: &HashMap<UserId, Label>,
+    historic: bool,
+) -> MessageView {
     let own = entry.id.as_ref().map(|id| MessageRef { sender: entry.sender, id: id.clone() });
+    let label = labels.get(&entry.sender);
     MessageView {
         sender: entry.sender.to_string(),
+        sender_label: label
+            .map_or_else(|| crate::profile::short_id(&entry.sender), |l| l.text.clone()),
+        sender_ambiguous: label.is_some_and(|l| l.ambiguous),
         body: String::from_utf8_lossy(&entry.body).to_string(),
         sent_at_ms: entry.sent_at_ms,
         historic,

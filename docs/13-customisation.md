@@ -1,6 +1,7 @@
 # Customisation, and why most of Nitro is free here
 
-**Status:** Design. Nothing here is built.
+**Status:** Design. **Profiles are built** (§1a, [ADR-010](adr/010-encrypted-profiles.md));
+nothing else here is.
 
 The question this answers: can Cairn match Discord's customisation, and give away what Nitro
 charges for? Mostly yes — and the reason is not generosity. **Most of Nitro is artificial
@@ -30,6 +31,28 @@ These cost an operator nothing meaningful and should never be gated:
 **None of this needs a subscription tier, and there should not be one.** `00-vision.md` §4
 already forbids ads and message-content-derived monetization; charging to raise a limit the
 operator is not actually paying for would be the same instinct wearing a different hat.
+
+## 1a. Profiles, built so the instance never sees them
+
+"A row keyed by (account, community)" above is the Discord shape, and it would put every
+name, bio and face on the instance. What is built instead ([ADR-010](adr/010-encrypted-profiles.md)):
+
+- Display name, pronouns, about me (190 characters, 8 lines), avatar, banner, a two-colour
+  banner gradient, a custom status (emoji, text, optional expiry) and a **per-room nickname**.
+- The profile is a **record inside the encrypted message stream**, sent into each room; the
+  images are **encrypted attachments** in that room's blob store, keys inside the record.
+  The instance relays ciphertext and stores ciphertext.
+- It is attributed to the envelope's sender — the record names nobody — and the recipient
+  checks that sender against the group's roster. Building this found that no client did,
+  and that a malicious instance could relabel anyone's messages; see the ADR.
+- Names are sanitised on both ends and **lookalike names are flagged, not trusted**: two
+  members whose names collide are both shown with part of their id. Safety numbers, the
+  verified mark and membership notices show ids, never names. A name is a label.
+- A nickname reaches only its own room. A profile change reaches a room the next time this
+  device has it open.
+
+Discord's per-server *avatar* and animated decorations are not built; a GIF avatar is
+carried as-is, so it animates.
 
 ## 2. Where "free" means someone else's bill
 

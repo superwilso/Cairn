@@ -24,6 +24,7 @@ pub mod embed;
 #[cfg(feature = "http")]
 pub mod gifs;
 pub mod history;
+pub mod profile;
 #[cfg(feature = "http")]
 pub mod session;
 pub mod statedir;

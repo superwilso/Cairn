@@ -383,6 +383,19 @@ Four calls made by the owner, so a session does not re-litigate them:
       Registration invites shorter than 16 characters are now refused at startup, because
       against a guesser with many addresses the token is the defence and the limit is not.
       **Not bounded:** an attacker with many addresses, and anything after a restart.
+- [x] **Profiles the instance cannot read** — display name, pronouns, about me, avatar,
+      banner, colours, status and per-room nickname, carried inside the encrypted stream
+      with images as encrypted attachments ([ADR-010](adr/010-encrypted-profiles.md)). The
+      desktop client has avatars, a profile card and an editor.
+
+      **Found by probing, before a line of the feature relied on it:** clients attributed
+      every message to the envelope's `sender` without checking the signature the instance
+      had checked, so a malicious instance could relabel anyone's words — and would have been
+      able to relabel anyone's profile. Now verified against the group's roster
+      (`01-threat-model.md` §4). Lookalike names (`AIice` for `Alice`, Cyrillic letters, a name
+      that is somebody's short id) are flagged and shown with the id rather than trusted.
+      **Not done:** binding the decrypted ciphertext to the envelope's signer (needs the MLS
+      sender from `cairn-crypto`), and sending changes into rooms that are not open.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.

@@ -1,0 +1,165 @@
+/* Profiles — avatars, names, the card and the editor.
+
+   Uses only the theme's variables, so it follows whatever style.css becomes. Nothing here
+   styles the tier badge, the safety panel or a membership notice: those say who can read the
+   room and whose key is whose, and a profile — chosen by another member — must never be able
+   to restyle them (docs/13-customisation.md §5). */
+
+.pf-link { cursor: pointer; }
+
+/* <bdi> keeps a right-to-left name from reordering whatever sits next to it. */
+.pf-name { unicode-bidi: isolate; }
+
+.pf-avatar {
+  --pf-size: 28px;
+  width: var(--pf-size); height: var(--pf-size); flex: none;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  display: inline-grid; place-items: center;
+  overflow: hidden;
+  color: var(--muted);
+  font: 600 calc(var(--pf-size) * 0.38)/1 var(--sans);
+  user-select: none;
+}
+.pf-avatar.pf-colored { color: #fff; border-color: transparent; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35); }
+.pf-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* The tag: part of the id, drawn beside a name that collides with another member's. */
+.pf-tag {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10.5px;
+  vertical-align: 1px;
+}
+.pf-suffix { color: var(--dim); }
+.pf-status-mini { font-size: 12px; flex: none; }
+#member-list li .who[data-pf-user] { white-space: nowrap; }
+
+/* ---- the timeline ------------------------------------------------------- */
+
+.msg.pf-msg { align-items: flex-start; }
+.msg.pf-msg > .pf-avatar { margin-top: 1px; }
+.msg .who.pf-named { width: auto; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg .who.pf-link:hover .pf-name { text-decoration: underline; }
+
+/* ---- the signed-in account --------------------------------------------- */
+
+#avatar.pf-me { background: none; width: auto; height: auto; border-radius: 0; }
+#whoami.pf-link:hover { color: var(--text); }
+
+/* ---- the card ----------------------------------------------------------- */
+
+.pf-card {
+  width: 300px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  user-select: text;
+}
+.pf-floating { position: fixed; z-index: 20; box-shadow: var(--shadow); }
+.pf-floating[hidden] { display: none; }
+
+.pf-banner {
+  height: 96px;
+  background: linear-gradient(160deg, var(--surface-2), var(--line));
+  background-size: cover;
+  background-position: center;
+}
+.pf-body { position: relative; padding: 0 16px 14px; }
+.pf-body > .pf-big {
+  --pf-size: 76px;
+  margin-top: -40px;
+  border: 5px solid var(--surface);
+  box-sizing: content-box;
+}
+.pf-names { margin-top: 6px; }
+.pf-title { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.pf-pronouns { color: var(--muted); font-size: 13px; }
+.pf-id { color: var(--dim); font-size: 11px; margin-top: 2px; overflow-wrap: anywhere; }
+.pf-warn {
+  margin-top: 10px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+}
+.pf-status {
+  display: flex; gap: 7px; align-items: center;
+  margin-top: 10px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.pf-status-emoji { font-size: 16px; }
+.pf-section {
+  margin-top: 12px;
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pf-about { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+.pf-foot {
+  display: flex; align-items: center; gap: 8px; justify-content: space-between;
+  margin-top: 14px; padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.pf-keys { color: var(--muted); font-size: 12px; }
+.pf-keys.ok { color: var(--accent); }
+.pf-keys.bad { color: var(--text); font-weight: 700; }
+
+/* ---- the editor --------------------------------------------------------- */
+
+.sheet .panel.pf-editor-panel { width: min(760px, calc(100vw - 32px)); }
+.pf-editor-grid { display: grid; grid-template-columns: 1fr 300px; gap: 20px; }
+.pf-form { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.pf-field { display: flex; flex-direction: column; gap: 4px; }
+.pf-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+.pf-count { color: var(--dim); font-variant-numeric: tabular-nums; }
+.pf-count.over { color: var(--text); font-weight: 700; }
+.pf-form input:not([type]), .pf-form textarea, .pf-form select {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 7px 9px;
+  color: var(--text);
+  font: inherit;
+}
+.pf-form textarea { resize: vertical; min-height: 72px; }
+.pf-row { display: flex; gap: 8px; align-items: center; }
+.pf-row > input:not([type]) { flex: 1; min-width: 0; width: auto; }
+.pf-form .pf-row > input.pf-emoji-input { width: 52px; flex: none; text-align: center; }
+.pf-row input[type="color"] {
+  width: 38px; height: 28px; padding: 0;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); background: none;
+}
+.pf-check {
+  display: flex; align-items: center; justify-content: flex-start; gap: 6px;
+  color: var(--muted); font-size: 12px; flex: 1;
+}
+.pf-check input[type="checkbox"] { width: auto; flex: none; margin: 0; }
+.pf-images { gap: 10px; }
+.pf-picker { display: flex; align-items: center; gap: 6px; flex: 1; }
+.pf-picker button { white-space: nowrap; }
+.pf-picker .pf-label { min-width: 0; }
+.pf-actions { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+.pf-actions .error { flex: 1; margin: 0; }
+.pf-preview-col { min-width: 0; }
+.pf-preview-col .pf-section { margin: 0 0 6px; }
+.pf-note { color: var(--dim); font-size: 11.5px; line-height: 1.5; }
+
+@media (max-width: 720px) {
+  .pf-editor-grid { grid-template-columns: 1fr; }
+}

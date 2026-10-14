@@ -18,7 +18,7 @@ const CairnMessages = (() => {
     const HEART = QUICK[0];
     const SWIPE_PX = 56;
 
-    let hooks = { me: () => null, short: (s) => s, onError: () => {} };
+    let hooks = { me: () => null, short: (s) => s, onError: () => {}, author: () => {} };
     let replyingTo = null;
 
     const find = (sender, id) =>
@@ -68,6 +68,8 @@ const CairnMessages = (() => {
         reactions.className = "reactions";
         content.append(body, reactions);
         li.append(who, content);
+        // Name and avatar are profile.js's to draw.
+        hooks.author(li, who, m);
 
         // A message recorded before replies existed has no id and cannot be answered.
         if (m.id) {

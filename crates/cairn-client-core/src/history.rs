@@ -172,7 +172,7 @@ impl History {
 }
 
 #[cfg(unix)]
-fn restrict(path: &Path) -> Result<(), HistoryError> {
+pub(crate) fn restrict(path: &Path) -> Result<(), HistoryError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
@@ -180,7 +180,7 @@ fn restrict(path: &Path) -> Result<(), HistoryError> {
 
 /// No portable equivalent on Windows; the same gap the client's other state has.
 #[cfg(not(unix))]
-fn restrict(_path: &Path) -> Result<(), HistoryError> {
+pub(crate) fn restrict(_path: &Path) -> Result<(), HistoryError> {
     Ok(())
 }
 

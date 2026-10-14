@@ -29,6 +29,10 @@ pub enum ConversationError {
     CommitmentMismatch,
     #[error("could not encode or decode the message body: {0}")]
     Encoding(#[from] serde_json::Error),
+    /// The envelope names a sender whose device holds no leaf in this group, or its
+    /// signature does not verify under that leaf's key. See [`Conversation::receive`].
+    #[error("the message's claimed sender is not the device that signed it")]
+    UnattributableSender,
 }
 
 /// A message ready to hand to the transport, plus the opening the sender must retain.
@@ -295,13 +299,31 @@ impl Conversation {
         self.send_with(b"", Extras { reaction: Some(reaction), ..Extras::default() }, now_ms)
     }
 
+    /// Publish this account's profile to the room.
+    ///
+    /// Like a reaction, the body is empty and the record rides beside it inside the
+    /// encrypted body, so **a profile is not reportable through franking** — a hostile name
+    /// or bio is something a recipient can screenshot, not something they can prove.
+    /// Recorded here rather than discovered.
+    ///
+    /// The record carries no field saying whose profile it is. Recipients file it under the
+    /// envelope's sender, which [`Conversation::receive`] checks against the group's roster,
+    /// so there is nothing in the payload for anyone to forge.
+    pub fn send_profile(
+        &mut self,
+        profile: crate::profile::Profile,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(b"", Extras { profile: Some(profile), ..Extras::default() }, now_ms)
+    }
+
     fn send_with(
         &mut self,
         plaintext: &[u8],
         extras: Extras,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        let Extras { card, attachment, signal, reply_to, reaction } = extras;
+        let Extras { card, attachment, signal, reply_to, reaction, profile } = extras;
         let tier = self.seal.tier();
         if !tier.is_e2ee() {
             return Err(ConversationError::NotEncrypted);
@@ -322,6 +344,7 @@ impl Conversation {
             signal,
             reply_to,
             reaction,
+            profile,
         };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
@@ -416,9 +439,13 @@ impl Conversation {
                 attachment: None,
                 reply_to: None,
                 reaction: None,
+                profile: None,
             })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
+                if matches!(envelope.payload, EnvelopePayload::MlsApplication { .. }) {
+                    self.check_sender(envelope)?;
+                }
                 let group = self.group.as_mut().ok_or(MlsError::NoGroup)?;
                 let msg = cairn_crypto::mls::parse_message(ciphertext)?;
                 let decrypted = match group.process(msg)? {
@@ -449,6 +476,13 @@ impl Conversation {
                 if inner.reaction.as_ref().is_some_and(|r| !r.is_valid()) {
                     return Ok(TimelineEvent::Nothing);
                 }
+                // The same for a profile: every limit is re-checked here, because the
+                // sender's client is not bound by its own checks. One bad field drops the
+                // whole record rather than a cleaned-up version of it — a name with its
+                // text-direction override stripped is still a name somebody built to mislead.
+                if inner.profile.as_ref().is_some_and(|p| p.validate().is_err()) {
+                    return Ok(TimelineEvent::Nothing);
+                }
 
                 Ok(TimelineEvent::Message(ReceivedMessage {
                     body: inner.body,
@@ -465,8 +499,53 @@ impl Conversation {
                     // the text is still something its sender said.
                     reply_to: inner.reply_to.filter(MessageRef::is_valid).map(Box::new),
                     reaction: inner.reaction.map(Box::new),
+                    profile: inner.profile.map(Box::new),
                 }))
             }
+        }
+    }
+
+    /// Refuse an application message whose envelope does not come from the device it names.
+    ///
+    /// **Found by a probe, written while building profiles.** Every client attributes a
+    /// message — and now a profile — to `envelope.sender`, and nothing on the receiving side
+    /// checked it: the instance verifies the signature on the way in, but the instance is
+    /// exactly the party a client must not take that from. A probe rewrote `sender` on a
+    /// delivered envelope and the recipient accepted it, so a malicious instance could have
+    /// shown one member's words — or one member's display name and avatar — under anybody
+    /// else's id.
+    ///
+    /// The envelope is signed with the device key, and that key *is* the device's leaf key
+    /// in this group. So the check is: find the leaf whose credential names this exact
+    /// account and device, and verify the signature under that leaf's key. The roster comes
+    /// from the group's own state, which the instance cannot alter without every member
+    /// rejecting the commit.
+    ///
+    /// **What it does not cover:** the MLS ciphertext inside is not itself bound to the
+    /// envelope's signer — that needs the sender leaf of the decrypted message, which
+    /// `cairn_crypto::mls::GroupEvent::Application` does not expose yet. Re-wrapping another
+    /// member's ciphertext in your own signed envelope fails as an MLS replay when the
+    /// original was delivered first, which an honest instance's ordering guarantees; an
+    /// instance colluding with a member could reorder them. Recorded in
+    /// `docs/adr/010-encrypted-profiles.md`.
+    fn check_sender(&self, envelope: &Envelope) -> Result<(), ConversationError> {
+        let group = self.group.as_ref().ok_or(MlsError::NoGroup)?;
+        let claimed = cairn_proto::DeviceIdentity::new(envelope.sender, envelope.sender_device)
+            .to_credential();
+        let signature = envelope
+            .signature
+            .as_deref()
+            .and_then(|s| hex::decode(s).ok())
+            .ok_or(ConversationError::UnattributableSender)?;
+        let signed = envelope.signing_bytes();
+        let genuine = group.members().iter().any(|m| {
+            m.identity == claimed
+                && cairn_crypto::mls::verify_signature(&m.signature_key, &signed, &signature)
+        });
+        if genuine {
+            Ok(())
+        } else {
+            Err(ConversationError::UnattributableSender)
         }
     }
 }
@@ -550,6 +629,11 @@ struct InnerBody {
     /// reacted to what, with which emoji, is conversation content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reaction: Option<Reaction>,
+    /// The sender's profile — display name, avatar and the rest. Inside the encrypted body
+    /// because that is the point: the instance relays it and learns only that something was
+    /// sent. See `docs/adr/010-encrypted-profiles.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<crate::profile::Profile>,
 }
 
 /// The optional parts of an outgoing message. Bundled so `send_with` does not grow a
@@ -561,6 +645,7 @@ struct Extras {
     signal: Option<crate::call::CallSignal>,
     reply_to: Option<MessageRef>,
     reaction: Option<Reaction>,
+    profile: Option<crate::profile::Profile>,
 }
 
 /// Names one earlier message in a room: who sent it, and its franking commitment.
@@ -609,7 +694,7 @@ impl Reaction {
     }
 }
 
-fn is_emoji_like(s: &str) -> bool {
+pub(crate) fn is_emoji_like(s: &str) -> bool {
     let n = s.chars().count();
     (1..=Reaction::MAX_CHARS).contains(&n)
         && s.chars().all(|c| !c.is_ascii() && !c.is_control() && !c.is_whitespace())
@@ -621,6 +706,11 @@ fn is_emoji_like(s: &str) -> bool {
 /// what let an added member be invisible: MLS applies the commit either way, so the
 /// difference between a wiretap and a normal handshake existed only in a value the old
 /// signature had no room for.
+///
+/// The size lint is allowed rather than satisfied by boxing the message: one of these exists
+/// per envelope for the length of a `match`, never in bulk, and nearly every one *is* a
+/// message — boxing would allocate for the common case to save stack in the rare one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum TimelineEvent {
     /// Content to display.
@@ -689,6 +779,10 @@ pub struct ReceivedMessage {
     pub reply_to: Option<Box<MessageRef>>,
     /// A reaction rather than text. Already checked with [`Reaction::is_valid`].
     pub reaction: Option<Box<Reaction>>,
+    /// The sender's profile rather than text. Already checked with
+    /// [`crate::profile::Profile::validate`]. Whose profile it is comes from the envelope,
+    /// never from here.
+    pub profile: Option<Box<crate::profile::Profile>>,
 }
 
 /// Franking material a recipient retains so a message can be reported later.
@@ -812,34 +906,120 @@ mod tests {
     }
 
     /// Wire two conversations together over a shared MLS group.
+    ///
+    /// Each side's MLS credential names the account and device its conversation sends as,
+    /// the way `Session::open` builds them. `receive` checks the two agree, so a test pair
+    /// built from arbitrary labels would have every message refused as unattributable.
     fn linked_pair() -> (Conversation, Conversation) {
-        let alice_session = Arc::new(Session::new(b"alice").unwrap());
-        let bob_session = Arc::new(Session::new(b"bob").unwrap());
+        let (mut alice, mut bob, _) = linked_group(2);
+        (alice.remove(0), bob.remove(0))
+    }
 
-        let mut alice = Conversation::create_encrypted(
-            dm_seal(),
+    /// A group of `n` conversations, all in one room. Returns (first, the rest, their users).
+    fn linked_group(n: usize) -> (Vec<Conversation>, Vec<Conversation>, Vec<UserId>) {
+        let seal = || {
+            RoomSeal::new(RoomShape {
+                is_direct: n == 2,
+                is_publicly_discoverable: false,
+                member_ceiling: n as u32,
+            })
+            .unwrap()
+        };
+        let people: Vec<(UserId, DeviceId)> =
+            (0..n).map(|_| (UserId::new(), DeviceId::new())).collect();
+        let sessions: Vec<Arc<Session>> = people
+            .iter()
+            .map(|(u, d)| {
+                Arc::new(
+                    Session::new(&cairn_proto::DeviceIdentity::new(*u, *d).to_credential())
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        let mut first = Conversation::create_encrypted(
+            seal(),
             RoomId::new(),
-            UserId::new(),
-            DeviceId::new(),
-            alice_session.clone(),
+            people[0].0,
+            people[0].1,
+            sessions[0].clone(),
         )
         .unwrap();
+        let mut rest: Vec<Conversation> = Vec::new();
+        for (i, session) in sessions.iter().enumerate().skip(1) {
+            let commit =
+                first.group_mut().unwrap().add_member(session.key_package().unwrap()).unwrap();
+            // Members already in the group process the commit, as they would off the wire.
+            let handshake = first.wrap_handshake(&commit.commit.to_bytes().unwrap(), 0).unwrap();
+            for member in &mut rest {
+                member.receive(&handshake).unwrap();
+            }
+            let group = session.join(&commit.welcome.unwrap()).unwrap();
+            rest.push(
+                Conversation::join_encrypted(
+                    seal(),
+                    first.room(),
+                    people[i].0,
+                    people[i].1,
+                    session.clone(),
+                    group,
+                )
+                .unwrap(),
+            );
+        }
+        (vec![first], rest, people.iter().map(|(u, _)| *u).collect())
+    }
 
-        let commit =
-            alice.group_mut().unwrap().add_member(bob_session.key_package().unwrap()).unwrap();
-        let bob_group = bob_session.join(&commit.welcome.unwrap()).unwrap();
+    #[test]
+    fn a_message_relabelled_to_another_sender_is_refused() {
+        // The probe that found it: the instance rewrites who sent a message it relays, and
+        // the recipient accepted it — attributing bob's words to carol.
+        let (mut first, mut rest, users) = linked_group(3);
+        let alice = &mut first[0];
+        let mut bob = rest.remove(0);
+        let mut sent = bob.send(b"said by bob", 1).unwrap();
+        sent.envelope.sender = users[2];
+        assert!(matches!(
+            alice.receive(&sent.envelope),
+            Err(ConversationError::UnattributableSender)
+        ));
+    }
 
-        let bob = Conversation::join_encrypted(
-            dm_seal(),
-            alice.room(),
-            UserId::new(),
-            DeviceId::new(),
-            bob_session.clone(),
-            bob_group,
-        )
-        .unwrap();
+    #[test]
+    fn a_message_moved_to_another_device_or_unsigned_is_refused() {
+        let (mut alice, mut bob) = linked_pair();
+        let mut sent = bob.send(b"from bob's phone", 1).unwrap();
+        sent.envelope.sender_device = DeviceId::new();
+        assert!(matches!(
+            alice.receive(&sent.envelope),
+            Err(ConversationError::UnattributableSender)
+        ));
 
-        (alice, bob)
+        let mut sent = bob.send(b"unsigned", 2).unwrap();
+        sent.envelope.signature = None;
+        assert!(matches!(
+            alice.receive(&sent.envelope),
+            Err(ConversationError::UnattributableSender)
+        ));
+    }
+
+    #[test]
+    fn a_profile_that_breaks_the_rules_is_dropped_on_receipt() {
+        // A hostile client is not bound by `set_profile`'s checks.
+        use crate::profile::Profile;
+        let (mut alice, mut bob) = linked_pair();
+        for name in ["al\u{202E}ecila", "\u{200B}", "ali\u{0000}ce", &"x".repeat(200)] {
+            let profile = Profile { display_name: Some(name.to_owned()), ..Profile::default() };
+            let sent = bob.send_profile(profile, 1).unwrap();
+            assert!(
+                matches!(alice.receive(&sent.envelope).unwrap(), TimelineEvent::Nothing),
+                "{name:?} must not arrive as anything"
+            );
+        }
+        let good = Profile { display_name: Some("Bob".into()), ..Profile::default() };
+        let sent = bob.send_profile(good, 1).unwrap();
+        let got = alice.receive(&sent.envelope).unwrap().message().unwrap();
+        assert_eq!(got.profile.unwrap().display_name.as_deref(), Some("Bob"));
     }
 
     /// M1's exit condition at the layer a client actually drives.
@@ -859,10 +1039,12 @@ mod tests {
 
         let (room, alice_user, alice_device, bob_user, bob_device) =
             (RoomId::new(), UserId::new(), DeviceId::new(), UserId::new(), DeviceId::new());
+        let alice_id = cairn_proto::DeviceIdentity::new(alice_user, alice_device).to_credential();
+        let bob_id = cairn_proto::DeviceIdentity::new(bob_user, bob_device).to_credential();
 
         {
-            let alice_session = Arc::new(Session::open(&alice_dir, b"alice").unwrap());
-            let bob_session = Arc::new(Session::open(&bob_dir, b"bob").unwrap());
+            let alice_session = Arc::new(Session::open(&alice_dir, &alice_id).unwrap());
+            let bob_session = Arc::new(Session::open(&bob_dir, &bob_id).unwrap());
 
             let mut alice = Conversation::create_encrypted(
                 dm_seal(),
@@ -898,8 +1080,8 @@ mod tests {
         }
 
         // Restart. Only the directories survive.
-        let alice_session = Arc::new(Session::open(&alice_dir, b"alice").unwrap());
-        let bob_session = Arc::new(Session::open(&bob_dir, b"bob").unwrap());
+        let alice_session = Arc::new(Session::open(&alice_dir, &alice_id).unwrap());
+        let bob_session = Arc::new(Session::open(&bob_dir, &bob_id).unwrap());
         let alice_index = ConversationIndex::open(&alice_dir).unwrap();
         let bob_index = ConversationIndex::open(&bob_dir).unwrap();
 
@@ -989,7 +1171,16 @@ mod tests {
         let (bogus, _) = franking::commit(b"something else entirely");
         sent.envelope.franking_commitment = Some(bogus.to_hex());
 
-        assert!(matches!(bob.receive(&sent.envelope), Err(ConversationError::CommitmentMismatch)));
+        // Tampered in transit, the signature no longer covers it and the envelope is refused
+        // before anything is decrypted.
+        assert!(matches!(
+            bob.receive(&sent.envelope),
+            Err(ConversationError::UnattributableSender)
+        ));
+        // Signed that way by a hostile *sender*, it gets past attribution — and the
+        // commitment check is what catches it.
+        let resigned = alice.sign(sent.envelope).unwrap();
+        assert!(matches!(bob.receive(&resigned), Err(ConversationError::CommitmentMismatch)));
     }
 
     #[test]
@@ -1126,6 +1317,7 @@ mod attachment_tests {
             signal: None,
             reply_to: None,
             reaction: None,
+            profile: None,
         };
 
         let encoded = serde_json::to_vec(&inner).unwrap();

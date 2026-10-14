@@ -201,6 +201,19 @@ Two more surfaced when the desktop client gained the same display, again by prob
   number changed which key that was. Both clients now hand back the number that was shown,
   and verification is refused if it is no longer the current one.
 
+One more surfaced building profiles ([ADR-010](adr/010-encrypted-profiles.md)), and it
+contradicted the first sentence of this section:
+
+- **The instance could relabel who sent a message.** It checks envelope signatures on the
+  way in; no client checked them on the way out, and every client attributes a message to
+  the envelope's `sender`. A probe rewriting that field had a recipient show one member's
+  words — and, with profiles, one member's name and avatar — under another's id. Clients now
+  verify each application envelope's signature under the roster leaf for that exact account
+  and device. **Still open:** the MLS ciphertext is not bound to the envelope's signer, so an
+  instance *colluding with a member* can reorder a re-wrapped copy of someone else's message
+  ahead of the original and attribute it to that member. Closing that needs the decrypted
+  message's sender leaf from `cairn-crypto`.
+
 **A4 is bounded for a user who actually compares.** That is a narrower claim than "A4 is
 bounded", and the gap is deliberate: verification is manual and per-peer, so it protects
 exactly the conversations someone took the trouble to check. **Key transparency remains

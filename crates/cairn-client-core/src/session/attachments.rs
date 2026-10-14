@@ -231,6 +231,12 @@ pub struct PendingDownload {
 }
 
 impl PendingDownload {
+    /// For an attachment this session took from an encrypted body — a profile's avatar, say.
+    /// Crate-internal: a frontend still cannot name a blob and a key of its own.
+    pub(super) fn new(client: Client<HttpTransport>, attachment: Attachment) -> Self {
+        Self { client, attachment }
+    }
+
     /// Download and open. Fails — rather than returning anything — if the instance served
     /// bytes that do not authenticate under the key from the message.
     pub fn fetch(&self) -> Result<Vec<u8>, SessionError> {
@@ -348,7 +354,7 @@ impl Session {
         // Into the thread too, so the sender can be replied to or reacted to about it.
         open.thread.record(&entry);
         self.attachments.insert(attachment.blob, attachment);
-        Ok(view(&entry, &open.thread, false))
+        Ok(view(&entry, &open.thread, &open.labels, false))
     }
 
     /// Seal, upload and send in one call, holding `&mut self` throughout. For callers that

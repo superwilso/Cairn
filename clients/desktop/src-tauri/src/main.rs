@@ -22,7 +22,8 @@ use std::sync::Mutex;
 use cairn_client_core::call::{self, CallSignal, IceServer};
 use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
-    Event, MemberView, MessageView, ReactionView, RoomSummary, Session,
+    Event, ImageSlot, MemberView, MessageView, ProfileEdit, ProfileLimits, ProfileView,
+    ReactionView, RoomSummary, Session,
 };
 use cairn_client_core::verify::SafetyView;
 use tauri::State;
@@ -413,6 +414,84 @@ async fn send_gif(app: tauri::AppHandle, id: String) -> CmdResult<MessageView> {
     .await
 }
 
+// ---- profiles --------------------------------------------------------------
+//
+// The record, its rules, which room hears what and when, and every label the UI draws are
+// `cairn_client_core::session::profiles`. The UI sends edits and bytes, and gets views.
+
+#[tauri::command]
+fn my_profile(state: State<'_, AppState>) -> CmdResult<ProfileView> {
+    with(&state, |s| Ok(s.my_profile()))
+}
+
+#[tauri::command]
+fn profiles(state: State<'_, AppState>) -> CmdResult<Vec<ProfileView>> {
+    with(&state, |s| s.profiles())
+}
+
+#[tauri::command]
+fn set_profile(state: State<'_, AppState>, edit: ProfileEdit) -> CmdResult<ProfileView> {
+    with(&state, |s| s.set_profile(edit))
+}
+
+#[tauri::command]
+fn set_nickname(state: State<'_, AppState>, nickname: Option<String>) -> CmdResult<ProfileView> {
+    with(&state, |s| s.set_nickname(nickname.as_deref()))
+}
+
+#[tauri::command]
+fn profile_limits() -> ProfileLimits {
+    cairn_client_core::session::profile_limits()
+}
+
+#[derive(serde::Deserialize)]
+struct ImageMeta {
+    slot: ImageSlot,
+    mime: String,
+}
+
+/// Set an avatar or banner. Raw bytes as the IPC body, the slot and type in a header — the
+/// same shape as `send_file`, for the same reason.
+#[tauri::command]
+async fn set_profile_image(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<ProfileView> {
+    let meta: ImageMeta = request
+        .headers()
+        .get("x-cairn-image")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or("the image's slot and type are missing")?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(value) => <Vec<u8> as serde::Deserialize>::deserialize(value)
+            .map_err(|_| "expected the image's bytes")?,
+    };
+    off_main(move || with_app(&app, |s| s.set_profile_image(meta.slot, Some((&bytes, &meta.mime)))))
+        .await
+}
+
+#[tauri::command]
+fn clear_profile_image(state: State<'_, AppState>, slot: ImageSlot) -> CmdResult<ProfileView> {
+    with(&state, |s| s.set_profile_image(slot, None))
+}
+
+/// One member's avatar or banner in the open room, decrypted, as raw bytes.
+#[tauri::command]
+async fn fetch_profile_image(
+    app: tauri::AppHandle,
+    user: String,
+    slot: ImageSlot,
+) -> CmdResult<tauri::ipc::Response> {
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_profile_image(&user, slot))?;
+        let bytes = pending.fetch().map_err(|e| e.to_string())?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -449,6 +528,14 @@ fn main() {
             gif_search,
             gif_preview,
             send_gif,
+            my_profile,
+            profiles,
+            set_profile,
+            set_nickname,
+            profile_limits,
+            set_profile_image,
+            clear_profile_image,
+            fetch_profile_image,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

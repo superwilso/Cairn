@@ -125,6 +125,12 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/gifs.browser.test.js
+      - name: Profiles in a browser
+        # A member's chosen name is drawn as text, an ambiguous one always carries the id,
+        # and the card opens safety numbers by id. The record and the attacks are in cargo.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/profile.browser.test.js
 
   lint:
     name: fmt + clippy
