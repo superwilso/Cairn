@@ -384,12 +384,26 @@ test("calls in the real UI", { skip }, async (t) => {
             await b.$eval("#volume-range", (r) => { r.value = "160"; r.dispatchEvent(new Event("input")); });
             await b.waitForSelector(tileSel(ALICE) + " .tile-badge.local");
             assert.strictEqual(await b.$eval(tileSel(ALICE) + " .tile-badge.local", (x) => x.textContent), "160%");
+            // Above 100% the voice moves to the WebAudio path and the tile's own element goes
+            // quiet, or she would be heard twice.
+            const elementMuted = () => b.$eval(tileSel(ALICE) + " video", (v) => v.muted);
+            assert.strictEqual(await elementMuted(), true);
             await shot(b, "volume");
             await b.click("#volume-mute");
             await b.waitForSelector(tileSel(ALICE) + ' .tile-badge.local[title="Muted for you"]');
 
             const saved = await b.evaluate(() => JSON.parse(localStorage.getItem("cairn.callvol.v1")));
             assert.deepStrictEqual(saved["usr_a11ce000000040008000000000000001"], { volume: 160, muted: true });
+
+            // Back to 100%: the plain element path, which every webview plays reliably.
+            await b.click("#volume-reset");
+            assert.strictEqual(await elementMuted(), false);
+            assert.strictEqual(await b.$eval(tileSel(ALICE) + " video", (v) => v.volume), 1);
+            // Deafen silences every voice on this device, whichever path it is on.
+            await b.click("#deafen");
+            assert.strictEqual(await elementMuted(), true);
+            await b.click("#deafen");
+            assert.strictEqual(await elementMuted(), false);
             // Alice is not told she was turned down.
             assert.strictEqual(await a.$(tileSel(ALICE) + " .tile-badge.local"), null);
             await a.close(); await b.close();

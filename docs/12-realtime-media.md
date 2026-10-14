@@ -47,11 +47,25 @@ What the mesh does not have:
   which is end-to-end *because there is no middle*, not because of anything Cairn built.
   Adding an SFU is exactly what makes §4 necessary.
 - **No downgrade badge** (§5). Nothing can downgrade yet, because there is only one mode.
-- **No TURN relay**, so STUN-only traversal fails on some home networks. The client says so
-  rather than leaving a user to conclude their connection is broken.
-- **Every participant learns every other participant's IP address.** Inherent to
-  peer-to-peer media, stated in §6 already, and stated in the client's own UI. A relay is
-  the only thing that changes it, and a relay costs an operator bandwidth.
+- **A TURN relay only if the operator runs one.** An instance configured with
+  `CAIRN_TURN_URLS` and `CAIRN_TURN_SECRET` (`11-self-hosting.md` §2) hands short-lived
+  coturn REST-auth credentials to authenticated members of the room a call is in; anyone
+  else is refused without learning whether a relay exists. Without one, traversal is
+  STUN-only and fails on some home networks, and the client says so rather than leaving a
+  user to conclude their connection is broken.
+- **Every participant learns every other participant's IP address** — unless they switch on
+  *Always use the relay* (Settings → Voice & video), which sets `iceTransportPolicy: "relay"`
+  so the browser offers relay candidates only. Then the other participants see the relay's
+  address, and **the relay's operator sees theirs** instead, which the setting says. On an
+  instance with no relay it refuses to start a call rather than hang. This is the reverse of
+  §10's recommendation, which is to relay by default: that needs every instance to run a
+  relay, and until a default can rely on one, direct is the default and the relay is a
+  per-person choice. That decision is open, not settled.
+- **Ringing reaches the room you have open, and nowhere else.** The client polls the open
+  room only, so a call started in another room does not ring until you open it. A ring
+  lasts 45 seconds and then becomes a missed call; declining sends an encrypted `decline`
+  addressed to whoever rang, so the instance learns that a message went to the room and not
+  what it said.
 - **A call has no roster of its own**, so it cannot tell a participant from a room member who
   is merely nearby. In the window between joining and the first offer, any member of the room
   can rename a device's call and split the call in two, each half waiting for answers the
@@ -60,12 +74,28 @@ What the mesh does not have:
   it is written down rather than left to be discovered. §2's per-call MLS group is what
   supplies the roster that closes it.
 
-Three layers of test cover it, because each catches what the others cannot: the transport in
-`group_chat_session.rs`, the mesh's decisions against a fake `RTCPeerConnection` in
-`clients/desktop/tests/mesh.test.js`, and a real call between two Chromium pages in
-`call.browser.test.js`. The last found a bug nothing else could: a transceiver the answering
-side pre-created that a remote offer will not reuse, which left every call reporting
-"connected" while carrying video in one direction only.
+**Mute, deafen and push-to-talk never reach the instance.** Whether someone is muted or
+deafened travels on a WebRTC data channel per peer connection — DTLS between the two devices,
+like the media — rather than as a signal through the room, which would have given the
+instance a timestamped log of every mute. Push-to-talk is not signalled at all, and it works
+only while the Cairn window is focused: a webview cannot see keys pressed in other apps, and
+the client says so. What the instance's view of a call does not change: per §6, packet
+timing still shows who speaks to anyone on the media path — which, in the mesh, is the other
+participants and, with a relay, its operator.
+
+Per-person volume (0–200%) and "mute for me" are this device's alone, stored locally, and the
+person is not told. Noise suppression, echo cancellation and automatic gain are the webview's
+own `getUserMedia` processing, switchable in the same settings section.
+
+Four layers of test cover it, because each catches what the others cannot: the transport in
+`group_chat_session.rs` (and the relay credentials over HTTP in `turn_http.rs`), the mesh's
+decisions against a fake `RTCPeerConnection` in `clients/desktop/tests/mesh.test.js`, a real
+call between two Chromium pages in `call.browser.test.js`, and the same in the whole UI in
+`calls.browser.test.js` — ring and accept, decline, mute crossing to the other side and not
+through the instance, the speaking ring, push-to-talk, and relay-only offering no address of
+the device's own. The third found a bug nothing else could: a transceiver the answering side
+pre-created that a remote offer will not reuse, which left every call reporting "connected"
+while carrying video in one direction only.
 
 ---
 

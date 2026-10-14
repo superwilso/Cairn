@@ -356,9 +356,15 @@ Four calls made by the owner, so a session does not re-litigate them:
       networks, and a mesh call shows every participant every other participant's IP address.
       Both appear in the UI, the client README and the release notes.
 
-      **Not done:** an SFU, SFrame, a TURN relay, the per-call MLS group, or the downgrade
-      badge of `12-realtime-media.md` §5. This is the rung below that design, and it is what
-      makes a call work at all.
+      **Not done:** an SFU, SFrame, the per-call MLS group, or the downgrade badge of
+      `12-realtime-media.md` §5. This is the rung below that design, and it is what makes a
+      call work at all.
+
+      **Since:** call basics — an incoming-call screen with accept/decline and a missed-call
+      notice, mute and deafen carried peer to peer over a data channel, push-to-talk (focused
+      window only), speaking rings, per-person volume, microphone processing switches, and an
+      optional operator-run TURN relay with short-lived credentials for room members plus a
+      per-user "always use the relay" setting. Rings reach the open room only.
 - [x] **A Windows release build.** `.github/workflows/release.yml` bundles the client on
       `windows-latest` and publishes it as a prerelease. **Unrun** — it was written on Linux,
       where a Windows installer cannot be produced or verified. What *was* caught locally is

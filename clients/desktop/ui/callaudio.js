@@ -5,18 +5,21 @@
 // MediaStreams call.js already has and routes their sound. Every setting here stays on this
 // device — another participant never learns that you turned them down.
 //
-// ## Why remote audio goes through WebAudio
+// ## Two paths for a voice, and why the plain one is the default
 //
-// A media element's `volume` stops at 100%, and a quiet microphone on the other end needs
-// more than that. So each remote voice runs source → gain → a MediaStream destination → its
-// own hidden <audio> element: the gain gives 0–200%, and the element is still a media element,
-// so the output-device choice (`setSinkId`) keeps working. The tile's <video> stays muted.
+// Up to 100%, a voice plays through its tile's own media element, with `volume` and `muted`
+// — the path every webview has played WebRTC audio through for years. A media element's
+// volume stops at 100%, though, and a quiet microphone on the other end needs more. Above
+// 100% a voice is switched to WebAudio: source → gain → a MediaStream destination → its own
+// hidden <audio> element, which is still a media element, so the output-device choice
+// (`setSinkId`) keeps working.
 //
-// **The fallback matters more than the feature.** An AudioContext can start suspended — the
-// webview's autoplay policy keeps it so until the user has clicked something — and a
-// suspended graph is silence. Whenever the context is not running, a voice plays through its
-// tile's own element instead, capped at 100%, so the worst case is "the boost does not work
-// yet", never "I cannot hear anyone".
+// The boost is the exception rather than the rule on purpose. An AudioContext can start
+// suspended — a webview's autoplay policy keeps it so until the user has clicked something —
+// and a suspended graph is silence; and the three webviews Tauri runs on do not all treat a
+// remote WebRTC stream in WebAudio alike. Whatever goes wrong with the graph, the worst case
+// is "the boost does not work", never "I cannot hear anyone". The analysers for the speaking
+// ring tap the same source and never sit in the path of what is heard.
 
 /* eslint-env browser */
 
@@ -137,8 +140,8 @@ const CairnCallAudio = (() => {
         if (!v) return;
         const p = prefsFor(user);
         const level = deafened || p.muted ? 0 : p.volume / 100;
-        const graph = running() && v.gain && v.out;
-        if (graph) {
+        const boost = level > 1 && running() && v.gain && v.out;
+        if (boost) {
             v.gain.gain.value = level;
             v.out.muted = false;
             if (v.el) v.el.muted = true;
