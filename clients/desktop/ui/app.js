@@ -460,6 +460,29 @@ $("text").addEventListener("paste", (ev) => {
     sendFiles(files);
 });
 
+// ---- voice notes and GIFs --------------------------------------------------
+//
+// Both end as an attachment message Rust hands back; voice.js and gifs.js own the rest.
+
+CairnVoice.bind({
+    button: $("voice"),
+    composer: $("composer"),
+    canRecord: () => (openRoom ? true : (fail($("error"), "Open a room before recording."), false)),
+    send: (bytes, name, mime) => CairnAttach.sendBytes(bytes, name, mime),
+    onSent: (view) => { fail($("error"), null); addMessage(view); },
+    onError: (e) => fail($("error"), e),
+    onNotice: (text) => addNotice(text),
+});
+
+CairnGifs.bind({
+    invoke,
+    button: $("gif"),
+    anchor: $("composer"),
+    canSend: () => !!openRoom,
+    onSent: (view) => { fail($("error"), null); addMessage(view); },
+    onError: (e) => fail($("error"), e),
+});
+
 // ---- calls -----------------------------------------------------------------
 
 CairnCall.bind({
