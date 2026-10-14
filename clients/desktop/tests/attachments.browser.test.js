@@ -78,9 +78,21 @@ function stub(opts) {
         { sender: "usr_bob00000", body: hostile, sent_at_ms: 3, historic: false,
           attachment: { id: "blob_doc", name: hostile, size: 48213, mime: "application/pdf", kind: "file" } },
     ];
+    // The scrolling case: a long history ending in a photo and one more message, with the
+    // photo's bytes held back until the test releases them.
+    if (opts.scroll) {
+        history.length = 0;
+        for (let i = 0; i < 40; i++) {
+            history.push({ sender: "usr_bob00000", body: "filler line " + i, sent_at_ms: 100 + i, historic: true });
+        }
+        history.push({ sender: "usr_alice000", body: "late.png", sent_at_ms: 200, historic: true,
+            attachment: { id: "blob_img", name: "late.png", size: 5120, mime: "image/png", kind: "image" } });
+        history.push({ sender: "usr_bob00000", body: "the last word", sent_at_ms: 201, historic: true });
+    }
     async function png() {
         const c = new OffscreenCanvas(240, 150);
         const g = c.getContext("2d");
+        if (opts.scroll) { c.width = 300; c.height = 900; }
         const grad = g.createLinearGradient(0, 0, 240, 150);
         grad.addColorStop(0, "#f59e0b");
         grad.addColorStop(1, "#7c3aed");
@@ -108,7 +120,10 @@ function stub(opts) {
         poll: () => [],
         call_config: () => ({ ice_servers: [], has_relay: false, max_participants: 8 }),
         attachment_limits: () => ({ max_bytes: opts.maxBytes }),
-        fetch_attachment: ({ id }) => (id === "blob_img" ? png() : id === "blob_wav" ? wav() : Promise.reject("not inline")),
+        fetch_attachment: ({ id }) => {
+            if (id === "blob_img" && opts.scroll) return new Promise((done) => { window.__release = () => done(png()); });
+            return id === "blob_img" ? png() : id === "blob_wav" ? wav() : Promise.reject("not inline");
+        },
         save_attachment: () => "/home/me/Downloads/report.pdf",
         send_file: (body, o) => {
             const meta = JSON.parse(o.headers["x-cairn-file"]);
@@ -144,6 +159,32 @@ async function openApp(browser, base, opts) {
     await page.click("#rooms li");
     await page.waitForSelector("#timeline .attach-file");
     return { page, errors };
+}
+
+// Opens the long history, waits until the timeline is at its newest message, and returns
+// the page with the photo's bytes still held back.
+async function openScrolled(browser, base) {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 750 } });
+    page.setDefaultTimeout(10000);
+    await page.addInitScript(stub, { maxBytes: 1 << 20, hostileName: "x", scroll: true });
+    await page.goto(base + "/index.html");
+    await page.click("#go");
+    await page.click("#rooms li");
+    await page.waitForFunction(() => typeof window.__release === "function");
+    await page.waitForFunction(() => {
+        const t = document.getElementById("timeline");
+        return t.scrollHeight > t.clientHeight * 2 && t.scrollHeight - t.scrollTop - t.clientHeight < 5;
+    });
+    return page;
+}
+
+async function photoLoaded(page) {
+    await page.waitForFunction(() => {
+        const img = document.querySelector(".attach-image img");
+        return img && img.complete && img.naturalHeight === 900;
+    });
+    // Two frames: one for layout, one for the observer's callback to have run.
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
 }
 
 const pw = playwright();
@@ -223,6 +264,70 @@ test("attachments in the real UI", { skip }, async (t) => {
             await page.waitForFunction((n) =>
                 [...document.querySelectorAll(".attach-name")].some((e) => e.textContent === n), name);
             assert.strictEqual(await page.$$eval(".notice", (l) => l.filter((e) => e.textContent.startsWith("Sending")).length), 0);
+            await page.close();
+        });
+
+        await t.test("a photo that loads late keeps the newest message in view", async () => {
+            // Found by looking: the timeline scrolled to the bottom before the photo's bytes
+            // arrived, then the photo grew and pushed the last messages below the fold.
+            const page = await openScrolled(browser, base);
+            await page.evaluate(() => window.__release());
+            await photoLoaded(page);
+            const gap = await page.evaluate(() => {
+                const t = document.getElementById("timeline");
+                const last = [...t.querySelectorAll("li.msg")].pop();
+                return {
+                    text: last.textContent,
+                    below: last.getBoundingClientRect().bottom - t.getBoundingClientRect().bottom,
+                };
+            });
+            assert.match(gap.text, /the last word/);
+            assert.ok(gap.below <= 1, "the last message must still be on screen, but is " + gap.below + "px below");
+            await page.close();
+        });
+
+        await t.test("a reader who scrolled up is not moved when a photo loads", async () => {
+            const page = await openScrolled(browser, base);
+            await page.$eval("#timeline", (t) => { t.scrollTop = 120; });
+            await page.waitForFunction(() => document.getElementById("timeline").scrollTop === 120);
+            // Let the scroll event land before the photo does.
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            await page.evaluate(() => window.__release());
+            await photoLoaded(page);
+            assert.strictEqual(await page.$eval("#timeline", (t) => t.scrollTop), 120);
+            await page.close();
+        });
+
+        await t.test("a message arriving while the reader is up in the history is counted, not scrolled to", async () => {
+            const page = await openScrolled(browser, base);
+            await page.evaluate(() => window.__release());
+            await photoLoaded(page);
+            await page.$eval("#timeline", (t) => { t.scrollTop = 120; });
+            await page.waitForFunction(() => document.getElementById("timeline").scrollTop === 120);
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            await page.evaluate(() => addMessage({ sender: "usr_bob00000", body: "are you there?", sent_at_ms: 99, historic: false }));
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            assert.strictEqual(await page.$eval("#timeline", (t) => t.scrollTop), 120, "the reader was moved");
+            assert.strictEqual(await page.isVisible("#jump-new"), true);
+            assert.strictEqual(await page.innerText("#jump-new"), "1 new message \u2193");
+
+            // The button takes them down and goes away.
+            await page.click("#jump-new");
+            await page.waitForFunction(() => {
+                const t = document.getElementById("timeline");
+                return t.scrollHeight - t.scrollTop - t.clientHeight <= 2;
+            });
+            assert.strictEqual(await page.isVisible("#jump-new"), false);
+
+            // A message of one's own always brings the reader to it.
+            await page.$eval("#timeline", (t) => { t.scrollTop = 120; });
+            await page.evaluate(() => new Promise((r) => requestAnimationFrame(r)));
+            await page.evaluate(() => addMessage({ sender: "usr_me000000", body: "here", sent_at_ms: 100, historic: false }));
+            await page.waitForFunction(() => {
+                const t = document.getElementById("timeline");
+                return t.scrollHeight - t.scrollTop - t.clientHeight <= 2;
+            });
+            assert.strictEqual(await page.isVisible("#jump-new"), false);
             await page.close();
         });
 

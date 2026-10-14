@@ -7,11 +7,17 @@ Tauri. Windows is the first target.
 
 ```
 ui/index.html       structure, and the inline SVG icon set
-ui/style.css        the whole design, hand-written, no framework
+ui/style.css        the whole design, hand-written, no framework; themes are token sets here,
+                    and the `security` layer at the bottom draws the encryption indicators
+ui/settings.js      appearance: themes, accent, fonts, layout, custom CSS, theme import/export
+ui/settings.css     the appearance panel
+ui/fonts/           bundled woff2 fonts, each family with its OFL licence as published
+ui/textures/        contour-line, grain and cairn SVGs, used as CSS masks
 ui/app.js           the DOM — rooms, timeline, members, safety numbers, call controls
 ui/call.js          WebRTC: peer connections, devices, screen share
 ui/timer.js         the disappearing-message control and its notices
 ui/messages.js      drawing a message; replying and reacting to it
+ui/profile.js       avatars, names, the profile card and editor (+ profile.css)
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
@@ -30,6 +36,26 @@ upward and it belongs in `client-core`.
 Deliberate. This is a security product with a small supply chain as a stated value, and a
 chat window does not need a framework and 300 transitive packages to render a list. There is
 no `package.json`, no bundler, and nothing to audit but the files in `ui/`.
+
+The fonts are bundled for the same reason and one more: the webview is offline and its CSP
+allows only `'self'`, so a remote font would simply not load. Fraunces (display), Schibsted
+Grotesk (body), IBM Plex Mono (ids, safety numbers) and the alternative body fonts Alegreya
+Sans, Atkinson Hyperlegible and Literata are all SIL OFL 1.1; the latin subsets came from
+Google Fonts and each family's `OFL.txt` from the google/fonts repository, unedited.
+
+## Appearance
+
+Everything under the gear in the sidebar is stored in this webview's `localStorage` and
+nowhere else; the instance is not involved in how a client looks. Themes are data — colour
+tokens and a few enumerated choices — so a theme someone sends you cannot carry code.
+Custom CSS is the user's own and applies only to their client.
+
+None of it can repaint the encryption indicators ([`13-customisation.md`](../../docs/13-customisation.md)
+§5): their rules sit in the first CSS cascade layer, all `!important`, which no later rule
+outranks; custom CSS that declares a layer is refused; and a tripwire switches custom CSS off
+if it finds an indicator hidden, faded, filtered or covered through an ancestor. The tripwire
+measures what a page can measure — an overlay with `pointer-events: none` escapes
+hit-testing, for instance — so it is a check, not a proof.
 
 ## Running it
 
@@ -95,6 +121,16 @@ not in the encrypted group is marked, because they cannot read a word of it. The
 marked too: someone who holds a leaf in the encrypted group but whom the instance's member
 list leaves out appears as **unlisted** rather than not at all. The list is the instance's to
 write, and a reader of the room must not vanish because it omitted them.
+
+## Profiles
+
+Click your name, top left, to set a display name, pronouns, about me, avatar, banner,
+colours, a status and a nickname for the open room. They are sent **encrypted, into each room**,
+the next time that room is open — the instance never sees them
+([ADR-010](../../docs/adr/010-encrypted-profiles.md)). Click a member's avatar, or a message's
+author, for their card. A name that looks like another member's is shown with part of the
+id beside it, and the card always shows the full id: a name is a label, the id and the safety
+number are who someone is.
 
 ## Safety numbers
 

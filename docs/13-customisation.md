@@ -1,6 +1,8 @@
 # Customisation, and why most of Nitro is free here
 
-**Status:** Design. Nothing here is built.
+**Status:** Design. **Profiles are built** (§1a, [ADR-010](adr/010-encrypted-profiles.md)),
+and §4's themes and §5's protection are built in the desktop client
+(`clients/desktop/ui/settings.js`); custom emoji, plugins and the rest are not.
 
 The question this answers: can Cairn match Discord's customisation, and give away what Nitro
 charges for? Mostly yes — and the reason is not generosity. **Most of Nitro is artificial
@@ -30,6 +32,28 @@ These cost an operator nothing meaningful and should never be gated:
 **None of this needs a subscription tier, and there should not be one.** `00-vision.md` §4
 already forbids ads and message-content-derived monetization; charging to raise a limit the
 operator is not actually paying for would be the same instinct wearing a different hat.
+
+## 1a. Profiles, built so the instance never sees them
+
+"A row keyed by (account, community)" above is the Discord shape, and it would put every
+name, bio and face on the instance. What is built instead ([ADR-010](adr/010-encrypted-profiles.md)):
+
+- Display name, pronouns, about me (190 characters, 8 lines), avatar, banner, a two-colour
+  banner gradient, a custom status (emoji, text, optional expiry) and a **per-room nickname**.
+- The profile is a **record inside the encrypted message stream**, sent into each room; the
+  images are **encrypted attachments** in that room's blob store, keys inside the record.
+  The instance relays ciphertext and stores ciphertext.
+- It is attributed to the envelope's sender — the record names nobody — and the recipient
+  checks that sender against the group's roster. Building this found that no client did,
+  and that a malicious instance could relabel anyone's messages; see the ADR.
+- Names are sanitised on both ends and **lookalike names are flagged, not trusted**: two
+  members whose names collide are both shown with part of their id. Safety numbers, the
+  verified mark and membership notices show ids, never names. A name is a label.
+- A nickname reaches only its own room. A profile change reaches a room the next time this
+  device has it open.
+
+Discord's per-server *avatar* and animated decorations are not built; a GIF avatar is
+carried as-is, so it animates.
 
 ## 2. Where "free" means someone else's bill
 
@@ -135,6 +159,20 @@ control.** Not "themes are discouraged from restyling them" — structurally unr
 same way the tier has no setter. A customisation system that can repaint the security
 indicators has made those indicators worthless, and per non-negotiable #3 an indicator that
 can lie is worse than no indicator.
+
+**As built (desktop client).** Three layers, and the limit of the third stated plainly:
+
+1. Themes are data — hex colour tokens and enumerated choices, validated key by key on
+   import. A theme cannot carry a selector, and the indicators take no colour from tokens.
+2. The indicators' rules live in the first-declared CSS cascade layer with every
+   declaration `!important`; for important declarations the earliest layer beats every
+   later layer and all unlayered CSS, so no theme or user CSS can restyle the badge element.
+   User CSS that declares or joins a layer is refused, checked by the browser's own parser.
+3. User CSS can still act on an ancestor or paint over a badge. A tripwire measures each
+   indicator (visibility, size, ancestor opacity and filters, the colours the layer paints,
+   and a hit-test at its centre) and switches user CSS off when one fails. That is a check of
+   what the page can measure, not structural: an overlay with `pointer-events: none` is
+   invisible to hit-testing. Regression tests: `clients/desktop/tests/settings.browser.test.js`.
 
 ## 6. What this is worth
 

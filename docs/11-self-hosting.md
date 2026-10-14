@@ -75,6 +75,64 @@ What this does not do: bound someone with many addresses. A botnet, or anyone ho
 large IPv6 allocation, gets many budgets. That is why invite-only is the default — against a
 distributed guesser, a long random token is the defence, and the limit is not.
 
+### GIF search (optional, off by default)
+
+A fresh instance has **no GIF search**, and the picker says so. Cairn ships no API key: a
+shared key would be rate-limited into uselessness by the first few instances. To turn it on,
+get a key from one or both providers and set it on the `cairn` service:
+
+```bash
+CAIRN_KLIPY_API_KEY=...   # https://partner.klipy.com — but read the terms note below first
+CAIRN_GIPHY_API_KEY=...   # https://developers.giphy.com
+```
+
+Either, both or neither. With both, members get a tab for each. A key is letters, digits,
+`-` and `_`; anything else stops the instance at startup rather than producing broken
+requests. Removing a key and restarting turns that provider off.
+
+**How it works, and what it costs you.** Members' clients search through *your* instance
+([`14-gifs.md`](14-gifs.md)): the instance opens a tunnel to the provider's fixed hosts on
+port 443 and relays bytes, and the client runs its own TLS to the provider inside it. You see
+that a member searched, which provider host, when, and how many bytes — never the words. The
+provider sees the words and your instance's address — never the member's. A sent GIF is
+fetched the same way and then travels as an ordinary encrypted attachment, so recipients
+contact no provider at all. Every search and preview crosses your connection, bounded per
+account at 600 tunnels and 200 MiB an hour; each sent GIF also counts against the upload
+quota like a photo.
+
+**Two things to understand before enabling it:**
+
+- **The key is shared with every member.** The client builds the provider request inside
+  its own TLS session, so it must hold the key — Signal ships its GIPHY key in its app for the
+  same reason. Any account on your instance can read it and use it elsewhere, spending your
+  quota or getting it revoked. Strangers cannot: the endpoint that hands it out requires a
+  signed-in account.
+- **A small instance is a small crowd.** The provider cannot see who searched, but on an
+  instance with three active people it can guess. The relay stops a profile being built
+  against a member's own address; it does not make them anonymous to the provider.
+
+**KLIPY's terms, read October 2026.** KLIPY's standard
+[integration requirements](https://docs.klipy.com/integration-requirements) say API requests
+and media must come from the end-user's device *without* routing through partner proxies,
+that media must not be re-hosted, and that results must not be filtered. Cairn's design does
+all three on purpose — the relay is what keeps a member's address from KLIPY, re-hosting is
+what keeps recipients from contacting it, and Cairn removes the adverts KLIPY inserts
+(non-negotiable #4). Each of those requirements carries an exception for "prior written
+approval" from developers@klipy.com. **Get that approval before setting
+`CAIRN_KLIPY_API_KEY`**; without it, enabling KLIPY on your instance likely breaches its terms.
+KLIPY also requires the search box to read "Search KLIPY", which the client does. GIPHY
+requires "Powered by GIPHY", which the client shows; read GIPHY's own API terms for your key's
+tier — beta keys are limited to about 100 requests an hour.
+
+Behind Caddy nothing extra should be needed: the tunnel is an HTTP/1.1 `Upgrade` on an ordinary
+path, which Caddy's `reverse_proxy` passes through for any protocol, as it does WebSockets
+(the relay is tested over real sockets; it has not yet been run behind a live Caddy). If your firewall
+restricts outbound traffic, the instance needs `api.klipy.com`, `static.klipy.com`,
+`static1.klipy.com`, `static2.klipy.com` and/or `api.giphy.com`, `i.giphy.com`,
+`media.giphy.com`, `media0`–`media4.giphy.com`, all on 443. That list is fixed in the source
+(`crates/cairn-server/src/gif_relay.rs`) and is not configurable, because a configurable list
+is how a relay ends up reaching `localhost`.
+
 ## 3. Why TLS is not optional here
 
 The server terminates no TLS of its own, and `docker-compose.yml` deliberately gives it no

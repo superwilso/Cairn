@@ -145,6 +145,12 @@ mod http {
         pub fn is_tls(&self) -> bool {
             self.base.starts_with("https://")
         }
+
+        /// The origin this transport talks to, without a trailing slash. The GIF relay
+        /// opens its tunnels to the same place on a socket of its own.
+        pub fn base(&self) -> &str {
+            &self.base
+        }
     }
 
     impl Transport for HttpTransport {

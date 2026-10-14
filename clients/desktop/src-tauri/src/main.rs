@@ -20,8 +20,10 @@
 use std::sync::Mutex;
 
 use cairn_client_core::call::{self, CallSignal, IceServer};
+use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
-    Event, MemberView, MessageView, ReactionView, RoomSummary, Session,
+    Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
+    ProfileView, ReactionView, RoomSummary, Session,
 };
 use cairn_client_core::verify::SafetyView;
 use tauri::State;
@@ -114,23 +116,72 @@ fn open_room_tier(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.open_room_tier())
 }
 
-/// Returns the message as sent, so the sender sees it at once — polling never delivers a
-/// device's own messages back to it.
+/// Send a message, with a link card if it has a link and previews are on.
+///
+/// **Async, and the fetch runs with the session unlocked.** A synchronous command runs on
+/// the main thread, so a slow site would freeze the window for as long as it took; and
+/// holding the session lock across the fetch would stall polling the same way. So: decide
+/// under the lock, fetch with it released, and send under the lock again — `finish_send`
+/// refuses if the user switched rooms in between.
+///
+/// Returns the message as the timeline should show it, card included, because MLS never
+/// decrypts a device's own message back to it.
 #[tauri::command]
-fn send(state: State<'_, AppState>, text: String) -> CmdResult<MessageView> {
-    with(&state, |s| s.send(&text))
+async fn send(app: tauri::AppHandle, text: String) -> CmdResult<MessageView> {
+    off_main(move || send_with_preview(&app, &text, None)).await
 }
 
 /// Reply to a message on screen. The quote recipients see is resolved from their own
-/// transcripts; this sends only which message it answers.
+/// transcripts; this sends only which message it answers. A reply can carry a link card
+/// like any other message.
 #[tauri::command]
-fn reply(
-    state: State<'_, AppState>,
+async fn reply(
+    app: tauri::AppHandle,
     text: String,
     sender: String,
     id: String,
 ) -> CmdResult<MessageView> {
-    with(&state, |s| s.reply(&text, &sender, &id))
+    off_main(move || send_with_preview(&app, &text, Some((&sender, &id)))).await
+}
+
+fn send_with_preview(
+    app: &tauri::AppHandle,
+    text: &str,
+    reply: Option<(&str, &str)>,
+) -> CmdResult<MessageView> {
+    let mut pending = with_app(app, |s| s.begin_send(text, reply))?;
+    // The only network fetch a link card ever causes, and it is the sender's: the session
+    // lock is not held here.
+    pending.unfurl();
+    with_app(app, |s| s.finish_send(pending))
+}
+
+#[tauri::command]
+fn link_previews(state: State<'_, AppState>) -> CmdResult<LinkPreviewSettings> {
+    with(&state, |s| Ok(s.link_previews()))
+}
+
+#[tauri::command]
+fn set_link_previews(state: State<'_, AppState>, settings: LinkPreviewSettings) -> CmdResult<()> {
+    with(&state, |s| s.set_link_previews(settings))
+}
+
+/// The text the Instagram proxy setting must show before it can be switched on.
+#[tauri::command]
+fn instagram_proxy_disclosure() -> String {
+    format!(
+        "{} The proxy used is {}.",
+        cairn_client_core::embed::instagram::disclosure(),
+        cairn_client_core::embed::instagram::SUGGESTED_PROXY
+    )
+}
+
+/// Open a card's link in the system browser. The check is `embed::openable`'s, not this
+/// shell's: only a plain http(s) URL ever reaches the platform opener.
+#[tauri::command]
+fn open_link(url: String) -> CmdResult<()> {
+    let url = cairn_client_core::embed::openable(&url).ok_or("not a link that can be opened")?;
+    open::that_detached(url).map_err(|e| e.to_string())
 }
 
 /// React to a message, or withdraw this user's reaction with `emoji: null`. Returns every
@@ -361,6 +412,135 @@ fn set_room_timer(state: State<'_, AppState>, ttl_ms: Option<i64>) -> CmdResult<
     with(&state, |s| s.set_room_timer(ttl_ms))
 }
 
+// ---- GIFs ------------------------------------------------------------------
+//
+// Search, previews and the fetch for sending all run through the instance's relay, off the
+// main thread and without the session lock — `Gifs` is shared out of the session for that.
+// The UI only ever holds opaque result ids; see `cairn_client_core::gifs`.
+
+fn gifs_of(app: &tauri::AppHandle) -> CmdResult<std::sync::Arc<cairn_client_core::gifs::Gifs>> {
+    with_app(app, |s| s.gifs())
+}
+
+/// The providers this instance relays, with each one's required placeholder and
+/// attribution. Empty when the operator configured none.
+#[tauri::command]
+async fn gif_providers(app: tauri::AppHandle) -> CmdResult<Vec<GifProviderView>> {
+    off_main(move || gifs_of(&app)?.providers().map_err(|e| e.to_string())).await
+}
+
+/// Search one provider, or list what is trending when `query` is blank.
+#[tauri::command]
+async fn gif_search(
+    app: tauri::AppHandle,
+    provider: String,
+    query: String,
+) -> CmdResult<Vec<GifView>> {
+    off_main(move || gifs_of(&app)?.search(&provider, &query).map_err(|e| e.to_string())).await
+}
+
+/// A result's preview, as raw bytes, by the id a search returned.
+#[tauri::command]
+async fn gif_preview(app: tauri::AppHandle, id: String) -> CmdResult<tauri::ipc::Response> {
+    off_main(move || {
+        let media = gifs_of(&app)?.preview(&id).map_err(|e| e.to_string())?;
+        Ok(tauri::ipc::Response::new(media.bytes))
+    })
+    .await
+}
+
+/// Send a result to the open room as an encrypted attachment. The same three steps as
+/// `send_file`, with the fetch through the relay in front.
+#[tauri::command]
+async fn send_gif(app: tauri::AppHandle, id: String) -> CmdResult<MessageView> {
+    off_main(move || {
+        let file = gifs_of(&app)?.fetch_for_sending(&id).map_err(|e| e.to_string())?;
+        let pending = with_app(&app, |s| s.prepare_upload(&file.name, file.mime, &file.bytes))?;
+        drop(file);
+        let uploaded = pending.upload().map_err(|e| e.to_string())?;
+        with_app(&app, |s| s.send_uploaded(uploaded))
+    })
+    .await
+}
+
+// ---- profiles --------------------------------------------------------------
+//
+// The record, its rules, which room hears what and when, and every label the UI draws are
+// `cairn_client_core::session::profiles`. The UI sends edits and bytes, and gets views.
+
+#[tauri::command]
+fn my_profile(state: State<'_, AppState>) -> CmdResult<ProfileView> {
+    with(&state, |s| Ok(s.my_profile()))
+}
+
+#[tauri::command]
+fn profiles(state: State<'_, AppState>) -> CmdResult<Vec<ProfileView>> {
+    with(&state, |s| s.profiles())
+}
+
+#[tauri::command]
+fn set_profile(state: State<'_, AppState>, edit: ProfileEdit) -> CmdResult<ProfileView> {
+    with(&state, |s| s.set_profile(edit))
+}
+
+#[tauri::command]
+fn set_nickname(state: State<'_, AppState>, nickname: Option<String>) -> CmdResult<ProfileView> {
+    with(&state, |s| s.set_nickname(nickname.as_deref()))
+}
+
+#[tauri::command]
+fn profile_limits() -> ProfileLimits {
+    cairn_client_core::session::profile_limits()
+}
+
+#[derive(serde::Deserialize)]
+struct ImageMeta {
+    slot: ImageSlot,
+    mime: String,
+}
+
+/// Set an avatar or banner. Raw bytes as the IPC body, the slot and type in a header — the
+/// same shape as `send_file`, for the same reason.
+#[tauri::command]
+async fn set_profile_image(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<ProfileView> {
+    let meta: ImageMeta = request
+        .headers()
+        .get("x-cairn-image")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or("the image's slot and type are missing")?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(value) => <Vec<u8> as serde::Deserialize>::deserialize(value)
+            .map_err(|_| "expected the image's bytes")?,
+    };
+    off_main(move || with_app(&app, |s| s.set_profile_image(meta.slot, Some((&bytes, &meta.mime)))))
+        .await
+}
+
+#[tauri::command]
+fn clear_profile_image(state: State<'_, AppState>, slot: ImageSlot) -> CmdResult<ProfileView> {
+    with(&state, |s| s.set_profile_image(slot, None))
+}
+
+/// One member's avatar or banner in the open room, decrypted, as raw bytes.
+#[tauri::command]
+async fn fetch_profile_image(
+    app: tauri::AppHandle,
+    user: String,
+    slot: ImageSlot,
+) -> CmdResult<tauri::ipc::Response> {
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_profile_image(&user, slot))?;
+        let bytes = pending.fetch().map_err(|e| e.to_string())?;
+        Ok(tauri::ipc::Response::new(bytes))
+    })
+    .await
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -393,6 +573,22 @@ fn main() {
             set_room_timer,
             reply,
             react,
+            gif_providers,
+            gif_search,
+            gif_preview,
+            send_gif,
+            my_profile,
+            profiles,
+            set_profile,
+            set_nickname,
+            profile_limits,
+            set_profile_image,
+            clear_profile_image,
+            fetch_profile_image,
+            link_previews,
+            set_link_previews,
+            instagram_proxy_disclosure,
+            open_link,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

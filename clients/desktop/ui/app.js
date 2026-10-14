@@ -49,6 +49,7 @@ $("go").onclick = async () => {
         $("whoami").textContent = short(me.user);
         $("whoami").title = me.user;
         $("avatar").textContent = initials(me.user);
+        await CairnProfile.signedIn(me.user);
 
         // The transport badge is not cosmetic. MLS protects message bodies either way, but
         // over http:// every id, every membership change and every request is in the clear
@@ -68,6 +69,7 @@ $("go").onclick = async () => {
         await refreshRooms();
         await describeRelay();
         await listDevices();
+        await CairnLinkCards.loadSettings();
     } catch (e) {
         fail($("signin-error"), e);
     }
@@ -166,6 +168,7 @@ async function selectRoom(room) {
     CairnAttach.reset();
     try {
         const history = await invoke("open_room", { room });
+        await CairnProfile.load();
         for (const m of history) addMessage(m);
     } catch (e) { fail($("error"), e); }
 
@@ -206,6 +209,7 @@ async function refreshMembers() {
         who.textContent = short(m.user) + (m.role === "owner" ? " · owner" : "");
 
         li.append(av, who);
+        CairnProfile.member(li, av, who, m);
         li.title = m.user;
 
         if (!m.in_group) {
@@ -387,16 +391,22 @@ document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && !$("safety").hidden) closeSafety();
 });
 
+// One send at a time: a message with a link waits for its preview, and a second Enter
+// meanwhile must neither send it twice nor let a later message overtake it.
+let sending = false;
 $("composer").onsubmit = async (ev) => {
     ev.preventDefault();
     const text = $("text").value;
-    if (!text.trim()) return;
+    if (!text.trim() || sending) return;
+    sending = true;
+    const done = CairnLinkCards.sending(text);
     try {
         // Rust hands back the message as sent: polling never returns a device's own.
         addMessage(await CairnMessages.send(text));
         $("text").value = "";
         fail($("error"), null);
     } catch (e) { fail($("error"), e); }
+    finally { sending = false; done(); }
 };
 
 // ---- attachments -----------------------------------------------------------
@@ -458,6 +468,29 @@ $("text").addEventListener("paste", (ev) => {
     if (!files.length) return;
     ev.preventDefault();
     sendFiles(files);
+});
+
+// ---- voice notes and GIFs --------------------------------------------------
+//
+// Both end as an attachment message Rust hands back; voice.js and gifs.js own the rest.
+
+CairnVoice.bind({
+    button: $("voice"),
+    composer: $("composer"),
+    canRecord: () => (openRoom ? true : (fail($("error"), "Open a room before recording."), false)),
+    send: (bytes, name, mime) => CairnAttach.sendBytes(bytes, name, mime),
+    onSent: (view) => { fail($("error"), null); addMessage(view); },
+    onError: (e) => fail($("error"), e),
+    onNotice: (text) => addNotice(text),
+});
+
+CairnGifs.bind({
+    invoke,
+    button: $("gif"),
+    anchor: $("composer"),
+    canSend: () => !!openRoom,
+    onSent: (view) => { fail($("error"), null); addMessage(view); },
+    onError: (e) => fail($("error"), e),
 });
 
 // ---- calls -----------------------------------------------------------------
@@ -778,6 +811,7 @@ async function tick() {
     for (const ev of events) {
         if (CairnMessages.handle(ev)) continue;
         if (CairnTimer.handle(ev)) continue;
+        if (CairnProfile.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -808,9 +842,10 @@ async function tick() {
 
 // Drawing a message, and replying and reacting to it, are messages.js's.
 function addMessage(m) {
-    const li = CairnMessages.render(m);
+    // Avatar, timestamp and grouping are appearance, and settings.js's (CairnLook).
+    const li = CairnLook.decorate(CairnMessages.render(m), m);
     $("timeline").append(li);
-    li.scrollIntoView({ block: "end" });
+    CairnMessages.arrived(li, m.sender === myUser);
 }
 
 function addNotice(text) {
@@ -818,11 +853,19 @@ function addNotice(text) {
     li.className = "notice";
     li.textContent = text;
     $("timeline").append(li);
-    li.scrollIntoView({ block: "end" });
+    CairnMessages.arrived(li, false);
     return li;
 }
 
-CairnMessages.init({ me: () => myUser, short, onError: (e) => fail($("error"), e) });
+CairnMessages.init({
+    me: () => myUser, short, onError: (e) => fail($("error"), e),
+    author: (li, who, m) => CairnProfile.author(li, who, m),
+});
+CairnProfile.init({
+    invoke, openSafety: (user) => openSafety(user), roomOpen: () => !!openRoom,
+    onError: (e) => fail($("error"), e),
+});
+CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

@@ -48,10 +48,17 @@ use crate::transport::HttpTransport;
 use crate::verify::{self, SafetyView, VerifyError};
 
 mod attachments;
+mod gifs;
 pub use attachments::{
     kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
     PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
 };
+mod profiles;
+pub use crate::profile::{ImageSlot, ImageView, ProfileView, StatusView};
+pub use profiles::{profile_limits, PendingProfileImage, ProfileEdit, ProfileLimits};
+
+use crate::profile::{Label, ProfileError, ProfileStore, ProfileStoreError};
+use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -73,6 +80,8 @@ pub enum SessionError {
     Shape(#[from] cairn_proto::ShapeError),
     #[error(transparent)]
     Verify(#[from] VerifyError),
+    #[error(transparent)]
+    Gif(#[from] crate::gifs::GifError),
     #[error("not a valid id: {0}")]
     BadId(String),
     #[error("no room is open")]
@@ -103,6 +112,16 @@ pub enum SessionError {
     UnknownMessage,
     #[error("a reaction is a single emoji")]
     BadReaction,
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
+    #[error(transparent)]
+    ProfileStore(#[from] ProfileStoreError),
+    #[error("that profile image is not one this device holds for the open room")]
+    UnknownProfileImage,
+    #[error("you switched rooms before this message was sent, so it was not sent")]
+    RoomChanged,
+    #[error("link preview settings could not be saved: {0}")]
+    Preferences(String),
 }
 
 /// A room as a frontend needs to show it.
@@ -137,6 +156,10 @@ pub struct MemberView {
     /// At least one of this account's devices changed key after being verified. Sticky until
     /// the new number is compared — see [`ContactStore::observe`].
     pub key_changed: bool,
+    /// Their profile in this room, labelled against everyone else's. **Presentation only**:
+    /// `user` above is who they are, and `verified` is about their keys, not their name.
+    #[serde(default)]
+    pub profile: Option<ProfileView>,
 }
 
 /// The role reported for a group member the instance's member list omits.
@@ -150,6 +173,14 @@ pub const UNLISTED: &str = "unlisted";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageView {
     pub sender: String,
+    /// What to call the sender in this room — their nickname or display name, or their
+    /// short id — as labelled when this view was made. `sender` is who they are.
+    #[serde(default)]
+    pub sender_label: String,
+    /// Another member's name or id looks like `sender_label`, so a frontend must show the
+    /// sender's id beside it.
+    #[serde(default)]
+    pub sender_ambiguous: bool,
     pub body: String,
     pub sent_at_ms: i64,
     /// True when replayed from the local transcript rather than just received.
@@ -165,9 +196,18 @@ pub struct MessageView {
     pub reply_to: Option<QuoteView>,
     /// Reactions already under it.
     pub reactions: Vec<ReactionView>,
+    /// The sender's link card, already checked against this message and reduced to what
+    /// is safe to show. `None` when there was no card or it did not pass
+    /// ([`crate::embed::Card::view_for`]).
+    #[serde(default)]
+    pub card: Option<Box<crate::embed::CardView>>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
+///
+/// The size lint is allowed: events live for one poll on their way to being serialised, and
+/// most of them are messages, so boxing the large variant would allocate for the common case.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -208,6 +248,12 @@ pub enum Event {
         from: String,
         signal: CallSignal,
     },
+    /// Somebody's profile arrived, or the room's membership changed. Every profile in the
+    /// room, not the one that changed: a new name can make two *other* members ambiguous, so
+    /// a frontend redraws every label rather than keeping its own copy of that rule.
+    Profiles {
+        profiles: Vec<ProfileView>,
+    },
 }
 
 struct OpenRoom {
@@ -221,6 +267,11 @@ struct OpenRoom {
     /// Replies and reactions, folded over the transcript. Rebuilt whenever the timer sweeps
     /// it, so nothing here outlives the message it describes.
     thread: Thread,
+    /// The accounts the instance last listed for this room, so a name can be checked
+    /// against members who are waiting as well as those in the group.
+    listed: Vec<UserId>,
+    /// What to call everyone, and who needs their id shown. See [`crate::profile::labels`].
+    labels: HashMap<UserId, Label>,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -239,6 +290,7 @@ pub struct Session {
     index: ConversationIndex,
     contacts: ContactStore,
     history: History,
+    profiles: ProfileStore,
     open: Option<OpenRoom>,
     dir: PathBuf,
     tls: bool,
@@ -260,6 +312,8 @@ pub struct Session {
     attachments: attachments::Known,
     /// How often polling re-reads the open room's timer. [`TIMER_RECHECK_MS`] outside tests.
     timer_recheck_ms: i64,
+    /// GIF search through the instance's relay, made on first use. See `crate::gifs`.
+    gifs: Option<Arc<crate::gifs::Gifs>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -320,6 +374,7 @@ impl Session {
             index: ConversationIndex::open(&dir)?,
             contacts: ContactStore::open(&dir)?,
             history: History::open(&dir)?,
+            profiles: ProfileStore::open(&dir)?,
             open: None,
             dir: dir.clone(),
             tls,
@@ -328,6 +383,7 @@ impl Session {
             ringing: None,
             attachments: attachments::Known::new(),
             timer_recheck_ms: TIMER_RECHECK_MS,
+            gifs: None,
         };
         if !claimed {
             session.claim(invite)?;
@@ -409,14 +465,18 @@ impl Session {
         self.index.record(created.room, &created.seal, convo.group_id())?;
         let cursor = self.index.cursor(&created.room);
         // A room is created without a timer; nobody has had the chance to set one.
-        self.open = Some(OpenRoom {
+        let mut open = OpenRoom {
             convo,
             seal: created.seal,
             cursor,
             ttl: None,
             ttl_checked_ms: now_ms(),
             thread: Thread::default(),
-        });
+            listed: Vec::new(),
+            labels: HashMap::new(),
+        };
+        self.relabel(&mut open);
+        self.open = Some(open);
         // Found by a probe: without this, creating a room left the previous room's
         // attachments fetchable from the new one.
         self.attachments.clear();
@@ -493,12 +553,22 @@ impl Session {
         // A room's attachments are fetchable only while it is open.
         attachments::remember(&mut self.attachments, &entries);
         let thread = Thread::build(&entries);
+        let labels = profiles::labels_for(&self.profiles, self.client.user(), &convo, &[]);
         let views = entries
             .iter()
             .filter(|e| e.reaction.is_none())
-            .map(|e| view(e, &thread, true))
+            .map(|e| view(e, &thread, &labels, true))
             .collect();
-        self.open = Some(OpenRoom { convo, seal, cursor, ttl, ttl_checked_ms: now_ms(), thread });
+        self.open = Some(OpenRoom {
+            convo,
+            seal,
+            cursor,
+            ttl,
+            ttl_checked_ms: now_ms(),
+            thread,
+            listed: Vec::new(),
+            labels,
+        });
         Ok(views)
     }
 
@@ -517,7 +587,7 @@ impl Session {
     /// back to it, so polling will not deliver this; without the return value the sender's
     /// own words appeared only after reopening the room.
     pub fn send(&mut self, text: &str) -> Result<MessageView, SessionError> {
-        self.send_message(text, None)
+        self.send_message(text, None, None)
     }
 
     /// Reply to a message on this device's screen, named by its sender and id.
@@ -531,23 +601,22 @@ impl Session {
         id: &str,
     ) -> Result<MessageView, SessionError> {
         let target = self.known_target(sender, id)?;
-        self.send_message(text, Some(target))
+        self.send_message(text, Some(target), None)
     }
 
     fn send_message(
         &mut self,
         text: &str,
         reply_to: Option<MessageRef>,
+        card: Option<crate::embed::Card>,
     ) -> Result<MessageView, SessionError> {
         let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
         if open.convo.group_id().is_none() {
             return Err(SessionError::NoGroupYet);
         }
         let at = now_ms();
-        let outbound = match reply_to.clone() {
-            Some(target) => open.convo.send_reply(text.as_bytes(), target, at)?,
-            None => open.convo.send(text.as_bytes(), at)?,
-        };
+        let card = card.map(crate::embed::Card::clamp);
+        let outbound = open.convo.send_text(text.as_bytes(), reply_to.clone(), card.clone(), at)?;
         self.client.send(open.convo.room(), &outbound.envelope)?;
 
         // Recorded locally because MLS will not decrypt our own message back to us — without
@@ -561,10 +630,11 @@ impl Session {
             id: Some(outbound.commitment.to_hex()),
             reply_to,
             reaction: None,
+            card,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
-        Ok(view(&entry, &open.thread, false))
+        Ok(view(&entry, &open.thread, &open.labels, false))
     }
 
     /// React to a message on this device's screen, or withdraw this user's reaction to it
@@ -598,6 +668,7 @@ impl Session {
             id: None,
             reply_to: None,
             reaction: Some(reaction),
+            card: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
@@ -631,6 +702,7 @@ impl Session {
             }
         };
         let mut events = Vec::new();
+        let mut profiles_changed = false;
 
         for message in fetched {
             open.cursor = open.cursor.max(message.server_seq);
@@ -657,6 +729,11 @@ impl Session {
                             joined: vec![self.client.user().to_string()],
                             left: Vec::new(),
                         });
+                        // Nothing sent before the welcome is readable here, so whatever was
+                        // last sent to this room — by this device, in an earlier membership —
+                        // is unknown to the group as it now is.
+                        let _ = self.profiles.resend(&room);
+                        profiles_changed = true;
                     }
                 }
                 continue;
@@ -679,6 +756,20 @@ impl Session {
                         }
                         continue;
                     }
+                    // A profile is state, not a message: it updates who is called what and
+                    // never enters the transcript. Filed under the envelope's sender, which
+                    // `receive` has already checked against the roster — the record itself
+                    // has no field naming whose profile it is.
+                    if let Some(profile) = received.profile {
+                        if message.envelope.sender != self.client.user() {
+                            let _ = self.profiles.receive(room, message.envelope.sender, *profile);
+                            // At once, so a message later in this same batch is labelled
+                            // with the name its sender had when they sent it.
+                            self.relabel(&mut open);
+                            profiles_changed = true;
+                        }
+                        continue;
+                    }
                     // Attributed to the envelope's sender, for a reaction as for a message:
                     // the payload has no field naming who reacted, so none can be forged.
                     let attachment = received.attachment.map(|a| *a);
@@ -691,6 +782,7 @@ impl Session {
                         id: received.franking.as_ref().map(|f| f.commitment.to_hex()),
                         reply_to: received.reply_to.map(|r| *r),
                         reaction: received.reaction.map(|r| *r),
+                        card: received.card.map(|c| *c),
                     };
                     let _ = self.history.append(room, &entry);
                     open.thread.record(&entry);
@@ -705,10 +797,21 @@ impl Session {
                             reactions: open.thread.reactions(target),
                         });
                     } else {
-                        events.push(Event::Message(view(&entry, &open.thread, false)));
+                        events.push(Event::Message(view(
+                            &entry,
+                            &open.thread,
+                            &open.labels,
+                            false,
+                        )));
                     }
                 }
                 Ok(TimelineEvent::Membership { added, removed, .. }) => {
+                    // A new member cannot read anything sent before they joined, this
+                    // account's profile included, so it goes again once this poll is done.
+                    if !added.is_empty() {
+                        let _ = self.profiles.resend(&room);
+                    }
+                    profiles_changed = true;
                     events.push(Event::Membership {
                         joined: added.iter().map(describe_member).collect(),
                         left: removed.iter().map(describe_member).collect(),
@@ -716,8 +819,10 @@ impl Session {
                 }
                 Ok(TimelineEvent::RemovedFromRoom { .. }) => {
                     // Being ejected means the local transcript goes too: the room is no
-                    // longer readable and keeping a plaintext copy is not a courtesy.
+                    // longer readable and keeping a plaintext copy is not a courtesy. The
+                    // same for what its members called themselves.
                     let _ = self.history.forget(room);
+                    let _ = self.profiles.forget(&room);
                     events.push(Event::Removed);
                 }
                 Ok(TimelineEvent::Nothing) => {}
@@ -740,6 +845,16 @@ impl Session {
         if let Some(live) = self.recheck_timer(&mut open, &mut events) {
             // An expired message takes the only in-memory key to its attachment with it.
             attachments::remember(&mut self.attachments, &live);
+        }
+        // After everything fetched has been processed, so the group is at its current epoch
+        // and a member who just joined can read it. A failure is retried on the next poll.
+        let _ = self.flush_profile(&mut open);
+        if profiles_changed {
+            self.relabel(&mut open);
+            let mut users: Vec<&UserId> = open.labels.keys().collect();
+            users.sort();
+            let profiles = users.into_iter().map(|u| self.view_of(&open, u)).collect();
+            events.push(Event::Profiles { profiles });
         }
         let _ = self.index.advance(room, open.cursor);
         self.open = Some(open);
@@ -989,7 +1104,21 @@ impl Session {
             verify::observe_roster(&open.convo, &mut self.contacts)?;
         }
         let listed = self.client.room_members(room)?;
-        Ok(member_views(listed, &open.convo.members(), &self.contacts))
+        let mut views = member_views(listed.clone(), &open.convo.members(), &self.contacts);
+
+        // Remember who the instance listed, so a name is labelled against waiting members
+        // too, then attach each member's profile.
+        if let Some(mut open) = self.open.take() {
+            open.listed = listed.iter().map(|(u, _)| *u).collect();
+            self.relabel(&mut open);
+            for v in &mut views {
+                if let Ok(user) = v.user.parse::<UserId>() {
+                    v.profile = Some(self.view_of(&open, &user));
+                }
+            }
+            self.open = Some(open);
+        }
+        Ok(views)
     }
 
     /// The safety number for each of `user`'s devices in the open room's group.
@@ -1071,7 +1200,11 @@ impl Session {
                 self.client.send(open.convo.room(), &wrapped)?;
             }
         }
-        self.index.record(open.convo.room(), &open.seal, open.convo.group_id())?;
+        let room = open.convo.room();
+        self.index.record(room, &open.seal, open.convo.group_id())?;
+        // This device committed the add, so no poll will report it here — and the new member
+        // still needs this account's profile, sent after the welcome.
+        let _ = self.profiles.resend(&room);
         Ok(())
     }
 
@@ -1094,6 +1227,157 @@ impl Session {
         self.index.record(room, &seal, None)?;
         Ok(room.to_string())
     }
+}
+
+/// Link-preview settings for one profile, persisted beside its state.
+///
+/// Its own file rather than a shared preferences file, so it can never clobber — or be
+/// clobbered by — another setting written by code that does not know about this one.
+///
+/// **Everything off by default.** Building a preview means this device contacting the
+/// linked site, which sees the sender's IP address; `docs/05-embeds.md` §1 requires that to
+/// be opted into per platform. A file written by an earlier version — one global `enabled`
+/// switch — loads as all off: nobody chose these per-platform switches yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LinkPreviewSettings {
+    /// One switch per platform, and one for every other website.
+    #[serde(flatten)]
+    pub sites: crate::embed::Sites,
+    /// Whether an Instagram link the site will not describe may be sent to a third-party
+    /// proxy ([`crate::embed::instagram::SUGGESTED_PROXY`]). **Off by default** — the proxy
+    /// sees the link, and `docs/05-embeds.md` forbids taking a less private path silently.
+    /// Has no effect unless Instagram previews are on.
+    #[serde(default)]
+    pub instagram_proxy: bool,
+}
+
+/// A message on its way out, holding everything needed to build its preview **without the
+/// session**.
+///
+/// Sending is split in three — [`Session::begin_send`], [`PendingSend::unfurl`],
+/// [`Session::finish_send`] — so the network fetch happens with no lock held. Fetching while
+/// holding the session would stall polling (and, in the desktop shell, the window) for as
+/// long as a slow site takes; that is what the split is for.
+#[derive(Debug)]
+pub struct PendingSend {
+    room: RoomId,
+    text: String,
+    reply_to: Option<MessageRef>,
+    preview: Option<Plan>,
+    card: Option<crate::embed::Card>,
+}
+
+/// What one preview may do: which URL, which sites it may contact on the way (every hop is
+/// checked, not only the link), and whether a third-party proxy may be asked.
+#[derive(Debug)]
+struct Plan {
+    url: String,
+    sites: crate::embed::Sites,
+    proxy: crate::embed::instagram::ProxyPolicy,
+}
+
+impl PendingSend {
+    /// Fetch the preview, if this message has a link and previews are on.
+    ///
+    /// Never fails: no card is a perfectly good outcome, and a preview is never worth
+    /// holding back a message.
+    pub fn unfurl(&mut self) {
+        if let Some(plan) = &self.preview {
+            self.card = crate::embed::preview(&plan.url, plan.sites, &plan.proxy);
+        }
+    }
+
+    /// The URL a preview will be fetched for, if any. For a UI to say what is happening.
+    pub fn preview_url(&self) -> Option<&str> {
+        self.preview.as_ref().map(|plan| plan.url.as_str())
+    }
+
+    /// Attach a card built some other way — by a test, or a platform-supplied fetcher.
+    ///
+    /// Grants nothing a modified client does not already have: a card is the sender's claim
+    /// however it was made, it is clamped on the way out and again on receipt, and a
+    /// recipient drops one whose URL is not a link in the message ([`crate::embed::Card::view_for`]).
+    pub fn with_card(mut self, card: crate::embed::Card) -> Self {
+        self.card = Some(card);
+        self
+    }
+}
+
+impl Session {
+    fn link_preview_path(&self) -> PathBuf {
+        self.dir.join("link-previews.json")
+    }
+
+    /// This profile's link-preview settings. A missing or unreadable file means defaults.
+    pub fn link_previews(&self) -> LinkPreviewSettings {
+        std::fs::read(self.link_preview_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_link_previews(&self, settings: LinkPreviewSettings) -> Result<(), SessionError> {
+        let bytes = serde_json::to_vec_pretty(&settings)
+            .map_err(|e| SessionError::Preferences(e.to_string()))?;
+        std::fs::write(self.link_preview_path(), bytes)
+            .map_err(|e| SessionError::Preferences(e.to_string()))
+    }
+
+    /// Start sending `text` to the open room, optionally as a reply to `(sender, id)`.
+    /// Cheap: decides *whether* to fetch a preview and captures which room the message is
+    /// for, and fetches nothing.
+    pub fn begin_send(
+        &self,
+        text: &str,
+        reply: Option<(&str, &str)>,
+    ) -> Result<PendingSend, SessionError> {
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let reply_to = match reply {
+            Some((sender, id)) => Some(self.known_target(sender, id)?),
+            None => None,
+        };
+        let preview = preview_plan(self.link_previews(), text);
+        Ok(PendingSend {
+            room: open.convo.room(),
+            text: text.to_string(),
+            reply_to,
+            preview,
+            card: None,
+        })
+    }
+
+    /// Encrypt and send a prepared message, returning it as the timeline should show it.
+    ///
+    /// **Refuses if the open room changed** since [`Session::begin_send`]. The preview fetch
+    /// runs with no lock held and can take seconds; a user who switches rooms meanwhile
+    /// would otherwise have the message delivered to whichever room is open when the fetch
+    /// returns — somebody else's conversation.
+    pub fn finish_send(&mut self, pending: PendingSend) -> Result<MessageView, SessionError> {
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.room() != pending.room {
+            return Err(SessionError::RoomChanged);
+        }
+        self.send_message(&pending.text, pending.reply_to, pending.card)
+    }
+}
+
+/// Which link to fetch for `text`, under which switches — or nothing.
+///
+/// `None` unless the first link's own site is switched on: a link to a platform the user has
+/// not enabled is not fetched, and neither is a proxy asked about it.
+fn preview_plan(settings: LinkPreviewSettings, text: &str) -> Option<Plan> {
+    use crate::embed::instagram::{ProxyPolicy, SUGGESTED_PROXY};
+    let url = crate::embed::first_url(text)?;
+    settings.sites.permits(url).ok()?;
+    let proxy = if settings.instagram_proxy && settings.sites.instagram {
+        ProxyPolicy::with_hosts([SUGGESTED_PROXY])
+    } else {
+        ProxyPolicy::disabled()
+    };
+    Some(Plan { url: url.to_string(), sites: settings.sites, proxy })
 }
 
 fn describe_member(m: &cairn_crypto::mls::GroupMember) -> String {
@@ -1147,6 +1431,7 @@ fn member_views(
                 in_group: found.is_some(),
                 verified: found.is_some_and(|s| s.verified),
                 key_changed: found.is_some_and(|s| s.changed),
+                profile: None,
             }
         })
         .collect();
@@ -1158,6 +1443,7 @@ fn member_views(
             in_group: true,
             verified: seen.verified,
             key_changed: seen.changed,
+            profile: None,
         });
     }
     views
@@ -1191,17 +1477,30 @@ fn human_bytes(n: usize) -> String {
 }
 
 /// A transcript entry as a frontend shows it, with its quote and reactions resolved.
-fn view(entry: &HistoryEntry, thread: &Thread, historic: bool) -> MessageView {
+fn view(
+    entry: &HistoryEntry,
+    thread: &Thread,
+    labels: &HashMap<UserId, Label>,
+    historic: bool,
+) -> MessageView {
     let own = entry.id.as_ref().map(|id| MessageRef { sender: entry.sender, id: id.clone() });
+    let label = labels.get(&entry.sender);
+    let body = String::from_utf8_lossy(&entry.body).to_string();
     MessageView {
         sender: entry.sender.to_string(),
-        body: String::from_utf8_lossy(&entry.body).to_string(),
+        sender_label: label
+            .map_or_else(|| crate::profile::short_id(&entry.sender), |l| l.text.clone()),
+        sender_ambiguous: label.is_some_and(|l| l.ambiguous),
         sent_at_ms: entry.sent_at_ms,
         historic,
         attachment: entry.attachment.as_ref().map(AttachmentView::of),
         id: entry.id.clone(),
         reply_to: entry.reply_to.as_ref().map(|r| thread.quote(r)),
         reactions: own.map(|r| thread.reactions(&r)).unwrap_or_default(),
+        // Rendered from what arrived inside the envelope. Nothing is fetched to draw it —
+        // the recipient-fetches-nothing rule (`docs/05-embeds.md`).
+        card: entry.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),
+        body,
     }
 }
 
@@ -1293,5 +1592,105 @@ mod tests {
         assert!(!views[0].in_group);
         assert!(!views[0].verified);
         assert!(!views[0].key_changed);
+    }
+}
+
+#[cfg(test)]
+mod link_preview_tests {
+    use super::*;
+
+    /// A session that never touches the network: the identity is already claimed, and the
+    /// instance address is one nothing listens on.
+    fn offline(name: &str) -> (Session, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cairn-lp-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = StoredIdentity {
+            user: uuid::Uuid::new_v4(),
+            device: uuid::Uuid::new_v4(),
+            claimed: true,
+        };
+        std::fs::write(dir.join("identity.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
+        let session = Session::open(name, "http://127.0.0.1:9", Some(&dir)).unwrap();
+        (session, dir)
+    }
+
+    #[test]
+    fn every_preview_switch_is_off_until_someone_changes_it() {
+        let (session, dir) = offline("defaults");
+        let settings = session.link_previews();
+        assert_eq!(settings, LinkPreviewSettings::default());
+        assert!(!settings.sites.any(), "no site may be contacted by default");
+        assert!(!settings.instagram_proxy, "a third party must never see links by default");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_settings_file_from_the_single_switch_era_loads_as_all_off() {
+        let (session, dir) = offline("migrate");
+        std::fs::write(dir.join("link-previews.json"), br#"{"enabled":true}"#).unwrap();
+        assert_eq!(session.link_previews(), LinkPreviewSettings::default());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_preview_setting_survives_a_restart() {
+        let (session, dir) = offline("persist");
+        let chosen = LinkPreviewSettings {
+            sites: crate::embed::Sites { youtube: true, web: true, ..Default::default() },
+            instagram_proxy: true,
+        };
+        session.set_link_previews(chosen).unwrap();
+        drop(session);
+        let reopened = Session::open("persist", "http://127.0.0.1:9", Some(&dir)).unwrap();
+        assert_eq!(reopened.link_previews(), chosen);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_message_is_never_delivered_to_a_room_opened_while_its_preview_loaded() {
+        // The race the lock-free fetch creates: begin in room A, switch to room B during
+        // the fetch, finish. The message must not land in B.
+        let (mut session, dir) = offline("race");
+        let a = RoomId::new();
+        let b = RoomId::new();
+        session.open_room(&a.to_string()).unwrap();
+        let pending =
+            PendingSend { room: a, text: "hi".into(), reply_to: None, preview: None, card: None };
+        session.open_room(&b.to_string()).unwrap();
+        assert!(
+            matches!(session.finish_send(pending), Err(SessionError::RoomChanged)),
+            "a message begun in one room must not be sent to another"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn only_a_link_to_a_switched_on_site_is_planned() {
+        use crate::embed::Sites;
+        let reel = "look https://www.instagram.com/reel/abc123/";
+        let video = "watch https://youtu.be/dQw4w9WgXcQ";
+
+        let off = LinkPreviewSettings { sites: Sites::default(), instagram_proxy: true };
+        assert!(preview_plan(off, reel).is_none(), "off means nothing is fetched at all");
+        assert!(preview_plan(off, video).is_none());
+
+        let youtube = LinkPreviewSettings {
+            sites: Sites { youtube: true, ..Sites::default() },
+            instagram_proxy: true,
+        };
+        assert!(preview_plan(youtube, reel).is_none(), "YouTube on does not mean Instagram on");
+        let plan = preview_plan(youtube, video).expect("an enabled platform is previewed");
+        assert_eq!(plan.url, "https://youtu.be/dQw4w9WgXcQ");
+        assert!(!plan.proxy.is_enabled(), "the Instagram proxy needs Instagram on too");
+        assert!(!plan.sites.web, "and the switches travel with the plan, for every hop");
+
+        let instagram = LinkPreviewSettings {
+            sites: Sites { instagram: true, ..Sites::default() },
+            instagram_proxy: false,
+        };
+        assert!(!preview_plan(instagram, reel).unwrap().proxy.is_enabled());
+        let proxied = LinkPreviewSettings { instagram_proxy: true, ..instagram };
+        assert!(preview_plan(proxied, reel).unwrap().proxy.is_enabled());
+        assert!(preview_plan(proxied, "no links here").is_none());
     }
 }

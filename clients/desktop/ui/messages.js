@@ -18,7 +18,7 @@ const CairnMessages = (() => {
     const HEART = QUICK[0];
     const SWIPE_PX = 56;
 
-    let hooks = { me: () => null, short: (s) => s, onError: () => {} };
+    let hooks = { me: () => null, short: (s) => s, onError: () => {}, author: () => {} };
     let replyingTo = null;
 
     const find = (sender, id) =>
@@ -66,8 +66,16 @@ const CairnMessages = (() => {
         }
         const reactions = document.createElement("div");
         reactions.className = "reactions";
-        content.append(body, reactions);
+        content.append(body);
+        // A link card, already vetted by Rust against this message's own text.
+        if (m.card && typeof CairnLinkCards !== "undefined") {
+            content.append(CairnLinkCards.render(m.card));
+            li.classList.add("with-card");
+        }
+        content.append(reactions);
         li.append(who, content);
+        // Name and avatar are profile.js's to draw.
+        hooks.author(li, who, m);
 
         // A message recorded before replies existed has no id and cannot be answered.
         if (m.id) {
@@ -304,8 +312,97 @@ const CairnMessages = (() => {
         return false;
     }
 
+    // ---- keeping the newest message in view ------------------------------------
+    //
+    // A photo's bytes arrive after its message is drawn, so it grows from a placeholder to
+    // its real height after the timeline has already scrolled to the bottom — and pushes
+    // the newest messages out of view. Anything else that grows late (audio controls, a
+    // reply bar, the call stage shrinking the timeline) does the same.
+    //
+    // So: whether the reader is at the bottom is decided only when *they* scroll, and while
+    // they are, any change of size keeps them there. Someone who scrolled up to read history
+    // is never moved. Measured by ResizeObserver, not timers, so it holds however slowly the
+    // bytes arrive.
+    const PIN_PX = 48;
+    let pinned = true;
+    // New messages that arrived while the reader was up in the history. They are counted on
+    // a button rather than scrolled to: a message landing should not take someone's place.
+    let unseen = 0;
+    let jump = null;
+
+    function showJump() {
+        if (!jump) return;
+        jump.hidden = unseen === 0;
+        jump.textContent = unseen === 1 ? "1 new message \u2193" : unseen + " new messages \u2193";
+    }
+
+    function toBottom(timeline) {
+        pinned = true;
+        unseen = 0;
+        showJump();
+        timeline.scrollTop = timeline.scrollHeight;
+    }
+
+    // Called by the app for every message or notice it appends. The reader's own messages
+    // always bring them down to it; anything else only does if they were already there.
+    function arrived(li, mine) {
+        const timeline = $("timeline");
+        if (!timeline) return;
+        if (pinned || mine) {
+            toBottom(timeline);
+            li.scrollIntoView({ block: "end" });
+        } else {
+            unseen += 1;
+            showJump();
+        }
+    }
+
+    function follow(timeline) {
+        const atBottom = () =>
+            timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight <= PIN_PX;
+        // Only an upward scroll unpins. A scroll event is dispatched a frame after the
+        // scroll, and if a photo grew in between, the bottom has moved away from a reader who
+        // never moved: judging by distance alone unpinned them under load. Growth, scroll
+        // anchoring and our own scrolling all move down; leaving the bottom means moving up.
+        let lastTop = timeline.scrollTop;
+        timeline.addEventListener("scroll", () => {
+            const top = timeline.scrollTop;
+            if (atBottom()) {
+                pinned = true;
+                if (unseen) { unseen = 0; showJump(); }
+            } else if (top < lastTop) pinned = false;
+            lastTop = top;
+        }, { passive: true });
+        const sizes = new ResizeObserver(() => {
+            if (pinned) timeline.scrollTop = timeline.scrollHeight;
+            // Content that shrank (a font swapping in) clamps scrollTop upward without anyone
+            // scrolling. Recording where this left it means that clamp is not later mistaken
+            // for the reader moving up — which a probe under load showed it was.
+            lastTop = timeline.scrollTop;
+        });
+        sizes.observe(timeline);
+        new MutationObserver((records) => {
+            for (const r of records) {
+                for (const n of r.addedNodes) if (n.nodeType === 1) sizes.observe(n);
+                for (const n of r.removedNodes) if (n.nodeType === 1) sizes.unobserve(n);
+            }
+            // A cleared timeline is a newly opened room, which starts at its newest message.
+            if (!timeline.firstElementChild) { pinned = true; lastTop = 0; unseen = 0; showJump(); }
+        }).observe(timeline, { childList: true });
+
+        jump = document.createElement("button");
+        jump.type = "button";
+        jump.id = "jump-new";
+        jump.className = "jump-new";
+        jump.hidden = true;
+        jump.addEventListener("click", () => toBottom(timeline));
+        timeline.after(jump);
+    }
+
     function init(h) {
         hooks = { ...hooks, ...h };
+        const timeline = $("timeline");
+        if (timeline) follow(timeline);
         const cancel = $("reply-cancel");
         if (cancel) cancel.addEventListener("click", cancelReply);
         document.addEventListener("keydown", (e) => {
@@ -315,5 +412,5 @@ const CairnMessages = (() => {
         });
     }
 
-    return { init, render, send, handle, cancelReply, QUICK };
+    return { init, render, send, handle, cancelReply, arrived, QUICK };
 })();

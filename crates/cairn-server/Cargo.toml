@@ -13,8 +13,14 @@ cairn-proto.workspace = true
 cairn-crypto.workspace = true
 
 axum.workspace = true
-tokio.workspace = true
+# `io-util` for the GIF relay, which copies bytes between two sockets itself so it can
+# enforce the limits `gif_relay.rs` sets on each tunnel.
+tokio = { workspace = true, features = ["io-util"] }
 tower-http.workspace = true
+# Both already in the tree under axum. Named directly because the GIF relay takes over the
+# connection with an HTTP/1.1 upgrade, which axum only exposes for WebSockets.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -29,3 +35,6 @@ rand.workspace = true
 
 [dev-dependencies]
 cairn-client-core.workspace = true
+# A stand-in GIF provider for the relay's tests, speaking real TLS so the tunnel is tested
+# with what it will actually carry. Same version and backend the client already uses.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

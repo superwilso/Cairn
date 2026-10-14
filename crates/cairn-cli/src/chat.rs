@@ -414,6 +414,7 @@ impl App {
                 id: None,
                 reply_to: None,
                 reaction: None,
+                card: None,
             },
         );
     }
@@ -941,9 +942,18 @@ impl App {
         // inside the encrypted body. The server never sees the URL and the recipient never
         // contacts the site — see `docs/05-embeds.md`. A failure degrades to a bare link,
         // which is the last step of the fallback chain.
-        let card = embed::first_url(text).and_then(|url| match embed::unfurl(url) {
+        //
+        // Off unless asked for, per platform, as in the desktop client: CAIRN_LINK_PREVIEWS
+        // lists the sites this device may contact, e.g. `youtube,web`, or `all`.
+        let sites = match std::env::var("CAIRN_LINK_PREVIEWS") {
+            Ok(list) => embed::Sites::parse_list(&list)?,
+            Err(_) => embed::Sites::default(),
+        };
+        let card = embed::first_url(text).and_then(|url| match embed::unfurl(url, sites) {
             Ok(card) if card.is_useful() => Some(card),
             Ok(_) => None,
+            // Not a failure worth printing: the user did not ask for this site.
+            Err(embed::UnfurlError::NotEnabled(_)) => None,
             Err(e) => {
                 println!("  (no preview for {url}: {e})");
                 None
@@ -1026,6 +1036,14 @@ impl App {
                         emoji.map_or("withdrew a reaction".to_owned(), |e| format!("reacted {e}"))
                     );
                 }
+                // A profile is not a message, and its body is empty. The CLI does not keep
+                // profiles; it says one arrived rather than printing a blank line.
+                Ok(TimelineEvent::Message(received)) if received.profile.is_some() => {
+                    println!(
+                        "\n  {} updated their profile",
+                        short(&message.envelope.sender.as_uuid().to_string())
+                    );
+                }
                 Ok(TimelineEvent::Message(received)) => {
                     println!(
                         "\n  [{}] {}: {}",
@@ -1049,6 +1067,7 @@ impl App {
                             id: None,
                             reply_to: None,
                             reaction: None,
+                            card: received.card.as_deref().cloned(),
                         },
                     );
                     if let Some(attachment) = &received.attachment {

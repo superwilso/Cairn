@@ -155,6 +155,7 @@ mod tests {
             id: Some(id.to_owned()),
             reply_to: None,
             reaction: None,
+            card: None,
         }
     }
 
@@ -168,6 +169,7 @@ mod tests {
             id: None,
             reply_to: None,
             reaction: Some(Reaction { target: target.clone(), emoji: emoji.map(str::to_owned) }),
+            card: None,
         }
     }
 
