@@ -120,7 +120,12 @@ fn answer(path: &str) -> (u16, &'static str, Vec<u8>, bool) {
     }
     let file = path.split('?').next().unwrap_or("");
     if file.contains("svg") {
-        return (200, "image/webp", b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>".to_vec(), false);
+        return (
+            200,
+            "image/webp",
+            b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>".to_vec(),
+            false,
+        );
     }
     if file.ends_with(".webp") {
         return (200, "image/webp", webp(file), false);
@@ -154,7 +159,8 @@ fn serve_provider_connection(tcp: TcpStream, config: Arc<rustls::ServerConfig>, 
 
         let (status, kind, body, chunked) = answer(&path);
         let mut out =
-            format!("HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nConnection: keep-alive\r\n").into_bytes();
+            format!("HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nConnection: keep-alive\r\n")
+                .into_bytes();
         if chunked {
             out.extend(b"Transfer-Encoding: chunked\r\n\r\n");
             for piece in body.chunks(700) {
@@ -287,7 +293,10 @@ fn a_search_reaches_the_provider_through_the_relay_and_ads_never_arrive() {
     let requests = provider.seen.requests.lock().unwrap().clone();
     let (sni, path) = &requests[0];
     assert_eq!(sni, "api.klipy.com", "TLS was to the provider's own name, end to end");
-    assert!(path.starts_with(&format!("/api/v1/{KLIPY_KEY}/gifs/search?q=eye%20roll%20%26%20sigh&")), "{path}");
+    assert!(
+        path.starts_with(&format!("/api/v1/{KLIPY_KEY}/gifs/search?q=eye%20roll%20%26%20sigh&")),
+        "{path}"
+    );
 
     let preview = gifs.preview(&results[0].id).unwrap();
     assert_eq!(preview.mime, "image/webp");
@@ -304,7 +313,10 @@ fn a_search_reaches_the_provider_through_the_relay_and_ads_never_arrive() {
     assert_eq!(trending.len(), 1);
     assert_eq!((trending[0].width, trending[0].height), (100, 75));
     let giphy_path = provider.seen.requests.lock().unwrap().last().cloned().unwrap().1;
-    assert!(giphy_path.starts_with(&format!("/v1/gifs/trending?api_key={GIPHY_KEY}&")), "{giphy_path}");
+    assert!(
+        giphy_path.starts_with(&format!("/v1/gifs/trending?api_key={GIPHY_KEY}&")),
+        "{giphy_path}"
+    );
     assert_eq!(gifs.preview(&trending[0].id).unwrap().mime, "image/webp");
 
     // Ids are this session's own. A frontend cannot name a URL, or a result it never got.
@@ -338,7 +350,10 @@ fn the_client_checks_the_providers_certificate_through_the_relay() {
     let mut alice = session(&server, "untrusted");
     let err = alice.gifs().unwrap().search("klipy", "cats").unwrap_err();
     assert!(matches!(err, GifError::Tls(_)), "{err}");
-    assert!(provider.seen.requests.lock().unwrap().is_empty(), "no request may cross unverified TLS");
+    assert!(
+        provider.seen.requests.lock().unwrap().is_empty(),
+        "no request may cross unverified TLS"
+    );
 }
 
 #[test]
@@ -429,16 +444,21 @@ struct Prober {
 
 impl Prober {
     fn register(server: &Server) -> Self {
-        let p = Self { mls: cairn_crypto::mls::Session::new(b"prober").unwrap(), device: DeviceId::new() };
-        server.instance.claim_account(UserId::new(), p.device, p.mls.public_key(), None, 0).unwrap();
+        let p = Self {
+            mls: cairn_crypto::mls::Session::new(b"prober").unwrap(),
+            device: DeviceId::new(),
+        };
+        server
+            .instance
+            .claim_account(UserId::new(), p.device, p.mls.public_key(), None, 0)
+            .unwrap();
         p
     }
 
     fn headers(&self, action: &str) -> Vec<(&'static str, String)> {
-        let issued_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let issued_at =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as i64;
         let bytes = cairn_proto::request_signing_bytes(action, None, issued_at);
         vec![
             ("x-cairn-device", self.device.as_uuid().to_string()),
@@ -449,7 +469,12 @@ impl Prober {
 }
 
 /// Ask for a tunnel and return the status, leaving the socket open if it upgraded.
-fn ask_tunnel(server: &Server, path: &str, headers: &[(&str, String)], upgrade: bool) -> (u16, TcpStream) {
+fn ask_tunnel(
+    server: &Server,
+    path: &str,
+    headers: &[(&str, String)],
+    upgrade: bool,
+) -> (u16, TcpStream) {
     let mut stream = TcpStream::connect(server.addr).unwrap();
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).unwrap();
     let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
@@ -470,7 +495,8 @@ fn ask_tunnel(server: &Server, path: &str, headers: &[(&str, String)], upgrade: 
         head.push(byte[0]);
     }
     let text = String::from_utf8_lossy(&head);
-    let status = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status line");
+    let status =
+        text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status line");
     (status, stream)
 }
 
@@ -510,8 +536,12 @@ fn the_relay_cannot_be_used_to_reach_anything_but_the_providers() {
     ];
     for target in &targets {
         let action = format!("gif_tunnel:{}", percent_decode(target));
-        let (status, _) =
-            ask_tunnel(&server, &format!("/v1/gifs/tunnel/{target}"), &prober.headers(&action), true);
+        let (status, _) = ask_tunnel(
+            &server,
+            &format!("/v1/gifs/tunnel/{target}"),
+            &prober.headers(&action),
+            true,
+        );
         assert!(matches!(status, 403 | 404), "{target} must be refused, got {status}");
     }
     assert_eq!(provider.seen.connections.load(Ordering::SeqCst), 0, "nothing may be dialled");
@@ -570,8 +600,12 @@ fn a_tunnel_needs_a_signature_for_exactly_its_own_target() {
     );
     assert_eq!(status, 401);
     // Signed for the capability endpoint, presented to the tunnel.
-    let (status, _) =
-        ask_tunnel(&server, "/v1/gifs/tunnel/api.klipy.com:443", &prober.headers("gif_capability"), true);
+    let (status, _) = ask_tunnel(
+        &server,
+        "/v1/gifs/tunnel/api.klipy.com:443",
+        &prober.headers("gif_capability"),
+        true,
+    );
     assert_eq!(status, 401);
     // Properly signed, but not asking to upgrade: told how, and nothing is dialled.
     let (status, _) = ask_tunnel(

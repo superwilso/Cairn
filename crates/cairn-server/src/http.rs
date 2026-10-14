@@ -614,8 +614,7 @@ async fn gif_capability(
     State(instance): State<SharedInstance>,
     headers: HeaderMap,
 ) -> Result<Json<GifCapabilityResponse>, ServerError> {
-    let actor =
-        signed_actor(&instance, &headers, crate::gif_relay::GIF_CAPABILITY_ACTION, None)?;
+    let actor = signed_actor(&instance, &headers, crate::gif_relay::GIF_CAPABILITY_ACTION, None)?;
     let providers = instance
         .gif_capability(actor)
         .into_iter()

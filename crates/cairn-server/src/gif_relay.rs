@@ -142,7 +142,11 @@ impl GifRelayConfig {
     /// The key is placed in a URL by the client — in the *path*, for KLIPY — so a key with
     /// a `/`, `?`, `#` or `&` in it would silently rewrite the request rather than fail.
     /// Both providers issue plain alphanumeric keys.
-    pub fn with_provider(mut self, provider: GifProvider, api_key: &str) -> Result<Self, ServerError> {
+    pub fn with_provider(
+        mut self,
+        provider: GifProvider,
+        api_key: &str,
+    ) -> Result<Self, ServerError> {
         let api_key = api_key.trim();
         if api_key.is_empty() {
             return Err(ServerError::GifConfigInvalid(format!(
@@ -386,11 +390,8 @@ impl Instance {
         if !allowed {
             return Err(ServerError::GifTargetRefused);
         }
-        let remaining = self
-            .gif_limiter
-            .lock()
-            .expect("gif limiter mutex poisoned")
-            .admit(actor, now_ms)?;
+        let remaining =
+            self.gif_limiter.lock().expect("gif limiter mutex poisoned").admit(actor, now_ms)?;
         Ok(GifTunnelGrant {
             actor,
             host,
@@ -439,7 +440,8 @@ mod tests {
     #[test]
     fn both_providers_can_be_configured_at_once_and_each_is_offered() {
         let inst = configured(&[GifProvider::Giphy, GifProvider::Klipy]);
-        let offered: Vec<_> = inst.gif_capability(UserId::new()).iter().map(|c| c.provider).collect();
+        let offered: Vec<_> =
+            inst.gif_capability(UserId::new()).iter().map(|c| c.provider).collect();
         assert_eq!(offered, [GifProvider::Klipy, GifProvider::Giphy], "a stable order for tabs");
         let actor = UserId::new();
         inst.authorize_gif_tunnel(actor, "api.klipy.com", 443, 0).unwrap();
@@ -503,7 +505,14 @@ mod tests {
     #[test]
     fn a_tunnel_target_has_one_spelling() {
         assert_eq!(parse_tunnel_target("api.klipy.com:443").unwrap(), ("api.klipy.com", 443));
-        for bad in ["api.klipy.com", "api.klipy.com:0443", "api.klipy.com:+443", "api.klipy.com: 443", "api.klipy.com:", ":443x"] {
+        for bad in [
+            "api.klipy.com",
+            "api.klipy.com:0443",
+            "api.klipy.com:+443",
+            "api.klipy.com: 443",
+            "api.klipy.com:",
+            ":443x",
+        ] {
             assert!(parse_tunnel_target(bad).is_err(), "{bad:?} must not parse");
         }
     }
@@ -593,7 +602,9 @@ mod tests {
 
     #[test]
     fn an_api_key_that_would_rewrite_the_request_url_is_refused() {
-        for bad in ["", "   ", "key/../x", "key?x=1", "key#frag", "key&q=x", "key with space", "kéy"] {
+        for bad in
+            ["", "   ", "key/../x", "key?x=1", "key#frag", "key&q=x", "key with space", "kéy"]
+        {
             assert!(
                 GifRelayConfig::new().with_provider(GifProvider::Klipy, bad).is_err(),
                 "{bad:?} must not be accepted as a key"

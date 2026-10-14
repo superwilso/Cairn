@@ -127,7 +127,11 @@ const CairnVoice = (() => {
             return;
         }
         Object.assign(rec, { pending: false, stream, recorder, type, started: Date.now() });
-        recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) rec && rec.chunks.push(ev.data); };
+        // Into this recording's own list, not whatever `rec` is by then: the last chunk is
+        // delivered after stop(), when `finish` has already cleared `rec`, and reading the
+        // global here silently dropped the final quarter-second of every note.
+        const chunks = rec.chunks;
+        recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
         recorder.start(250);
         rec.timer = setInterval(tick, 200);
         button.classList.add("on");

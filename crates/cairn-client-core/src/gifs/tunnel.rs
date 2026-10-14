@@ -101,7 +101,8 @@ pub(super) fn open(
     headers: &[(&'static str, String)],
 ) -> Result<Box<dyn Pipe>, GifError> {
     let io = |e: std::io::Error| GifError::Io(e.to_string());
-    let addrs: Vec<_> = (origin.host.as_str(), origin.port).to_socket_addrs().map_err(io)?.collect();
+    let addrs: Vec<_> =
+        (origin.host.as_str(), origin.port).to_socket_addrs().map_err(io)?.collect();
     let mut last = None;
     let mut tcp = None;
     for addr in addrs {
@@ -275,10 +276,11 @@ impl ProviderConn {
             return Err(GifError::Malformed("compressed provider response"));
         }
         let body = if framing.chunked {
-            read_chunked(&mut self.io, limit).map_err(|e| {
+            let body = read_chunked(&mut self.io, limit);
+            if body.is_err() {
                 self.reusable = false;
-                e
-            })?
+            }
+            body?
         } else if let Some(len) = framing.length {
             if len > limit as u64 {
                 self.reusable = false;
@@ -349,7 +351,8 @@ fn read_chunked(io: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, GifError
         io.take(256).read_until(b'\n', &mut line).map_err(err)?;
         let text = std::str::from_utf8(&line).map_err(|_| GifError::Malformed("chunk size"))?;
         let size_text = text.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16).map_err(|_| GifError::Malformed("chunk size"))?;
+        let size =
+            usize::from_str_radix(size_text, 16).map_err(|_| GifError::Malformed("chunk size"))?;
         if size == 0 {
             // Trailers, then the blank line that ends them.
             loop {
@@ -384,7 +387,10 @@ mod tests {
         assert!(o.tls);
         assert_eq!((o.host.as_str(), o.port, o.prefix.as_str()), ("cairn.example", 443, ""));
         let o = Origin::parse("http://127.0.0.1:8080/").unwrap();
-        assert_eq!((o.host.as_str(), o.port, o.authority.as_str()), ("127.0.0.1", 8080, "127.0.0.1:8080"));
+        assert_eq!(
+            (o.host.as_str(), o.port, o.authority.as_str()),
+            ("127.0.0.1", 8080, "127.0.0.1:8080")
+        );
         let o = Origin::parse("http://[::1]:9000/cairn").unwrap();
         assert_eq!((o.host.as_str(), o.port, o.prefix.as_str()), ("::1", 9000, "/cairn"));
         for bad in ["ftp://x", "cairn.example", "http://user@host", "http://", "http://h:port"] {

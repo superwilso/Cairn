@@ -293,7 +293,12 @@ fn dims(v: &serde_json::Value, w: &str, h: &str) -> (u32, u32) {
     (get(w), get(h))
 }
 
-fn klipy_rendition(file: &serde_json::Value, size: &str, format: &str, hosts: &[String]) -> Option<Rendition> {
+fn klipy_rendition(
+    file: &serde_json::Value,
+    size: &str,
+    format: &str,
+    hosts: &[String],
+) -> Option<Rendition> {
     let r = file.get(size)?.get(format)?;
     let (host, path) = rendition_at(r.get("url")?.as_str()?, hosts)?;
     let (width, height) = dims(r, "width", "height");
@@ -352,7 +357,8 @@ fn giphy_rendition(
 fn parse_giphy(body: &[u8], hosts: &[String]) -> Result<Vec<Found>, GifError> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| GifError::Malformed("GIPHY response"))?;
-    let items = v.get("data").and_then(|d| d.as_array()).ok_or(GifError::Malformed("GIPHY response"))?;
+    let items =
+        v.get("data").and_then(|d| d.as_array()).ok_or(GifError::Malformed("GIPHY response"))?;
     let mut out = Vec::new();
     for item in items {
         // GIPHY's GIF endpoints return `type: "gif"`; anything else is not what was asked.
@@ -502,14 +508,21 @@ impl Gifs {
 
     /// Search `provider` for `query`, or list what is trending when the query is blank.
     pub fn search(&self, provider: &str, query: &str) -> Result<Vec<GifView>, GifError> {
-        let p = Provider::parse(provider).ok_or_else(|| GifError::UnknownProvider(provider.into()))?;
+        let p =
+            Provider::parse(provider).ok_or_else(|| GifError::UnknownProvider(provider.into()))?;
         let grant = self.grant(p)?;
         if !grant.hosts.iter().any(|h| h == p.api_host()) {
-            return Err(GifError::Relay("the instance does not relay to the provider's API".into()));
+            return Err(GifError::Relay(
+                "the instance does not relay to the provider's API".into(),
+            ));
         }
         let reply = self.get(p.api_host(), &p.search_path(&grant.api_key, query), MAX_API_BYTES)?;
         if reply.status != 200 {
-            return Err(GifError::Provider { provider: p.name(), status: reply.status, hint: p.hint(reply.status) });
+            return Err(GifError::Provider {
+                provider: p.name(),
+                status: reply.status,
+                hint: p.hint(reply.status),
+            });
         }
         let found = match p {
             Provider::Klipy => parse_klipy(&reply.body, &grant.hosts)?,
@@ -537,13 +550,22 @@ impl Gifs {
     }
 
     fn lookup(&self, id: &str) -> Result<Remembered, GifError> {
-        self.remembered.lock().expect("gif results lock").get(id).cloned().ok_or(GifError::UnknownGif)
+        self.remembered
+            .lock()
+            .expect("gif results lock")
+            .get(id)
+            .cloned()
+            .ok_or(GifError::UnknownGif)
     }
 
     fn fetch(&self, provider: Provider, r: &Rendition, limit: usize) -> Result<GifMedia, GifError> {
         let reply = self.get(&r.host, &r.path, limit)?;
         if reply.status != 200 {
-            return Err(GifError::Provider { provider: provider.name(), status: reply.status, hint: "" });
+            return Err(GifError::Provider {
+                provider: provider.name(),
+                status: reply.status,
+                hint: "",
+            });
         }
         let mime = sniff(&reply.body).ok_or(GifError::NotAnImage)?;
         Ok(GifMedia { bytes: reply.body, mime })
@@ -565,7 +587,11 @@ impl Gifs {
             .find(|c| c.size.is_none_or(|s| s <= MAX_GIF_SEND_BYTES as u64))
             .ok_or(GifError::TooLarge)?;
         let media = self.fetch(r.provider, choice, MAX_GIF_SEND_BYTES)?;
-        Ok(GifFile { name: file_name(&r.found.title, media.mime), mime: media.mime, bytes: media.bytes })
+        Ok(GifFile {
+            name: file_name(&r.found.title, media.mime),
+            mime: media.mime,
+            bytes: media.bytes,
+        })
     }
 
     /// One GET through the relay, on a pooled connection if a fresh one is idle.
@@ -703,7 +729,9 @@ mod tests {
         assert!(path.contains("q=cats%26api_key%3Dstolen%23x%20%2F%3F%C3%A9&"), "{path}");
         assert_eq!(path.matches("api_key=").count(), 1);
         let long = "a".repeat(500);
-        assert!(Provider::Klipy.search_path("K", &long).contains(&format!("q={}&", "a".repeat(50))));
+        assert!(Provider::Klipy
+            .search_path("K", &long)
+            .contains(&format!("q={}&", "a".repeat(50))));
         assert!(Provider::Klipy.search_path("K", "   ").contains("/gifs/trending?"));
     }
 

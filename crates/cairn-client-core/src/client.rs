@@ -134,6 +134,9 @@ struct GifCapabilityResponse {
     providers: Vec<GifProviderGrant>,
 }
 
+/// Request-signing headers, as name and value.
+pub type SignedHeaders = Vec<(&'static str, String)>;
+
 /// One GIF provider an instance relays, as it described it.
 ///
 /// The key is the operator's, shared with every member by design — the client builds the
@@ -445,10 +448,7 @@ impl<T: Transport> Client<T> {
     /// open a tunnel to `host` and nowhere else; that is what keeps this from being the way
     /// to obtain a signature for an arbitrary action that `auth` is private to
     /// prevent.
-    pub fn gif_tunnel_request(
-        &self,
-        host: &str,
-    ) -> Result<(String, Vec<(&'static str, String)>), ClientError> {
+    pub fn gif_tunnel_request(&self, host: &str) -> Result<(String, SignedHeaders), ClientError> {
         let target = format!("{host}:443");
         let headers = self.auth(&format!("gif_tunnel:{target}"), None)?;
         Ok((format!("/v1/gifs/tunnel/{target}"), headers))
