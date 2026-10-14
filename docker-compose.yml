@@ -24,6 +24,14 @@ services:
       # Naming Caddy lets the instance believe the X-Forwarded-For it adds — and only that
       # one host's, because anyone can send the header. Must match caddy's address below.
       CAIRN_TRUSTED_PROXIES: 172.30.0.2
+      # GIF search, off unless a key is set. Either, both or neither; with neither, the
+      # picker says GIF search is not configured here. Each key is shared with every
+      # account on this instance (the client needs it inside its own TLS to the provider),
+      # and KLIPY's standard terms forbid the relay, re-hosting and ad filtering this
+      # design relies on without their written approval. Read docs/11-self-hosting.md
+      # ("GIF search") before uncommenting.
+      # CAIRN_KLIPY_API_KEY: ${CAIRN_KLIPY_API_KEY:-}
+      # CAIRN_GIPHY_API_KEY: ${CAIRN_GIPHY_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
     networks:
       - internal
