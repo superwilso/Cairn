@@ -404,10 +404,12 @@ name = "cairn-server"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "cairn-client-core",
  "cairn-crypto",
  "cairn-proto",
  "hex",
+ "hmac",
  "hyper",
  "hyper-util",
  "rand 0.8.7",
@@ -415,6 +417,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "subtle",
  "thiserror 2.0.19",
@@ -423,6 +426,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

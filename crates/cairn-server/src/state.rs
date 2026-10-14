@@ -137,6 +137,9 @@ pub enum ServerError {
     /// Operator configuration for the GIF relay that would not work. Startup only.
     #[error("GIF relay configuration: {0}")]
     GifConfigInvalid(String),
+    /// Operator configuration for the TURN relay that would not work. Startup only.
+    #[error("TURN relay configuration: {0}")]
+    TurnConfigInvalid(String),
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -578,6 +581,8 @@ pub struct Instance {
     pub(crate) gif_relay: Mutex<Option<crate::gif_relay::GifRelayConfig>>,
     /// Bounds what one account can relay. Not persisted, as above.
     pub(crate) gif_limiter: Mutex<crate::gif_relay::GifRelayLimiter>,
+    /// The operator's TURN relay, if any. Configuration, not state: not persisted.
+    turn: Mutex<Option<TurnConfig>>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -615,6 +620,7 @@ impl Instance {
             send_budget: Mutex::default(),
             gif_relay: Mutex::new(None),
             gif_limiter: Mutex::default(),
+            turn: Mutex::new(None),
             registration_limiter: Mutex::default(),
             franking_key,
             storage,
@@ -1598,6 +1604,306 @@ impl Instance {
     #[cfg(test)]
     pub(crate) fn franking_key(&self) -> &ServerFrankingKey {
         &self.franking_key
+    }
+}
+
+// ---- TURN relay credentials ---------------------------------------------------------------
+//
+// A call's media goes peer to peer (`docs/12-realtime-media.md` §0), which fails across some
+// home networks and shows every participant every other participant's IP address. A TURN
+// relay fixes both, at the operator's bandwidth cost. The relay itself is a separate
+// program — coturn, typically — and the instance's only part is **handing out credentials
+// for it**, using coturn's REST-auth scheme (`use-auth-secret`): the instance and the relay
+// share a secret, and a credential is `HMAC-SHA1(secret, "<expiry>:<account>")`, which the
+// relay checks without ever talking to the instance.
+//
+// What that does and does not give, stated here because the client repeats it:
+//
+// - The relay sees every relayed participant's IP address, and the media's size and timing.
+//   It cannot read the media: DTLS-SRTP runs between the participants, through the relay.
+// - A credential works for anyone holding it until it expires. The relay has no idea which
+//   room or call it was issued for — the membership check below decides who gets one, not
+//   what it can be used for.
+
+/// How long a credential lasts unless the operator says otherwise.
+///
+/// A trade with two sides. A short life bounds how long a leaked credential lets a stranger
+/// use the operator's bandwidth; but a credential that expires mid-call can cost that call
+/// its relay when the relay next re-checks it, so the life also has to cover a long call.
+/// Four hours errs toward the call. The client asks afresh every time it joins one.
+pub const TURN_DEFAULT_TTL_SECS: u64 = 4 * 60 * 60;
+/// Bounds on an operator-chosen lifetime. Below a minute a call could not even finish
+/// connecting; above a day the credential is effectively static.
+pub const TURN_MIN_TTL_SECS: u64 = 60;
+pub const TURN_MAX_TTL_SECS: u64 = 24 * 60 * 60;
+/// The shortest shared secret accepted. HMAC accepts any length; a guessable secret lets
+/// anyone mint credentials offline, so a short one is refused at startup.
+pub const TURN_MIN_SECRET_BYTES: usize = 16;
+
+/// The operator's TURN relay: where it is, and the secret it shares with this instance.
+///
+/// The secret never appears in `Debug` and is wiped on drop. Nothing else here is secret:
+/// the URLs are handed to every member who asks.
+pub struct TurnConfig {
+    urls: Vec<String>,
+    secret: zeroize::Zeroizing<Vec<u8>>,
+    ttl_secs: u64,
+}
+
+impl std::fmt::Debug for TurnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnConfig")
+            .field("urls", &self.urls)
+            .field("secret", &"<redacted>")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
+}
+
+impl TurnConfig {
+    /// Validate an operator's configuration. `ttl_secs` of `None` takes the default.
+    ///
+    /// Refuses rather than repairs: a URL list that half-parsed would have every call
+    /// trying a relay that is not there, and that fails as "calls do not connect" with
+    /// nothing pointing at the configuration.
+    pub fn new(urls: &[&str], secret: &str, ttl_secs: Option<u64>) -> Result<Self, ServerError> {
+        let bad = |why: String| ServerError::TurnConfigInvalid(why);
+        let urls: Vec<String> =
+            urls.iter().map(|u| u.trim()).filter(|u| !u.is_empty()).map(str::to_string).collect();
+        if urls.is_empty() {
+            return Err(bad("no relay URL given".into()));
+        }
+        if urls.len() > 8 {
+            return Err(bad("more than eight relay URLs".into()));
+        }
+        let scheme = |u: &str, schemes: &[&str]| {
+            let lower = u.to_ascii_lowercase();
+            schemes.iter().any(|s| lower.starts_with(s))
+        };
+        for url in &urls {
+            if !scheme(url, &["turn:", "turns:", "stun:", "stuns:"])
+                || url.len() > 256
+                || url.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                return Err(bad(format!(
+                    "'{url}' is not a turn:, turns: or stun: URI (e.g. turn:turn.example.org:3478)"
+                )));
+            }
+        }
+        if !urls.iter().any(|u| scheme(u, &["turn:", "turns:"])) {
+            return Err(bad(
+                "at least one URL must be turn: or turns: — STUN alone is not a relay".into(),
+            ));
+        }
+        if secret.len() < TURN_MIN_SECRET_BYTES {
+            return Err(bad(format!(
+                "the shared secret must be at least {TURN_MIN_SECRET_BYTES} bytes"
+            )));
+        }
+        let ttl_secs = ttl_secs.unwrap_or(TURN_DEFAULT_TTL_SECS);
+        if !(TURN_MIN_TTL_SECS..=TURN_MAX_TTL_SECS).contains(&ttl_secs) {
+            return Err(bad(format!(
+                "credential lifetime must be between {TURN_MIN_TTL_SECS} and {TURN_MAX_TTL_SECS} seconds"
+            )));
+        }
+        Ok(Self { urls, secret: zeroize::Zeroizing::new(secret.as_bytes().to_vec()), ttl_secs })
+    }
+
+    pub fn urls(&self) -> &[String] {
+        &self.urls
+    }
+
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+}
+
+/// One short-lived relay credential, in the shape WebRTC's `RTCIceServer` takes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TurnGrant {
+    pub urls: Vec<String>,
+    /// `<expiry unix seconds>:<account id>` — coturn reads the expiry from before the colon.
+    pub username: String,
+    /// `base64(HMAC-SHA1(secret, username))`.
+    pub credential: String,
+    pub ttl_secs: u64,
+}
+
+impl std::fmt::Debug for TurnGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnGrant")
+            .field("urls", &self.urls)
+            .field("username", &self.username)
+            .field("credential", &"<redacted>")
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
+}
+
+/// coturn's REST-auth credential: the password for `username` is the base64 HMAC-SHA1 of it.
+///
+/// SHA-1 is coturn's choice, not this project's, and it is not a weakness here: HMAC's
+/// security does not rest on SHA-1's collision resistance, which is the part that is broken.
+fn turn_password(secret: &[u8], username: &str) -> String {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    let mut mac =
+        hmac::Hmac::<sha1::Sha1>::new_from_slice(secret).expect("HMAC accepts a key of any length");
+    mac.update(username.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+impl Instance {
+    /// Configure the TURN relay, or turn it off with `None`. Operator action.
+    pub fn set_turn(&self, config: Option<TurnConfig>) {
+        *self.turn.lock().expect("turn mutex poisoned") = config;
+    }
+
+    /// Relay credentials for `actor`, to use in a call in `room`.
+    ///
+    /// The rules, in order: `actor` is a member of the room; then, and only then,
+    /// whether a relay is configured at all — `Ok(None)` when not. The order is the point.
+    /// Credentials spend the operator's bandwidth, so they go only to an authenticated
+    /// account in the room the call is in, and somebody who is not learns nothing — not even
+    /// whether this instance runs a relay.
+    ///
+    /// What membership buys is limited, and is not overstated: any registered account can
+    /// create a room of its own and ask for credentials in it. The gate keeps the relay from
+    /// strangers on the internet, not from the instance's own users; capping a member who
+    /// abuses it is the relay's job (coturn's `user-quota` and `total-quota`).
+    pub fn turn_credentials(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        now_ms: i64,
+    ) -> Result<Option<TurnGrant>, ServerError> {
+        {
+            let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+            // One refusal for "no such room" and "not yours": a stranger holding a private
+            // room's id must not learn from this endpoint that it exists.
+            if !rooms.get(&room).is_some_and(|r| r.has_member(actor)) {
+                return Err(ServerError::NotAMember);
+            }
+        }
+        let guard = self.turn.lock().expect("turn mutex poisoned");
+        let Some(config) = guard.as_ref() else { return Ok(None) };
+        let expiry = now_ms.div_euclid(1000).saturating_add(config.ttl_secs as i64);
+        let username = format!("{expiry}:{actor}");
+        let credential = turn_password(&config.secret, &username);
+        Ok(Some(TurnGrant {
+            urls: config.urls.clone(),
+            username,
+            credential,
+            ttl_secs: config.ttl_secs,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod turn {
+    use super::tests::*;
+    use super::*;
+
+    const SECRET: &str = "a-shared-secret-of-some-length";
+
+    fn relay() -> TurnConfig {
+        TurnConfig::new(
+            &["turn:turn.example.org:3478", "turns:turn.example.org:5349"],
+            SECRET,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn room_of(inst: &Instance) -> (RoomId, TestSender) {
+        let owner = TestSender::registered(inst);
+        let (room, _) = inst.create_room(public_shape(), owner.user).unwrap();
+        (room, owner)
+    }
+
+    #[test]
+    fn the_credential_is_the_one_coturn_computes() {
+        // The vector is openssl's, not this code's own output read back:
+        //   printf '1700003600:usr_test' | openssl dgst -sha1 -hmac "$SECRET" -binary | base64
+        // A credential the relay disagrees with fails as "calls do not connect", with
+        // nothing pointing here, so the format is pinned to an outside computation.
+        assert_eq!(
+            turn_password(SECRET.as_bytes(), "1700003600:usr_test"),
+            "F4+tIurTNbhp3LDxnJf7IdWDbnE="
+        );
+    }
+
+    #[test]
+    fn a_member_gets_a_credential_that_expires() {
+        let inst = Instance::in_memory();
+        inst.set_turn(Some(relay()));
+        let (room, owner) = room_of(&inst);
+        let grant = inst.turn_credentials(room, owner.user, 1_700_000_000_123).unwrap().unwrap();
+        let (expiry, who) = grant.username.split_once(':').unwrap();
+        assert_eq!(expiry.parse::<i64>().unwrap(), 1_700_000_000 + TURN_DEFAULT_TTL_SECS as i64);
+        assert_eq!(who, owner.user.to_string());
+        assert_eq!(grant.credential, turn_password(SECRET.as_bytes(), &grant.username));
+        assert_eq!(grant.urls.len(), 2);
+    }
+
+    #[test]
+    fn someone_outside_the_room_gets_no_relay_credential() {
+        let inst = Instance::in_memory();
+        inst.set_turn(Some(relay()));
+        let (room, _) = room_of(&inst);
+        let stranger = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.turn_credentials(room, stranger.user, 0),
+            Err(ServerError::NotAMember)
+        ));
+    }
+
+    #[test]
+    fn a_stranger_cannot_tell_whether_a_relay_exists() {
+        // Counterfactual for the order of the checks: with no relay configured, a stranger
+        // must get the same refusal as above, not an `Ok(None)` that says "no relay here".
+        let inst = Instance::in_memory();
+        let (room, owner) = room_of(&inst);
+        let stranger = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.turn_credentials(room, stranger.user, 0),
+            Err(ServerError::NotAMember)
+        ));
+        assert_eq!(inst.turn_credentials(room, owner.user, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_relay_secret_never_appears_in_debug() {
+        let config = relay();
+        let inst = Instance::in_memory();
+        inst.set_turn(Some(TurnConfig::new(&["turn:t.example:3478"], SECRET, None).unwrap()));
+        let (room, owner) = room_of(&inst);
+        let grant = inst.turn_credentials(room, owner.user, 0).unwrap().unwrap();
+        for printed in [format!("{config:?}"), format!("{grant:?}")] {
+            assert!(!printed.contains(SECRET), "{printed}");
+            assert!(!printed.contains(&grant.credential), "{printed}");
+        }
+    }
+
+    #[test]
+    fn a_relay_configuration_that_would_not_work_is_refused() {
+        let ok = ["turn:t.example:3478"];
+        assert!(TurnConfig::new(&[], SECRET, None).is_err(), "no URL");
+        assert!(
+            TurnConfig::new(&["stun:t.example:3478"], SECRET, None).is_err(),
+            "STUN is not a relay"
+        );
+        assert!(TurnConfig::new(&["https://t.example"], SECRET, None).is_err(), "not a TURN URI");
+        assert!(TurnConfig::new(&["turn:t.example:3478 x"], SECRET, None).is_err(), "whitespace");
+        assert!(TurnConfig::new(&ok, "short", None).is_err(), "guessable secret");
+        assert!(TurnConfig::new(&ok, SECRET, Some(5)).is_err(), "too short to connect a call");
+        assert!(
+            TurnConfig::new(&ok, SECRET, Some(TURN_MAX_TTL_SECS + 1)).is_err(),
+            "effectively static"
+        );
+        assert!(
+            TurnConfig::new(&["TURNS:t.example:5349", "stun:t.example"], SECRET, Some(600)).is_ok()
+        );
     }
 }
 

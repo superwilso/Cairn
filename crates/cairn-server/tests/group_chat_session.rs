@@ -553,4 +553,53 @@ mod calls {
             "the SDP must not appear anywhere in what the instance holds"
         );
     }
+
+    /// Poll until a signal of `kind` arrives, returning who sent it and the signal.
+    fn wait_for(who: &mut Session, kind: SignalKind) -> Option<(String, CallSignal)> {
+        for _ in 0..8 {
+            for event in who.poll().unwrap() {
+                if let Event::Signal { from, signal } = event {
+                    if signal.kind == kind {
+                        return Some((from, signal));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_declined_call_tells_the_caller_who_declined() {
+        let (_server, mut alice, mut bob, _room) = two_in_a_group();
+        let call = alice.call_join().unwrap();
+        assert!(wait_for(&mut bob, SignalKind::Join).is_some(), "bob is rung");
+
+        bob.call_decline().unwrap();
+
+        let (from, signal) =
+            wait_for(&mut alice, SignalKind::Decline).expect("the caller must hear the decline");
+        assert_eq!(from, bob.user_id());
+        assert_eq!(signal.call, call, "it names the call that was declined");
+        assert_eq!(signal.to.as_deref(), Some(alice.user_id().as_str()));
+    }
+
+    #[test]
+    fn a_declined_call_is_not_joined_by_the_next_press_of_the_call_button() {
+        // Declining forgets the ring. Otherwise bob pressing "call" a minute later would
+        // silently drop him into the call he said no to, rather than starting his own.
+        let (_server, mut alice, mut bob, _room) = two_in_a_group();
+        let call = alice.call_join().unwrap();
+        wait_for(&mut bob, SignalKind::Join).unwrap();
+        bob.call_decline().unwrap();
+        assert_ne!(bob.call_join().unwrap(), call);
+    }
+
+    #[test]
+    fn declining_with_nothing_ringing_puts_nothing_on_the_wire() {
+        let (_server, mut alice, mut bob, _room) = two_in_a_group();
+        alice.call_join().unwrap();
+        // Bob never polled, so he was never rung: there is nobody to address a decline to.
+        bob.call_decline().unwrap();
+        assert!(wait_for(&mut alice, SignalKind::Decline).is_none());
+    }
 }

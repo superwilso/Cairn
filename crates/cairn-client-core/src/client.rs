@@ -130,6 +130,11 @@ struct UploadedBlobResponse {
 }
 
 #[derive(Deserialize)]
+struct TurnResponse {
+    ice_servers: Vec<crate::call::IceServer>,
+}
+
+#[derive(Deserialize)]
 struct GifCapabilityResponse {
     providers: Vec<GifProviderGrant>,
 }
@@ -430,6 +435,24 @@ impl<T: Transport> Client<T> {
             None,
         )?;
         Ok(response.body)
+    }
+
+    /// Short-lived credentials for the instance's TURN relay, for a call in `room`.
+    ///
+    /// Empty when the operator runs no relay. Asked for afresh on every call: they expire,
+    /// and a credential cached from yesterday is one the relay refuses mid-handshake.
+    pub fn turn_credentials(
+        &self,
+        room: RoomId,
+    ) -> Result<Vec<crate::call::IceServer>, ClientError> {
+        let response = self.call(
+            "POST",
+            &format!("/v1/rooms/{}/turn", room.as_uuid()),
+            &self.auth("turn_credentials", Some(room.into()))?,
+            None,
+        )?;
+        let parsed: TurnResponse = serde_json::from_slice(&response.body)?;
+        Ok(parsed.ice_servers)
     }
 
     /// Which GIF providers this instance relays, with the key and hosts for each. Empty when

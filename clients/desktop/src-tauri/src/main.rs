@@ -19,7 +19,7 @@
 
 use std::sync::Mutex;
 
-use cairn_client_core::call::{self, CallSignal, IceServer};
+use cairn_client_core::call::{CallConfig, CallSignal};
 use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
     Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
@@ -265,29 +265,21 @@ fn call_id(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.call_id())
 }
 
-/// What the WebRTC layer needs before it can build a peer connection.
-///
-/// Sent as data rather than baked into the JavaScript so a self-hosted instance can point
-/// calls at its own STUN/TURN later without a frontend change — and so the honest caveat
-/// travels with the config instead of living in a comment nobody reads.
-#[derive(serde::Serialize)]
-struct CallConfig {
-    ice_servers: Vec<IceServer>,
-    /// False on STUN alone. The UI says so: without a relay a minority of users behind
-    /// symmetric NATs will find calls simply do not connect, and "it is your network" is
-    /// not something a client should leave them to work out themselves.
-    has_relay: bool,
-    max_participants: usize,
+/// Decline the call this device is being rung for. The caller sees "declined".
+#[tauri::command]
+fn call_decline(state: State<'_, AppState>) -> CmdResult<()> {
+    with(&state, |s| s.call_decline())
 }
 
+/// What the WebRTC layer needs before it can build a peer connection, for the open room.
+///
+/// Sent as data rather than baked into the JavaScript so a self-hosted instance points
+/// calls at its own STUN/TURN without a frontend change — and so the honest caveat travels
+/// with the config instead of living in a comment nobody reads. Relay credentials in it are
+/// fresh each time and expire; see `Session::call_config`.
 #[tauri::command]
-fn call_config() -> CallConfig {
-    let ice_servers = call::default_ice_servers();
-    CallConfig {
-        has_relay: call::has_relay(&ice_servers),
-        ice_servers,
-        max_participants: call::MAX_MESH_PARTICIPANTS,
-    }
+fn call_config(state: State<'_, AppState>) -> CmdResult<CallConfig> {
+    with(&state, |s| s.call_config())
 }
 
 // ---- attachments -----------------------------------------------------------
@@ -565,6 +557,7 @@ fn main() {
             signal,
             call_id,
             call_config,
+            call_decline,
             send_file,
             fetch_attachment,
             save_attachment,
