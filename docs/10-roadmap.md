@@ -442,13 +442,15 @@ re-litigated:
   the five-native-UI plan, which was the single largest cost in the project and the main
   thing standing between here and calls. WebRTC supplies capture, echo cancellation, jitter
   buffering and codec negotiation. The FFI line survives — protocol logic stays in Rust.
-- **[ADR-009](adr/009-instance-side-unfurl.md): the instance unfurls links.** One adapter
-  set, a shared cache, and thumbnails, at the cost of the instance seeing URLs its users
-  send. **Recipients still fetch nothing** — that was always the important half.
+- **[ADR-009](adr/009-instance-side-unfurl.md): the instance unfurls links — superseded.**
+  Proposed here, then superseded before it was built: link previews stay sender-side, per
+  platform and off by default, so the instance never sees the URL. **Recipients still fetch
+  nothing** — that was always the important half.
 - **Calls may downgrade** (`12-realtime-media.md` §5), carrying their own badge and
   announcing the fallback, rather than refusing to connect.
 
-Both concessions are recorded in `01-threat-model.md` §3a. The tier model, franking, and the
+`01-threat-model.md` §3a records the client-architecture concession, and what link
+previews reveal now that ADR-009 is superseded. The tier model, franking, and the
 honesty rule are unchanged.
 
 **What this reorders.** Calls move from M6 to roughly M4; the native-client work that used to
@@ -470,12 +472,14 @@ embeds, voice. The feature scorecard in `08-feature-parity.md` is the target.
       message, so this lands on a known scaling gap. Deserves its own ADR.
 - [ ] **Video sending.** Table stakes against every product in `08-feature-parity.md`.
       Blocked on attachments; unrelated to embeds despite sharing the word.
-- [ ] **Authenticated embeds**, per `05-embeds.md`. **Text cards already ship** —
-      sender-side unfurl, card inside the encrypted body, server never sees the URL. What
-      remains here is the authenticated rung of the fallback chain (per-platform sessions),
-      the proxy rung with its privacy notice, per-platform opt-in, a DNS-resolving address
-      check, multi-media cards (Instagram carousels), and video — whose inline playback
-      requires re-hosting because Cairn cannot use an iframe player.
+- [ ] **Authenticated embeds**, per `05-embeds.md`. **Cards with thumbnails ship in the
+      desktop client and the CLI** — sender-side unfurl, oEmbed for YouTube/TikTok/X/Reddit,
+      a reel-shaped Instagram card, the thumbnail fetched and shrunk by the sender, all
+      inside the encrypted body; the server never sees the URL and recipients fetch nothing.
+      The Instagram proxy rung exists with its disclosure, off by default, but yields nothing
+      with an honest user-agent (`05-embeds.md`, Status). What remains is the authenticated
+      rung (per-platform sessions), multi-media cards (Instagram carousels), and video — whose inline playback requires
+      re-hosting because Cairn cannot use an iframe player.
 
 ---
 

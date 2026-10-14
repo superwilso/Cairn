@@ -284,6 +284,18 @@ impl Conversation {
         self.send_with(plaintext, Extras { reply_to: Some(reply_to), ..Extras::default() }, now_ms)
     }
 
+    /// A text message that may answer an earlier one and may carry a link card — the shape
+    /// a composer actually produces, since a reply can contain a link like anything else.
+    pub fn send_text(
+        &mut self,
+        plaintext: &[u8],
+        reply_to: Option<MessageRef>,
+        card: Option<crate::embed::Card>,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(plaintext, Extras { reply_to, card, ..Extras::default() }, now_ms)
+    }
+
     /// React to a message, or withdraw a reaction (`emoji: None`).
     ///
     /// The body is empty, like a signal's, so the franking commitment covers nothing a
@@ -492,7 +504,7 @@ impl Conversation {
                     }),
                     // Clamped again on receipt. These bytes came from the sender, so the
                     // limits are a defence against a hostile one, not tidiness.
-                    card: inner.card.map(crate::embed::Card::clamp),
+                    card: inner.card.map(crate::embed::Card::clamp).map(Box::new),
                     attachment: inner.attachment.map(Box::new),
                     signal: inner.signal.map(Box::new),
                     // A malformed reference makes this an ordinary message, not an error:
@@ -753,7 +765,10 @@ pub struct ReceivedMessage {
     /// **Everything in it was chosen by the sender.** A client renders it as a claim, keeps
     /// the URL visible, and derives no trust signal from its contents. It must not fetch
     /// anything to display it — see [`crate::embed`].
-    pub card: Option<crate::embed::Card>,
+    ///
+    /// Boxed for the same reason as `attachment`: a card now carries a thumbnail and an
+    /// author, and an unboxed one made every membership event pay for it.
+    pub card: Option<Box<crate::embed::Card>>,
     /// The sender's attachment, if they sent one. Fetch the blob and open it with the key
     /// inside; both came from the encrypted body, so the server supplied neither.
     ///

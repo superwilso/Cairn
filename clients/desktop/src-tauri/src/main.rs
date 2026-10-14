@@ -22,8 +22,8 @@ use std::sync::Mutex;
 use cairn_client_core::call::{self, CallSignal, IceServer};
 use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
-    Event, ImageSlot, MemberView, MessageView, ProfileEdit, ProfileLimits, ProfileView,
-    ReactionView, RoomSummary, Session,
+    Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
+    ProfileView, ReactionView, RoomSummary, Session,
 };
 use cairn_client_core::verify::SafetyView;
 use tauri::State;
@@ -116,23 +116,72 @@ fn open_room_tier(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.open_room_tier())
 }
 
-/// Returns the message as sent, so the sender sees it at once — polling never delivers a
-/// device's own messages back to it.
+/// Send a message, with a link card if it has a link and previews are on.
+///
+/// **Async, and the fetch runs with the session unlocked.** A synchronous command runs on
+/// the main thread, so a slow site would freeze the window for as long as it took; and
+/// holding the session lock across the fetch would stall polling the same way. So: decide
+/// under the lock, fetch with it released, and send under the lock again — `finish_send`
+/// refuses if the user switched rooms in between.
+///
+/// Returns the message as the timeline should show it, card included, because MLS never
+/// decrypts a device's own message back to it.
 #[tauri::command]
-fn send(state: State<'_, AppState>, text: String) -> CmdResult<MessageView> {
-    with(&state, |s| s.send(&text))
+async fn send(app: tauri::AppHandle, text: String) -> CmdResult<MessageView> {
+    off_main(move || send_with_preview(&app, &text, None)).await
 }
 
 /// Reply to a message on screen. The quote recipients see is resolved from their own
-/// transcripts; this sends only which message it answers.
+/// transcripts; this sends only which message it answers. A reply can carry a link card
+/// like any other message.
 #[tauri::command]
-fn reply(
-    state: State<'_, AppState>,
+async fn reply(
+    app: tauri::AppHandle,
     text: String,
     sender: String,
     id: String,
 ) -> CmdResult<MessageView> {
-    with(&state, |s| s.reply(&text, &sender, &id))
+    off_main(move || send_with_preview(&app, &text, Some((&sender, &id)))).await
+}
+
+fn send_with_preview(
+    app: &tauri::AppHandle,
+    text: &str,
+    reply: Option<(&str, &str)>,
+) -> CmdResult<MessageView> {
+    let mut pending = with_app(app, |s| s.begin_send(text, reply))?;
+    // The only network fetch a link card ever causes, and it is the sender's: the session
+    // lock is not held here.
+    pending.unfurl();
+    with_app(app, |s| s.finish_send(pending))
+}
+
+#[tauri::command]
+fn link_previews(state: State<'_, AppState>) -> CmdResult<LinkPreviewSettings> {
+    with(&state, |s| Ok(s.link_previews()))
+}
+
+#[tauri::command]
+fn set_link_previews(state: State<'_, AppState>, settings: LinkPreviewSettings) -> CmdResult<()> {
+    with(&state, |s| s.set_link_previews(settings))
+}
+
+/// The text the Instagram proxy setting must show before it can be switched on.
+#[tauri::command]
+fn instagram_proxy_disclosure() -> String {
+    format!(
+        "{} The proxy used is {}.",
+        cairn_client_core::embed::instagram::disclosure(),
+        cairn_client_core::embed::instagram::SUGGESTED_PROXY
+    )
+}
+
+/// Open a card's link in the system browser. The check is `embed::openable`'s, not this
+/// shell's: only a plain http(s) URL ever reaches the platform opener.
+#[tauri::command]
+fn open_link(url: String) -> CmdResult<()> {
+    let url = cairn_client_core::embed::openable(&url).ok_or("not a link that can be opened")?;
+    open::that_detached(url).map_err(|e| e.to_string())
 }
 
 /// React to a message, or withdraw this user's reaction with `emoji: null`. Returns every
@@ -536,6 +585,10 @@ fn main() {
             set_profile_image,
             clear_profile_image,
             fetch_profile_image,
+            link_previews,
+            set_link_previews,
+            instagram_proxy_disclosure,
+            open_link,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

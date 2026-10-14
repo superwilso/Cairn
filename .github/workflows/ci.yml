@@ -131,6 +131,10 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/profile.browser.test.js
+      - name: Link cards render safely in a browser
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/linkcards.browser.test.js
 
   lint:
     name: fmt + clippy

@@ -349,6 +349,7 @@ impl Session {
             id: Some(outbound.commitment.to_hex()),
             reply_to: None,
             reaction: None,
+            card: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         // Into the thread too, so the sender can be replied to or reacted to about it.
