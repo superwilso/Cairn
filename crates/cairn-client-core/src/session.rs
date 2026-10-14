@@ -192,6 +192,10 @@ pub struct MessageView {
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
+///
+/// The size lint is allowed: events live for one poll on their way to being serialised, and
+/// most of them are messages, so boxing the large variant would allocate for the common case.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {

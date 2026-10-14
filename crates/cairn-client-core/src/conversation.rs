@@ -706,6 +706,11 @@ pub(crate) fn is_emoji_like(s: &str) -> bool {
 /// what let an added member be invisible: MLS applies the commit either way, so the
 /// difference between a wiretap and a normal handshake existed only in a value the old
 /// signature had no room for.
+///
+/// The size lint is allowed rather than satisfied by boxing the message: one of these exists
+/// per envelope for the length of a `match`, never in bulk, and nearly every one *is* a
+/// message — boxing would allocate for the common case to save stack in the rare one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum TimelineEvent {
     /// Content to display.
