@@ -22,6 +22,7 @@ pub mod contacts;
 pub mod conversation;
 pub mod embed;
 pub mod history;
+pub mod profile;
 #[cfg(feature = "http")]
 pub mod session;
 pub mod statedir;
