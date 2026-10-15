@@ -138,6 +138,17 @@ if command -v node >/dev/null 2>&1; then
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/settings.browser.test.js
+
+        # Custom emoji: drawn from the local cache by id, never fetched at render time. And
+        # the soundboard, mixed into a real call's microphone track and heard at the far end.
+        run "desktop custom emoji in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/emoji.browser.test.js
+        run "desktop soundboard in a real call" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/soundboard.browser.test.js
     fi
 else
     printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'

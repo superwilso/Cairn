@@ -134,7 +134,7 @@ const CairnCall = (() => {
         };
         peers.set(user, entry);
 
-        const audio = local && local.getAudioTracks()[0];
+        const audio = outgoingAudio();
         if (audio) entry.audioSender = pc.addTrack(audio, local);
 
         // The empty video line described at the top of this file — but **only on the side
@@ -408,6 +408,7 @@ const CairnCall = (() => {
     }
 
     function stopTracks() {
+        closeMixer();
         for (const s of [local, screen]) if (s) s.getTracks().forEach((t) => t.stop());
         local = null;
         screen = null;
@@ -510,8 +511,12 @@ const CairnCall = (() => {
         if (!local) return;
         const fresh = await navigator.mediaDevices.getUserMedia({ audio: micConstraint(), video: false });
         const track = fresh.getAudioTracks()[0];
-        for (const entry of peers.values()) {
-            if (entry.audioSender) await entry.audioSender.replaceTrack(track);
+        // While the soundboard mixer is running the senders carry its output, not the mic;
+        // the new mic is fed into the mixer instead.
+        if (!remix(track)) {
+            for (const entry of peers.values()) {
+                if (entry.audioSender) await entry.audioSender.replaceTrack(track);
+            }
         }
         local.getAudioTracks().forEach((t) => { t.stop(); local.removeTrack(t); });
         local.addTrack(track);
@@ -533,11 +538,70 @@ const CairnCall = (() => {
 
     const shortId = (id) => String(id).replace(/^usr_/, "").slice(0, 8);
 
+    // ---- soundboard hook ---------------------------------------------------
+    //
+    // soundboard.js's only way in. A clip is **mixed into the outgoing microphone track**
+    // rather than announced with a "play X" message: an announcement would cross the instance
+    // (encrypted, but timed), while the mix is just more audio on a peer-to-peer track the
+    // instance never carries. The cost, stated in docs/13-customisation.md: a listener hears
+    // a clip as part of the sender's voice, so cannot turn it down separately.
+    //
+    // The mixer is built on first use and lives until the call ends. From then on every
+    // audio sender carries `mic + clips` from a MediaStreamAudioDestinationNode; muting still
+    // works, because a disabled mic track feeds the mixer silence.
+    let mixer = null;          // { ctx, dest, mic, track }
+
+    function outgoingAudio() {
+        return mixer ? mixer.track : (local && local.getAudioTracks()[0]) || null;
+    }
+
+    // Point the mixer's mic input at `track`. False when there is no mixer.
+    function remix(track) {
+        if (!mixer) return false;
+        try { mixer.mic.disconnect(); } catch (_) {}
+        mixer.mic = mixer.ctx.createMediaStreamSource(new MediaStream([track]));
+        mixer.mic.connect(mixer.dest);
+        return true;
+    }
+
+    async function mixIntoMic(buffer, { gain = 1, maxSeconds = 5 } = {}) {
+        if (!local || !callId) throw new Error("not in a call");
+        const mic = local.getAudioTracks()[0];
+        if (!mic || !mic.enabled) throw new Error("unmute to play a sound");
+        if (!mixer) {
+            const ctx = new AudioContext();
+            const dest = ctx.createMediaStreamDestination();
+            mixer = { ctx, dest, mic: null, track: dest.stream.getAudioTracks()[0] };
+            remix(mic);
+            for (const entry of peers.values()) {
+                if (entry.audioSender) await entry.audioSender.replaceTrack(mixer.track);
+            }
+        }
+        if (mixer.ctx.state === "suspended") await mixer.ctx.resume();
+        const clip = mixer.ctx.createBufferSource();
+        clip.buffer = buffer;
+        const level = mixer.ctx.createGain();
+        level.gain.value = Math.max(0, Math.min(1, gain));
+        clip.connect(level).connect(mixer.dest);
+        // Cut at the limit whatever the file claims: the one length check a sender cannot
+        // talk around, since it runs here, on the device doing the playing.
+        clip.start();
+        clip.stop(mixer.ctx.currentTime + Math.min(buffer.duration, maxSeconds));
+        return clip;
+    }
+
+    function closeMixer() {
+        if (!mixer) return;
+        try { mixer.ctx.close(); } catch (_) {}
+        mixer = null;
+    }
+
     return {
         loadConfig, devices, join, leave, handle, resetMic,
         setMuted, setDeafened, setPushToTalk, setTalking, setPrefs, setCameraOn,
         startScreenShare, stopScreenShare,
         useMicrophone, useCamera, useSpeaker, applySpeaker, canChooseSpeaker,
+        mixIntoMic,
         get callId() { return callId; },
         get local() { return local; },
         get transmitting() { return !!local && local.getAudioTracks().some((t) => t.enabled); },

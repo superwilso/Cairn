@@ -1,8 +1,9 @@
 # Customisation, and why most of Nitro is free here
 
 **Status:** Design. **Profiles are built** (§1a, [ADR-010](adr/010-encrypted-profiles.md)),
-and §4's themes and §5's protection are built in the desktop client
-(`clients/desktop/ui/settings.js`); custom emoji, plugins and the rest are not.
+**custom emoji, stickers and the soundboard are built** (§3a) and §4's themes and §5's
+protection are built in the desktop client (`clients/desktop/ui/settings.js`); a user's
+personal emoji, plugins and the rest are not.
 
 The question this answers: can Cairn match Discord's customisation, and give away what Nitro
 charges for? Mostly yes — and the reason is not generosity. **Most of Nitro is artificial
@@ -119,6 +120,76 @@ Consequences worth stating before anyone builds it:
   since DMs are the tier where the claim is strongest.
 - Attachments are the prerequisite either way, so this sits behind
   [ADR-007](adr/007-server-storage.md)'s successor work.
+
+## 3a. As built: room emoji, stickers and soundboard
+
+The fix above, implemented (`cairn_client_core::custom`, `session/custom.rs`; desktop
+`emoji.js`, `customise.js`, `soundboard.js`).
+
+- **A room's set is one record inside the MLS-encrypted stream**, like a profile. Each image
+  or clip is an encrypted attachment in the room's blob store under its own single-use key,
+  the key inside the record. The instance stores ciphertext and relays ciphertext; it never
+  sees a name, a type or an image (`the_instance_stores_no_emoji_name_or_image_in_plaintext`).
+- **Fetched whole, when it changes.** A device that accepts a new set downloads every asset
+  it lacks at once, used or not. Drawing a custom emoji, a reaction, a sticker or the picker
+  reads the local cache by the id the set gave it; that path has no network call in it
+  (`drawing_a_custom_emoji_makes_no_request`, through a request-counting proxy; the browser
+  test counts one read per image however many messages use it). An emoji not yet downloaded
+  is shown as its `:name:`, never fetched on demand.
+- **Messages refer by name.** `:party_parrot:` in text is ordinary text, encrypted like the
+  rest. A reaction may be `:name:` — the only ASCII reaction allowed — and one outside the
+  room's set is drawn as a placeholder, not words. A sticker is a message whose franked body
+  is `:name:`, so it stays reportable and older clients show the name.
+- **Limits** — every member downloads all of it, so: 100 emoji at 256 KiB, 40 stickers at
+  512 KiB, 24 sounds at 512 KiB and five seconds, 16 MiB for the whole set. PNG, GIF and WebP
+  images; Ogg/Opus, MP3 and WAV clips. Names are `[a-z0-9_]`, 2–32 characters, so a name
+  cannot be a lookalike. Types are sniffed from the bytes, before upload and again after
+  every download. Clip length is measured by Rust for WAV and Ogg and by the uploading UI for
+  MP3, and every client stops a clip at five seconds whatever the file says.
+- **Who may change it.** Only an account the **instance's member list** names as `owner` or
+  `moderator`; every recipient checks the envelope's sender (already verified against the
+  group's roster) against that list, because the instance cannot read the set to refuse it.
+  Roles are read when a room opens and then every ten seconds, never because a set arrived —
+  a request triggered by a set would mark which message was one. A set from a sender not yet
+  known to be permitted is held until the next read of roles and then applied or dropped,
+  so a set a plain member sent cannot come into force later on an unrelated promotion. The
+  probe: a member whose client was told (by a lying proxy) that it was the owner sent a set;
+  every other member ignored it (`a_plain_members_set_is_ignored_by_everyone_else`, which
+  fails with the check removed).
+- **A new member gets the set** from any owner or moderator device that holds it, re-sent
+  after the commit that added them — the uploaded blobs are reused, not uploaded again.
+
+What this costs, plainly:
+
+- **Roles are the instance's word.** They are instance state, not part of the encrypted
+  group, so **a malicious instance (A4) can let a member of its choosing change a room's
+  set**, by listing them as a moderator. It cannot write a set itself, read one, or learn a
+  name. Binding roles into the group is a `cairn-crypto` change, left for the owner.
+- **A demotion takes up to ten seconds** to reach a device with the room open, during which
+  a set from the demoted account is still accepted.
+- **The instance learns that the set changed** — a message, uploads, and every member
+  downloading those blobs shortly after. Not what changed, and nothing when one is used.
+- **A room with no owner or moderator online** cannot give a new member its set until one
+  opens the room. Members cannot pass it on, because the record names no author they could
+  vouch for.
+- **A user's personal emoji in a DM** (the third consequence above) is not built.
+
+### The soundboard
+
+A clip is **mixed into the outgoing microphone track** (`CairnCall.mixIntoMic`, a
+`MediaStreamAudioDestinationNode` carrying mic + clip), and played locally. There is no
+"play X" message: it would cross the instance — encrypted, but timed — whereas the mix is
+just audio on a peer-to-peer track the instance never carries. A two-browser test measures
+the tone at the listener and checks that no signal was sent. Muting still mutes, and a muted
+participant cannot play a clip.
+
+The cost of mixing, stated where the controls are: **a listener hears a clip as part of the
+sender's voice.** The soundboard's volume is therefore the *sender's* — how loud your clips
+are for everyone — and "soundboard off" stops this device playing clips; neither can turn
+down or silence clips other people mix into their own microphones, short of turning those
+people down. Per-listener control would need each clip on its own track, which costs a
+negotiated transceiver per peer in the mesh. **Open for the owner:** whether that is worth
+it.
 
 ## 4. Themes yes, plugins are a different question
 

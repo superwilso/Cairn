@@ -43,7 +43,8 @@ Discord is the benchmark; nobody else is close.
 | Voice channels (drop-in) | ✅ | ❌ | ❌ | ❌ | ⚠️ voice chats | 🎯 v2 |
 | Screen share | ✅ | ⚠️ in call | ⚠️ in call | ❌ | ✅ | 🎯 v2 |
 | Stage / broadcast | ✅ | ❌ | ❌ | ⚠️ Live | ✅ | 🎯 v3 |
-| Custom emoji / stickers | ✅ | ⚠️ stickers | ⚠️ stickers | ⚠️ | ✅ | 🎯 v1 |
+| Custom emoji / stickers | ✅ | ⚠️ stickers | ⚠️ stickers | ⚠️ | ✅ | ✅ desktop — per room, set distributed up front **inside the encrypted stream**, drawn from a local cache |
+| Soundboard | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ desktop — clips mixed into the caller's microphone; nothing announced |
 | Profiles (bio, banner, status, nicknames) | ✅ server-side | ⚠️ name + avatar, encrypted | ⚠️ server-side | ✅ server-side | ✅ server-side | ✅ **end to end**, per room |
 | Bots & app platform | ✅ | ❌ | ⚠️ Business API | ❌ | ✅ | 🎯 v2 |
 | Server discovery | ✅ | ❌ | ❌ | ❌ | ✅ | 🎯 v2 |
@@ -63,7 +64,11 @@ instance you run yourself there is nothing to remove. Designed in
 [`13-customisation.md`](13-customisation.md), including the two places "free" is not free
 (uploads and streaming cost the operator real money) and the one that is genuinely different
 under E2EE: a custom emoji fetched at render time tells the server which emoji you used and
-when, leaking content it could not otherwise read.
+when, leaking content it could not otherwise read. **Built that way round** (§3a there): a
+room's emoji, stickers and sounds travel as one encrypted set, every member downloads all of
+it when it changes, and drawing one makes no request. Who may change a set is checked by
+every recipient against the instance's role list — so a malicious instance can grant that
+right to a member, though it cannot write a set itself.
 
 **Bots are not optional.** They are much of why Discord communities stay on Discord. A bot
 in an E2EE room is a group member holding keys — an A6 adversary with a friendly name

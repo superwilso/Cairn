@@ -52,7 +52,14 @@ const CairnMessages = (() => {
         content.className = "content";
         if (m.reply_to) content.append(quote(m.reply_to));
         let body;
-        if (m.attachment) {
+        const emoji = typeof CairnEmoji !== "undefined" ? CairnEmoji : null;
+        if (m.sticker && emoji) {
+            // Drawn from this device's copy of the room's set. The body is `:name:`, shown
+            // instead until the set arrives — never fetched by name.
+            body = emoji.renderSticker(m.sticker, m.body);
+            body.classList.add("body");
+            li.classList.add("with-sticker");
+        } else if (m.attachment) {
             // The body of an attachment message is its filename, for clients that cannot show
             // the attachment; the attachment's own caption already says it.
             body = CairnAttach.render(m.attachment);
@@ -62,7 +69,14 @@ const CairnMessages = (() => {
             body.className = "body";
             // textContent, never innerHTML: a message body is attacker-controlled text and
             // this is the one line standing between that and script execution in the client.
-            body.textContent = m.body;
+            // emoji.js builds text nodes too, with `:name:` drawn from the local cache.
+            if (emoji) {
+                const frag = emoji.renderText(m.body);
+                if (frag.jumbo) body.classList.add("ce-jumbo");
+                body.append(frag);
+            } else {
+                body.textContent = m.body;
+            }
         }
         const reactions = document.createElement("div");
         reactions.className = "reactions";
@@ -162,7 +176,10 @@ const CairnMessages = (() => {
             chip.type = "button";
             const mine = r.by.includes(me);
             chip.className = "chip" + (mine ? " mine" : "");
-            chip.textContent = r.emoji + (r.by.length > 1 ? " " + r.by.length : "");
+            // A room emoji is drawn from the local cache; anything else is text.
+            if (typeof CairnEmoji !== "undefined") chip.append(CairnEmoji.chip(r.emoji));
+            else chip.append(document.createTextNode(r.emoji));
+            if (r.by.length > 1) chip.append(document.createTextNode(" " + r.by.length));
             chip.title = r.by.map((u) => (u === me ? "you" : hooks.short(u))).join(", ") +
                 (mine ? " — click to remove yours" : "");
             // Clicking your own chip takes it back; clicking someone else's adds the same.
@@ -209,6 +226,25 @@ const CairnMessages = (() => {
             });
             el.append(b);
         }
+        // Everything else — the full set, search, and the room's own emoji — is emoji.js's.
+        if (typeof CairnEmoji !== "undefined") {
+            const more = document.createElement("button");
+            more.type = "button";
+            more.className = "more";
+            more.textContent = "+";
+            more.title = "More emoji";
+            more.setAttribute("aria-label", "More emoji");
+            more.setAttribute("role", "menuitem");
+            more.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const li = el.target;
+                const anchor = el.anchor;
+                closePicker();
+                if (!li) return;
+                CairnEmoji.open({ anchor: anchor || li, onPick: (emoji) => react(li, emoji) });
+            });
+            el.append(more);
+        }
         document.body.append(el);
         document.addEventListener("click", (e) => {
             if (!el.hidden && !el.contains(e.target)) closePicker();
@@ -219,6 +255,7 @@ const CairnMessages = (() => {
     function openPicker(li, anchor) {
         const el = picker();
         el.target = li;
+        el.anchor = anchor;
         el.hidden = false;
         const a = anchor.getBoundingClientRect();
         const w = el.offsetWidth;
