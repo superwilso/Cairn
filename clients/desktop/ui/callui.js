@@ -31,6 +31,9 @@ const CairnCallUi = (() => {
 
     // Call state this file draws.
     let ringing = null;       // { call, from, timer }
+    // Calls already declined or missed here. In a group, every newcomer announces itself to
+    // the room, and without this each arrival would ring again someone who already said no.
+    const quiet = new Set();
     let muted = false;
     let deafened = false;
     let config = null;        // CallConfig for the call in progress
@@ -170,6 +173,7 @@ const CairnCallUi = (() => {
     function ring(from, signal) {
         if (signal.kind === "join") {
             if (ringing && ringing.call === signal.call) return;
+            if (quiet.has(signal.call)) return;
             stopRinging();
             const direct = !!(CairnCall.config && CairnCall.config.direct);
             ringing = { call: signal.call, from, timer: setTimeout(() => missed(from), RING_MS) };
@@ -209,6 +213,7 @@ const CairnCallUi = (() => {
     // Not answered: the caller gave up, or the ring ran out. Left in the timeline with a way
     // to call back, which is the reason a missed call is worth showing at all.
     function missed(from) {
+        if (ringing) quiet.add(ringing.call);
         stopRinging();
         const li = hooks.addNotice("Missed call from " + label(from));
         if (li) {
@@ -231,6 +236,7 @@ const CairnCallUi = (() => {
 
     async function decline() {
         const from = ringing && ringing.from;
+        if (ringing) quiet.add(ringing.call);
         stopRinging();
         try { await hooks.invoke("call_decline"); } catch (e) { hooks.addNotice("Could not decline: " + e); return; }
         if (from) hooks.addNotice("You declined a call from " + label(from) + ".");

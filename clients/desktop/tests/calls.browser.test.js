@@ -509,7 +509,7 @@ test("calls in the real UI", { skip }, async (t) => {
                 await b.waitForTimeout(600);
                 await shot(b, theme + "-in-call");
                 await b.click("#open-settings");
-                await b.$eval("#prefs-voice", (p) => p.scrollIntoView());
+                await b.$eval("#prefs-voice", (p) => p.closest(".set-section").scrollIntoView());
                 await shot(b, theme + "-settings-voice");
                 assert.deepStrictEqual(a.errors, []);
                 assert.deepStrictEqual(b.errors, []);
