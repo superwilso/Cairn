@@ -350,6 +350,7 @@ impl Session {
             reply_to: None,
             reaction: None,
             card: None,
+            sticker: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         // Into the thread too, so the sender can be replied to or reacted to about it.

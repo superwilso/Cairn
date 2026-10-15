@@ -415,6 +415,7 @@ impl App {
                 reply_to: None,
                 reaction: None,
                 card: None,
+                sticker: None,
             },
         );
     }
@@ -1044,6 +1045,14 @@ impl App {
                         short(&message.envelope.sender.as_uuid().to_string())
                     );
                 }
+                // The same for a room's custom emoji set: the CLI cannot draw one, and does not
+                // check whether the sender may change it, so it applies nothing.
+                Ok(TimelineEvent::Message(received)) if received.custom_set.is_some() => {
+                    println!(
+                        "\n  {} sent the room's custom emoji (not shown here)",
+                        short(&message.envelope.sender.as_uuid().to_string())
+                    );
+                }
                 Ok(TimelineEvent::Message(received)) => {
                     println!(
                         "\n  [{}] {}: {}",
@@ -1068,6 +1077,7 @@ impl App {
                             reply_to: None,
                             reaction: None,
                             card: received.card.as_deref().cloned(),
+                            sticker: received.sticker.clone(),
                         },
                     );
                     if let Some(attachment) = &received.attachment {

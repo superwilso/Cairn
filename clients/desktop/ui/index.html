@@ -13,6 +13,8 @@
 <link rel="stylesheet" href="linkcards.css">
 <link rel="stylesheet" href="settings.css">
 <link rel="stylesheet" href="calls.css">
+<link rel="stylesheet" href="emoji.css">
+<link rel="stylesheet" href="soundboard.css">
 <!-- In <head> on purpose: applies the saved theme before first paint. -->
 <script src="settings.js"></script>
 </head>
@@ -82,6 +84,9 @@
     </symbol>
     <symbol id="i-volume-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>
+    </symbol>
+    <symbol id="i-sound" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 9.5h3l5-4v13l-5-4H4zM16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/>
     </symbol>
     <symbol id="i-call" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <path d="M4.5 4.5h3l1.5 4-2 1.5a12 12 0 0 0 5.5 5.5l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A15.5 15.5 0 0 1 2.5 6.7 2 2 0 0 1 4.5 4.5Z"/>
@@ -157,6 +162,9 @@
         <select id="room-timer" aria-label="Disappearing messages"></select>
       </label>
       <button id="invite" class="ghost">Invite</button>
+      <!-- The room's emoji, stickers and sounds. Anyone can look; customise.js draws the
+           controls only for an owner or moderator, and every member's device checks. -->
+      <button id="customise-btn" class="ghost" title="Custom emoji, stickers and sounds">Customise</button>
       <button id="start-voice" class="icon" title="Voice call">
         <svg width="15" height="15"><use href="#i-call"/></svg> Voice
       </button>
@@ -250,6 +258,9 @@
       <input id="file-input" type="file" multiple hidden>
       <button id="gif" type="button" class="icon" title="Send a GIF" aria-label="Send a GIF">GIF</button>
       <input id="text" placeholder="Message" autocomplete="off" spellcheck="false">
+      <button id="emoji" type="button" class="icon" title="Emoji and stickers" aria-label="Emoji and stickers">
+        <svg width="15" height="15"><use href="#i-react"/></svg>
+      </button>
       <button id="voice" type="button" class="icon" title="Hold to record a voice note, or click to start" aria-label="Record a voice note" aria-pressed="false">
         <svg width="15" height="15"><use href="#i-mic"/></svg>
       </button>
@@ -372,6 +383,9 @@
 <script src="gifs.js"></script>
 <script src="timer.js"></script>
 <script src="linkcards.js"></script>
+<script src="emoji.js"></script>
+<script src="customise.js"></script>
+<script src="soundboard.js"></script>
 <script src="messages.js"></script>
 <script src="profile.js"></script>
 <script src="app.js"></script>

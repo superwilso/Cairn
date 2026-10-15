@@ -148,6 +148,17 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/settings.browser.test.js
+      - name: Custom emoji, stickers and the picker in a browser
+        # A room's images are read from the local cache by id, once each, before any
+        # message uses them -- never fetched at render time (docs/13-customisation.md s3).
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/emoji.browser.test.js
+      - name: A soundboard clip crosses a real call
+        # Mixed into the microphone track and measured at the listener; no signal sent.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/soundboard.browser.test.js
 
   lint:
     name: fmt + clippy
