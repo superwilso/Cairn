@@ -180,6 +180,15 @@ holds.
 - **Deny service, drop, delay, or reorder messages.** Fully available to the server, and
   not preventable. Detectable via transcript integrity.
 - **Harvest all metadata.** See §3.1.
+- **Fabricate roles and moderators.** A space's roles, who holds them, and every permission
+  they confer are held and enforced by the instance on its own say-so
+  ([ADR-011](adr/011-spaces-channels-roles.md)). A malicious instance can make anyone a
+  moderator or an owner, invent roles, report a fabricated hierarchy to every client, and
+  honour or refuse any request regardless of the rules; no client can detect it. What it
+  cannot do with a fabricated role is read an end-to-end encrypted channel: the MLS group
+  gains a member only when an existing member's client commits the Add, as an explicit
+  action. **This stays true by the owner's decision until the M5 external review**, where
+  carrying roles inside the MLS group is on the agenda (`10-roadmap.md`).
 - **Serve backdoored client code** to web clients. This is why native and
   reproducibly-built clients matter, and why a web client's guarantees are weaker. Say so
   in the UI.
@@ -264,6 +273,20 @@ none could never be moderated again.
 What this class still permits: a removed account can be re-added by any moderator, and
 there is no instance-wide ban. Removal is a room-scoped action, not a platform one, until
 policy lists exist.
+
+**Spaces** ([ADR-011](adr/011-spaces-channels-roles.md)) put channels — each a room with its
+own sealed tier — under roles with permission bits and per-channel overrides. Against *other
+users* the rules are enforced by the instance in one access check, and were attacked before
+being trusted: a non-member reading a channel, a member creating a channel or handing out a
+role without the permission, escalation to or past one's own rank, a kicked member keeping
+access, and a channel's tier being changed. All were refused, in-process and over HTTP. A kick
+also bars rejoining by invite until lifted, because without the bar any live link undid it.
+
+Two limits, stated rather than implied. **Roles are instance-held metadata**, so against the
+instance itself (§4) they are worth nothing. And **a kick removes access, not keys**: a kicked
+device still holds each encrypted channel's group state until a member commits its removal
+(`remove_departed`, an explicit action), so until then the kick holds against everyone except
+the instance, which is the only party holding the ciphertext.
 
 ## 5. The malicious group member (A6)
 

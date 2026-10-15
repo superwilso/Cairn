@@ -254,10 +254,10 @@ impl<T: Transport> Client<T> {
 
     /// Headers proving this device authorized `action` against `resource`.
     ///
-    /// Private. There is no way for a caller to obtain these for an action or resource
+    /// Crate-private. There is no way for a frontend to obtain these for an action or resource
     /// other than the one the request actually performs, which is the property that stops
     /// a signature being reused against a different target.
-    fn auth(
+    pub(crate) fn auth(
         &self,
         action: &str,
         resource: Option<ResourceRef>,
@@ -272,7 +272,7 @@ impl<T: Transport> Client<T> {
         ])
     }
 
-    fn call(
+    pub(crate) fn call(
         &self,
         method: &str,
         path: &str,

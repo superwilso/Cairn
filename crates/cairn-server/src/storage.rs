@@ -43,11 +43,11 @@ use redb::{Database, Error as RedbError, ReadableTable, ReadableTableMetadata, T
 use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::ServerFrankingKey;
-use cairn_proto::{BlobId, DeviceId, RoomId, UserId, Username};
+use cairn_proto::{BlobId, DeviceId, RoomId, SpaceId, UserId, Username};
 
 use crate::state::{
     AccountRecord, BlobRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room,
-    RoomInviteRecord, StoredMessage,
+    RoomInviteRecord, Space, SpaceInviteRecord, StoredMessage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +114,11 @@ const KEY_PACKAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("key_pac
 const USERNAMES: TableDefinition<&str, &[u8]> = TableDefinition::new("usernames");
 /// Room invites, keyed by the **hash** of the token. The token itself is never stored.
 const ROOM_INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("room_invites");
+/// Spaces: roles, members, channels and overrides, one row per space. Plaintext metadata the
+/// instance needs in order to enforce anything; see ADR-011.
+const SPACES: TableDefinition<&str, &[u8]> = TableDefinition::new("spaces");
+/// Space invites, keyed by the **hash** of the token, as room invites are.
+const SPACE_INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("space_invites");
 /// Keyed by `(room id, server_seq)` so a room's messages are contiguous and a fetch after
 /// a cursor is a range scan rather than a filter over everything.
 const MESSAGES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("messages");
@@ -132,7 +137,7 @@ const BLOB_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_byte
 /// here produces a backup that restores *almost* everything, which is worse than one that
 /// fails, because the loss is only discovered after the restore.
 /// `every_table_is_included_in_a_backup` guards this.
-const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 10] = [
+const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 12] = [
     META,
     ROOMS,
     ACCOUNTS,
@@ -141,6 +146,8 @@ const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 10] = [
     KEY_PACKAGES,
     USERNAMES,
     ROOM_INVITES,
+    SPACES,
+    SPACE_INVITES,
     BLOB_META,
     BLOB_BYTES,
 ];
@@ -165,6 +172,8 @@ pub struct Directory {
     pub key_packages: Vec<(DeviceId, VecDeque<String>)>,
     pub usernames: Vec<(Username, UserId)>,
     pub room_invites: Vec<(String, RoomInviteRecord)>,
+    pub spaces: Vec<(SpaceId, Space)>,
+    pub space_invites: Vec<(String, SpaceInviteRecord)>,
     pub registration_policy: RegistrationPolicy,
 }
 
@@ -184,6 +193,9 @@ pub enum Write {
     Username(Username, UserId),
     /// Keyed by token hash, not the token.
     RoomInvite(String, RoomInviteRecord),
+    Space(SpaceId, Space),
+    /// Keyed by token hash, not the token.
+    SpaceInvite(String, SpaceInviteRecord),
     Message(RoomId, StoredMessage),
     /// Remove a message. Used by the disappearing-message purge, which must actually
     /// delete rather than hide: a message still on disk has not disappeared.
@@ -472,6 +484,16 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                 t.insert(hash.as_str(), serde_json::to_vec(record)?.as_slice())
                     .map_err(RedbError::from)?;
             }
+            Write::Space(id, space) => {
+                let mut t = tx.open_table(SPACES).map_err(RedbError::from)?;
+                t.insert(id.to_string().as_str(), serde_json::to_vec(space)?.as_slice())
+                    .map_err(RedbError::from)?;
+            }
+            Write::SpaceInvite(hash, record) => {
+                let mut t = tx.open_table(SPACE_INVITES).map_err(RedbError::from)?;
+                t.insert(hash.as_str(), serde_json::to_vec(record)?.as_slice())
+                    .map_err(RedbError::from)?;
+            }
             Write::Policy(policy) => {
                 let mut t = tx.open_table(META).map_err(RedbError::from)?;
                 t.insert("registration_policy", serde_json::to_vec(policy)?.as_slice())
@@ -592,6 +614,8 @@ impl Storage for DbStorage {
         read_all!(KEY_PACKAGES, dir.key_packages, |s: &str| s.parse::<DeviceId>().ok());
         read_all!(USERNAMES, dir.usernames, |s: &str| Username::parse(s).ok());
         read_all!(ROOM_INVITES, dir.room_invites, |s: &str| Some(s.to_string()));
+        read_all!(SPACES, dir.spaces, |s: &str| s.parse::<SpaceId>().ok());
+        read_all!(SPACE_INVITES, dir.space_invites, |s: &str| Some(s.to_string()));
 
         if let Ok(meta) = tx.open_table(META) {
             if let Some(v) = meta.get("registration_policy").map_err(RedbError::from)? {
@@ -688,6 +712,8 @@ impl Storage for MemoryStorage {
             key_packages: inner.directory.key_packages.clone(),
             usernames: inner.directory.usernames.clone(),
             room_invites: inner.directory.room_invites.clone(),
+            spaces: inner.directory.spaces.clone(),
+            space_invites: inner.directory.space_invites.clone(),
             registration_policy: inner.directory.registration_policy,
         })
     }
@@ -706,6 +732,10 @@ impl Storage for MemoryStorage {
                 Write::Username(n, u) => upsert(&mut inner.directory.usernames, n.clone(), *u),
                 Write::RoomInvite(h, r) => {
                     upsert(&mut inner.directory.room_invites, h.clone(), r.clone())
+                }
+                Write::Space(id, sp) => upsert(&mut inner.directory.spaces, *id, sp.clone()),
+                Write::SpaceInvite(h, r) => {
+                    upsert(&mut inner.directory.space_invites, h.clone(), r.clone())
                 }
                 Write::Policy(p) => inner.directory.registration_policy = *p,
                 Write::Message(room, m) => inner.messages.push((*room, m.clone())),
@@ -941,6 +971,17 @@ mod tests {
                     "hash".into(),
                     RoomInviteRecord {
                         room: room_id,
+                        created_by: user,
+                        uses_remaining: 1,
+                        expires_at_ms: None,
+                        revoked: false,
+                    },
+                ),
+                Write::Space(SpaceId::new(), crate::state::Space::for_test(user)),
+                Write::SpaceInvite(
+                    "space-hash".into(),
+                    SpaceInviteRecord {
+                        space: SpaceId::new(),
                         created_by: user,
                         uses_remaining: 1,
                         expires_at_ms: None,

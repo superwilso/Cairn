@@ -18,6 +18,7 @@
 pub mod envelope;
 pub mod identity;
 pub mod ids;
+pub mod space;
 pub mod tier;
 pub mod username;
 
@@ -25,7 +26,8 @@ pub use envelope::{
     device_authorization_bytes, request_signing_bytes, Envelope, EnvelopePayload, ResourceRef,
 };
 pub use identity::{DeviceIdentity, IdentityError};
-pub use ids::{BlobId, DeviceId, InstanceId, MessageId, RoomId, UserId};
+pub use ids::{BlobId, DeviceId, InstanceId, MessageId, RoleId, RoomId, SpaceId, UserId};
+pub use space::{space_action, Permissions};
 pub use tier::{derive_tier, RoomSeal, RoomShape, ShapeError, Tier};
 pub use username::{Username, UsernameError, MAX_USERNAME_LEN, MIN_USERNAME_LEN};
 

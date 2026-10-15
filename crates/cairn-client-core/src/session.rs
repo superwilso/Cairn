@@ -54,8 +54,12 @@ pub use attachments::{
     PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
 };
 mod profiles;
+mod spaces;
 pub use crate::profile::{ImageSlot, ImageView, ProfileView, StatusView};
 pub use profiles::{profile_limits, PendingProfileImage, ProfileEdit, ProfileLimits};
+pub use spaces::{
+    ChannelDisplay, OverrideDisplay, RoleDisplay, SpaceDisplay, SpaceListing, SpaceMemberDisplay,
+};
 
 use crate::profile::{Label, ProfileError, ProfileStore, ProfileStoreError};
 use std::collections::HashMap;
@@ -455,19 +459,27 @@ impl Session {
 
     fn create_room(&mut self, shape: RoomShape) -> Result<String, SessionError> {
         let created = self.client.create_room(shape)?;
+        self.start_group(created.room, created.seal)
+    }
+
+    /// Found the encrypted group for a room this device just created, and open it.
+    ///
+    /// Shared by rooms and channels: a channel is a room, and its group starts the same way —
+    /// with only this device in it, everyone else waiting to be admitted.
+    fn start_group(&mut self, room: RoomId, seal: RoomSeal) -> Result<String, SessionError> {
         let convo = Conversation::create_encrypted(
-            created.seal,
-            created.room,
+            seal,
+            room,
             self.client.user(),
             self.client.device(),
             self.mls.clone(),
         )?;
-        self.index.record(created.room, &created.seal, convo.group_id())?;
-        let cursor = self.index.cursor(&created.room);
+        self.index.record(room, &seal, convo.group_id())?;
+        let cursor = self.index.cursor(&room);
         // A room is created without a timer; nobody has had the chance to set one.
         let mut open = OpenRoom {
             convo,
-            seal: created.seal,
+            seal,
             cursor,
             ttl: None,
             ttl_checked_ms: now_ms(),
@@ -480,13 +492,15 @@ impl Session {
         // Found by a probe: without this, creating a room left the previous room's
         // attachments fetchable from the new one.
         self.attachments.clear();
-        Ok(created.room.to_string())
+        Ok(room.to_string())
     }
 
-    /// Every room this device knows about.
+    /// Every DM and group this device knows about. Channels are listed by
+    /// [`Session::space`], under their space.
     pub fn rooms(&self) -> Vec<RoomSummary> {
         self.index
             .rooms()
+            .filter(|(_, record)| record.space.is_none())
             .map(|(room, record)| RoomSummary {
                 id: room.to_string(),
                 tier: record.tier.label().to_string(),

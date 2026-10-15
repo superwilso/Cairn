@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use cairn_crypto::franking::{Commitment, Context as FrankingContext, ServerFrankingKey, Tag};
 use cairn_crypto::TranscriptReport;
 use cairn_proto::{
-    BlobId, DeviceId, Envelope, RoomId, RoomSeal, RoomShape, ShapeError, UserId, Username,
+    BlobId, DeviceId, Envelope, Permissions, RoleId, RoomId, RoomSeal, RoomShape, ShapeError,
+    SpaceId, UserId, Username,
 };
 
 use crate::address::AddressBucket;
@@ -137,6 +138,41 @@ pub enum ServerError {
     /// Operator configuration for the GIF relay that would not work. Startup only.
     #[error("GIF relay configuration: {0}")]
     GifConfigInvalid(String),
+    #[error("no such space")]
+    NoSuchSpace,
+    #[error("not a member of this space")]
+    NotASpaceMember,
+    #[error("you do not have the {0} permission in this space")]
+    MissingPermission(&'static str),
+    /// The hierarchy rule: nobody acts on a role or a member ranked at or above themselves.
+    #[error("you can only act on roles and members ranked below your own highest role")]
+    RankTooLow,
+    /// Granting a permission you do not hold yourself, by role or by override.
+    #[error("you cannot grant a permission you do not hold")]
+    CannotGrantUnheld,
+    #[error("no such role in this space")]
+    NoSuchRole,
+    #[error("no such channel in this space")]
+    NoSuchChannel,
+    /// A room-level membership call against a channel. Its membership is the space's.
+    #[error("this room is a channel of a space; its membership is managed by the space")]
+    ManagedBySpace,
+    #[error("the space is at its member ceiling")]
+    SpaceFull,
+    #[error("a name must be 1 to {MAX_SPACE_NAME_LEN} characters and not only whitespace")]
+    BadName,
+    #[error("an override may only allow or deny read and send, and not the same bit twice")]
+    BadOverride,
+    #[error("a role's position must be at least 1; 0 is @everyone's")]
+    BadPosition,
+    #[error("the owner cannot leave or be removed; a space must keep its owner")]
+    OwnerIsPermanent,
+    #[error("this space has as many roles or channels as an instance allows")]
+    SpaceLimitReached,
+    #[error("permission bits this instance does not recognise")]
+    UnknownPermission,
+    #[error("a space must admit at least one member")]
+    BadCeiling,
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -321,6 +357,17 @@ pub struct Room {
     /// `default` so rooms created before this existed still decode.
     #[serde(default)]
     disappear_after_ms: Option<i64>,
+    /// The space this room is a channel of, if any. Fixed at creation.
+    ///
+    /// When set, `members` is empty and stays empty: who may read and write is computed from
+    /// the space's roles and the channel's overrides by [`Instance::room_access`], and the
+    /// room-level membership calls refuse with [`ServerError::ManagedBySpace`]. Two lists
+    /// that could each admit someone would be two places to forget to remove them — the
+    /// "a kicked member keeps access" probe in `mod spaces` exists for exactly that.
+    ///
+    /// `default` so rooms created before spaces existed still decode, as ordinary rooms.
+    #[serde(default)]
+    space: Option<SpaceId>,
 }
 
 impl Room {
@@ -333,6 +380,7 @@ impl Room {
             last_franked: None,
             members: Vec::new(),
             disappear_after_ms: None,
+            space: None,
         }
     }
 
@@ -374,6 +422,174 @@ pub struct RoomInviteRecord {
     pub uses_remaining: u32,
     pub expires_at_ms: Option<i64>,
     pub revoked: bool,
+}
+
+/// Longest space, channel or role name accepted, in characters.
+pub const MAX_SPACE_NAME_LEN: usize = 100;
+/// Roles one space may define. A bound on what one account can make the instance hold in
+/// memory, since every space is loaded at start.
+pub const MAX_ROLES_PER_SPACE: usize = 250;
+/// Channels one space may hold. Each is a room, and a room is a record in memory.
+pub const MAX_CHANNELS_PER_SPACE: usize = 500;
+
+/// A role in a space: a name, some permission bits, and a rank.
+///
+/// `position` is the rank. Higher outranks lower; `@everyone` is position 0 and is not a
+/// row here. **The hierarchy rule** is the whole of what stops escalation: an actor may only
+/// create, edit, delete, assign or unassign a role whose position is strictly below their own
+/// highest, and may only act on a member whose highest role is strictly below theirs.
+/// Equal is not below — two moderators at the same rank cannot strip each other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceRole {
+    pub id: RoleId,
+    pub name: String,
+    pub permissions: Permissions,
+    pub position: u32,
+}
+
+/// An account in a space, and the roles it holds beyond `@everyone`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceMember {
+    pub user: UserId,
+    pub roles: Vec<RoleId>,
+}
+
+/// One per-channel override: bits allowed and denied for a role, or for `@everyone`
+/// when `role` is `None`. Only [`Permissions::CHANNEL_SCOPED`] bits may appear.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOverride {
+    pub role: Option<RoleId>,
+    pub allow: Permissions,
+    pub deny: Permissions,
+}
+
+/// A channel: a room of this space, with a name and its overrides.
+///
+/// **No tier field, deliberately.** The tier lives in the room's [`RoomSeal`] and is read from
+/// there every time. A copy here would be a second answer to "is this channel encrypted?",
+/// and the day the two disagreed one of them would be shown to a user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+    pub room: RoomId,
+    pub name: String,
+    pub overrides: Vec<ChannelOverride>,
+}
+
+/// A space as the instance holds it. See `docs/adr/011-spaces-channels-roles.md`.
+///
+/// **Every field here is readable by the instance operator**, including the names. A space's
+/// name, its channels' names, its roles and who holds them are metadata the instance needs in
+/// the clear in order to enforce anything, which is the concession ADR-011 states. Only the
+/// messages inside an end-to-end encrypted channel are out of the operator's reach.
+///
+/// Fields are private for the same reason as [`Room`]'s: every rule about who may do what is
+/// a method on [`Instance`], and a caller able to push onto `members` would skip all of them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Space {
+    name: String,
+    /// Outranks every role, holds every permission, and cannot be removed.
+    owner: UserId,
+    /// Sealed at creation, like a room's. Every channel's shape is derived from it, so no
+    /// channel can be asked to hold more members than its tier was derived for.
+    member_ceiling: u32,
+    /// What `@everyone` holds — every member, whatever else they hold.
+    everyone: Permissions,
+    roles: Vec<SpaceRole>,
+    members: Vec<SpaceMember>,
+    channels: Vec<Channel>,
+    /// Accounts removed by someone else, who may not rejoin by invite until the bar is
+    /// lifted. See [`Instance::kick_from_space`] for why a kick needs this.
+    #[serde(default)]
+    barred: Vec<UserId>,
+}
+
+/// A space invite, stored under the hash of its token, as [`RoomInviteRecord`] is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceInviteRecord {
+    pub space: SpaceId,
+    pub created_by: UserId,
+    pub uses_remaining: u32,
+    pub expires_at_ms: Option<i64>,
+    pub revoked: bool,
+}
+
+/// Rank used for comparisons. The owner is above every position a role can hold.
+const OWNER_RANK: u64 = u64::MAX;
+
+impl Space {
+    fn member(&self, user: UserId) -> Option<&SpaceMember> {
+        self.members.iter().find(|m| m.user == user)
+    }
+
+    fn role(&self, id: RoleId) -> Option<&SpaceRole> {
+        self.roles.iter().find(|r| r.id == id)
+    }
+
+    fn channel(&self, room: RoomId) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.room == room)
+    }
+
+    /// The member's highest position: 0 for `@everyone` only, [`OWNER_RANK`] for the owner.
+    fn rank_of(&self, user: UserId) -> Option<u64> {
+        if user == self.owner {
+            return Some(OWNER_RANK);
+        }
+        let m = self.member(user)?;
+        Some(
+            m.roles
+                .iter()
+                .filter_map(|id| self.role(*id))
+                .map(|r| u64::from(r.position))
+                .max()
+                .unwrap_or(0),
+        )
+    }
+
+    /// Space-wide permissions: `@everyone` plus every role held. The owner holds all.
+    fn base_permissions(&self, user: UserId) -> Option<Permissions> {
+        if user == self.owner {
+            return Some(Permissions::ALL);
+        }
+        let m = self.member(user)?;
+        Some(
+            m.roles
+                .iter()
+                .filter_map(|id| self.role(*id))
+                .fold(self.everyone, |acc, r| acc.union(r.permissions)),
+        )
+    }
+
+    /// What `user` may do in one channel, or `None` if they are not a member at all.
+    ///
+    /// Discord's order, because people will arrive with Discord's intuition: start from the
+    /// space-wide set, apply the `@everyone` override, then the union of the member's role
+    /// overrides, deny first and allow over it. Only the channel-scoped bits move. Then **no
+    /// READ, no SEND**: an override cannot leave someone able to post into a channel they
+    /// cannot read. The owner is exempt from overrides; a space whose owner could be locked
+    /// out of a channel by a moderator would have nobody left able to fix it.
+    fn channel_permissions(&self, user: UserId, channel: &Channel) -> Option<Permissions> {
+        let base = self.base_permissions(user)?;
+        if user == self.owner {
+            return Some(Permissions::ALL);
+        }
+        let held: &[RoleId] = &self.member(user)?.roles;
+        let mut scoped = base.intersection(Permissions::CHANNEL_SCOPED);
+        if let Some(o) = channel.overrides.iter().find(|o| o.role.is_none()) {
+            scoped = scoped.difference(o.deny).union(o.allow);
+        }
+        let (mut allow, mut deny) = (Permissions::NONE, Permissions::NONE);
+        for o in &channel.overrides {
+            if o.role.is_some_and(|r| held.contains(&r)) {
+                allow = allow.union(o.allow);
+                deny = deny.union(o.deny);
+            }
+        }
+        scoped = scoped.difference(deny).union(allow);
+        if !scoped.contains(Permissions::READ) {
+            scoped = Permissions::NONE;
+        }
+        Some(base.difference(Permissions::CHANNEL_SCOPED).union(scoped))
+    }
 }
 
 /// An attachment the server holds, minus its bytes.
@@ -562,6 +778,14 @@ pub struct Instance {
     usernames: Mutex<HashMap<Username, UserId>>,
     /// Keyed by token hash; see [`RoomInviteRecord`].
     room_invites: Mutex<HashMap<String, RoomInviteRecord>>,
+    /// Spaces, with their roles, members and channels.
+    ///
+    /// **Lock order: `rooms` before `spaces`, `spaces` before `space_invites`.** A channel's
+    /// access check runs with the rooms lock held, so anything that held `spaces` and then
+    /// asked for `rooms` would deadlock against a message being accepted.
+    spaces: Mutex<HashMap<SpaceId, Space>>,
+    /// Keyed by token hash; see [`SpaceInviteRecord`].
+    space_invites: Mutex<HashMap<String, SpaceInviteRecord>>,
     /// Bounds username *guessing*, which exact-match resolution does not. Not persisted,
     /// for the same reason as [`ClaimLimiter`].
     lookup_limiter: Mutex<HashMap<UserId, VecDeque<i64>>>,
@@ -610,6 +834,8 @@ impl Instance {
             claim_limiter: Mutex::new(ClaimLimiter::default()),
             usernames: Mutex::new(directory.usernames.into_iter().collect()),
             room_invites: Mutex::new(directory.room_invites.into_iter().collect()),
+            spaces: Mutex::new(directory.spaces.into_iter().collect()),
+            space_invites: Mutex::new(directory.space_invites.into_iter().collect()),
             lookup_limiter: Mutex::new(HashMap::new()),
             upload_budget: Mutex::default(),
             send_budget: Mutex::default(),
@@ -844,6 +1070,7 @@ impl Instance {
             last_franked: None,
             members: vec![RoomMember { user: creator, role: RoomRole::Owner }],
             disappear_after_ms: None,
+            space: None,
         };
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         rooms.insert(id, room.clone());
@@ -866,6 +1093,9 @@ impl Instance {
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if r.space.is_some() {
+            return Err(ServerError::ManagedBySpace);
+        }
         let actor_role = r.role_of(actor).ok_or(ServerError::NotAMember)?;
         if actor_role < RoomRole::Moderator {
             return Err(ServerError::InsufficientRole);
@@ -904,6 +1134,9 @@ impl Instance {
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if r.space.is_some() {
+            return Err(ServerError::ManagedBySpace);
+        }
         let actor_role = r.role_of(actor).ok_or(ServerError::NotAMember)?;
         let target_role = r.role_of(target).ok_or(ServerError::TargetNotAMember)?;
 
@@ -939,6 +1172,9 @@ impl Instance {
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        if r.space.is_some() {
+            return Err(ServerError::ManagedBySpace);
+        }
         if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Owner {
             return Err(ServerError::InsufficientRole);
         }
@@ -972,8 +1208,11 @@ impl Instance {
         }
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
-        if !r.has_member(actor) {
-            return Err(ServerError::NotAMember);
+        let access = self.room_access(r, room, actor).ok_or(ServerError::NotAMember)?;
+        // In a space the timer is the channel's, set by whoever manages channels — otherwise
+        // any member could make a moderator's announcements disappear.
+        if r.space.is_some() && !access.contains(Permissions::MANAGE_CHANNELS) {
+            return Err(ServerError::MissingPermission("manage_channels"));
         }
         r.disappear_after_ms = ttl_ms;
         let updated = r.clone();
@@ -1031,15 +1270,34 @@ impl Instance {
     ) -> Result<Vec<RoomMember>, ServerError> {
         let rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
-        if !r.has_member(actor) {
-            return Err(ServerError::NotAMember);
+        self.room_access(r, room, actor).ok_or(ServerError::NotAMember)?;
+        match r.space {
+            None => Ok(r.members.clone()),
+            // Whoever can read the channel now. This is the list a client compares with the
+            // MLS roster, so it must be the computed one: a kicked member drops off it and
+            // shows up as "unlisted" in the roster until somebody removes their leaf.
+            Some(space) => Ok(self
+                .spaces
+                .lock()
+                .expect("spaces mutex poisoned")
+                .get(&space)
+                .map(|sp| sp.channel_readers(room))
+                .unwrap_or_default()),
         }
-        Ok(r.members.clone())
     }
 
     /// An account's role in a room, if any.
     pub fn room_role(&self, room: RoomId, user: UserId) -> Option<RoomRole> {
-        self.rooms.lock().expect("rooms mutex poisoned").get(&room).and_then(|r| r.role_of(user))
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let r = rooms.get(&room)?;
+        match r.space {
+            None => r.role_of(user),
+            Some(space) => {
+                self.room_access(r, room, user)?;
+                let owner = self.spaces.lock().expect("spaces mutex poisoned").get(&space)?.owner;
+                Some(if owner == user { RoomRole::Owner } else { RoomRole::Member })
+            }
+        }
     }
 
     /// Join a room that is open to anyone.
@@ -1050,6 +1308,11 @@ impl Instance {
     pub fn join_room(&self, room: RoomId, user: UserId) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        // Before the public-room check: a public *channel* passes that one, and joining it
+        // here would put an account on the room without putting it in the space.
+        if r.space.is_some() {
+            return Err(ServerError::ManagedBySpace);
+        }
         if !r.seal.may_mint_public_invite() {
             return Err(ServerError::RoomNotOpen);
         }
@@ -1253,8 +1516,10 @@ impl Instance {
         {
             let rooms = self.rooms.lock().expect("rooms mutex poisoned");
             let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
-            if !r.has_member(actor) {
-                return Err(ServerError::NotAMember);
+            let access = self.room_access(r, room, actor).ok_or(ServerError::NotAMember)?;
+            // An upload is the first half of a send, and is refused to whoever cannot send.
+            if !access.contains(Permissions::SEND) {
+                return Err(ServerError::MissingPermission("send"));
             }
         }
 
@@ -1289,9 +1554,7 @@ impl Instance {
             let rooms = self.rooms.lock().expect("rooms mutex poisoned");
             // A blob whose room is gone is unreachable rather than public.
             let r = rooms.get(&record.room).ok_or(ServerError::NoSuchBlob)?;
-            if !r.has_member(actor) {
-                return Err(ServerError::NotAMember);
-            }
+            self.room_access(r, record.room, actor).ok_or(ServerError::NotAMember)?;
         }
 
         self.storage.blob_bytes(id)?.ok_or(ServerError::NoSuchBlob)
@@ -1315,6 +1578,11 @@ impl Instance {
         {
             let rooms = self.rooms.lock().expect("rooms mutex poisoned");
             let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
+            // A channel is joined through its space's invites, which know about bars and
+            // ceilings for the whole space. A room invite would bypass both.
+            if r.space.is_some() {
+                return Err(ServerError::ManagedBySpace);
+            }
             // Same authority as adding someone directly. An invite is a deferred add, so a
             // member who cannot admit people must not be able to mint one that does it later.
             if r.role_of(actor).ok_or(ServerError::NotAMember)? < RoomRole::Moderator {
@@ -1364,6 +1632,11 @@ impl Instance {
         let room_id = record.room;
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let room = rooms.get_mut(&room_id).ok_or(ServerError::RoomInviteInvalid)?;
+        // Unreachable while minting refuses channels; kept so a record restored from an
+        // older build cannot put someone on a channel's empty member list.
+        if room.space.is_some() {
+            return Err(ServerError::RoomInviteInvalid);
+        }
 
         // Already a member: succeed without spending a use. Otherwise a shared link burns a
         // slot every time someone re-opens it.
@@ -1500,10 +1773,14 @@ impl Instance {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
         let room = rooms.get_mut(&envelope.room).ok_or(ServerError::NoSuchRoom)?;
 
-        if !room.has_member(envelope.sender) {
-            // A non-member's message would advance next_seq and the franking chain of a
-            // room they are not in, corrupting evidence for the members who are.
-            return Err(ServerError::NotAMember);
+        // A non-member's message would advance next_seq and the franking chain of a room
+        // they are not in, corrupting evidence for the members who are. In a channel,
+        // "member" means whoever the space currently lets send there.
+        let access = self
+            .room_access(room, envelope.room, envelope.sender)
+            .ok_or(ServerError::NotAMember)?;
+        if !access.contains(Permissions::SEND) {
+            return Err(ServerError::MissingPermission("send"));
         }
 
         envelope.validate_for_tier(room.seal.tier())?;
@@ -1568,9 +1845,7 @@ impl Instance {
         {
             let rooms = self.rooms.lock().expect("rooms mutex poisoned");
             let r = rooms.get(&room).ok_or(ServerError::NoSuchRoom)?;
-            if !r.has_member(actor) {
-                return Err(ServerError::NotAMember);
-            }
+            self.room_access(r, room, actor).ok_or(ServerError::NotAMember)?;
         }
         // Purge before reading, so an expired message is gone from storage rather than
         // merely hidden from this caller.
@@ -1611,6 +1886,776 @@ fn decode_commitment(hex_str: &str) -> Option<Commitment> {
     let bytes = hex::decode(hex_str).ok()?;
     let arr: [u8; 32] = bytes.try_into().ok()?;
     Some(Commitment(arr))
+}
+
+// ---- spaces ------------------------------------------------------------------------------
+//
+// A space is a container of channels; each channel is a room with its own sealed tier.
+// Membership, roles and permissions are **instance-enforced metadata**: the operator sees all
+// of it and could change any of it. What follows is the rule set the instance applies on its
+// own say-so — see `docs/adr/011-spaces-channels-roles.md` for what that does and does not
+// protect.
+
+/// A space as one member is entitled to see it.
+///
+/// Everything the UI needs to draw is decided here, including whether each role and member is
+/// one the viewer may act on (`manageable`). A client renders those flags; it never derives
+/// them, because a UI that computed the hierarchy itself would be a second implementation of
+/// the rule, and the one nobody tests.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpaceView {
+    pub id: SpaceId,
+    pub name: String,
+    pub owner: UserId,
+    pub member_ceiling: u32,
+    /// The viewer's space-wide permissions.
+    pub my_permissions: Permissions,
+    pub everyone: Permissions,
+    /// Whether the viewer may edit `@everyone` — it is below everyone but the bottom rank.
+    pub everyone_manageable: bool,
+    pub roles: Vec<RoleView>,
+    pub members: Vec<SpaceMemberView>,
+    /// Only the channels the viewer can read. A channel nobody told you about is not listed,
+    /// which is all the hiding the instance can do — it knows every name regardless.
+    pub channels: Vec<ChannelView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleView {
+    pub id: RoleId,
+    pub name: String,
+    pub permissions: Permissions,
+    pub position: u32,
+    /// Whether the viewer may edit, delete or unassign this role.
+    pub manageable: bool,
+    /// Whether the viewer may hand this role out: manageable, and carrying nothing the viewer
+    /// does not hold.
+    pub assignable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpaceMemberView {
+    pub user: UserId,
+    pub roles: Vec<RoleId>,
+    pub owner: bool,
+    /// Whether the viewer outranks this member, which kicking requires.
+    pub manageable: bool,
+    /// Whether the viewer may change this member's roles: they hold `manage_roles`, and this
+    /// is themselves or someone they outrank.
+    pub roles_editable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelView {
+    pub room: RoomId,
+    pub name: String,
+    /// Read from the room's seal, never stored beside the channel.
+    pub tier: &'static str,
+    pub e2ee: bool,
+    pub my_permissions: Permissions,
+    /// Present only for a viewer who may change them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<Vec<ChannelOverride>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpaceSummary {
+    pub id: SpaceId,
+    pub name: String,
+}
+
+/// A name a person typed for a space, channel or role.
+///
+/// Trimmed and bounded, nothing more. These are not identities — a role called "Owner" is a
+/// role with that name, and the UI shows the owner by a separate flag — so there is no
+/// lookalike check here as there is for profile names (ADR-010).
+fn clean_name(name: &str) -> Result<String, ServerError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > MAX_SPACE_NAME_LEN
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(ServerError::BadName);
+    }
+    Ok(trimmed.to_string())
+}
+
+impl Space {
+    #[cfg(test)]
+    pub(crate) fn for_test(owner: UserId) -> Self {
+        Self {
+            name: "test".into(),
+            owner,
+            member_ceiling: 50,
+            everyone: Permissions::DEFAULT_EVERYONE,
+            roles: Vec::new(),
+            members: vec![SpaceMember { user: owner, roles: Vec::new() }],
+            channels: Vec::new(),
+            barred: Vec::new(),
+        }
+    }
+
+    /// The actor's space-wide permissions, if they hold `needed`.
+    fn require(
+        &self,
+        actor: UserId,
+        needed: Permissions,
+        label: &'static str,
+    ) -> Result<Permissions, ServerError> {
+        let held = self.base_permissions(actor).ok_or(ServerError::NotASpaceMember)?;
+        if !held.contains(needed) {
+            return Err(ServerError::MissingPermission(label));
+        }
+        Ok(held)
+    }
+
+    /// Refuse unless `position` is strictly below the actor's rank.
+    fn require_below(&self, actor: UserId, position: u64) -> Result<(), ServerError> {
+        let rank = self.rank_of(actor).ok_or(ServerError::NotASpaceMember)?;
+        if position >= rank {
+            return Err(ServerError::RankTooLow);
+        }
+        Ok(())
+    }
+
+    /// The actor may act on `target` as a member: themselves, or someone ranked below them.
+    fn require_outranks(&self, actor: UserId, target: UserId) -> Result<(), ServerError> {
+        let target_rank = self.rank_of(target).ok_or(ServerError::TargetNotAMember)?;
+        if actor == target {
+            return Ok(());
+        }
+        self.require_below(actor, target_rank)
+    }
+
+    fn role_position(&self, role: Option<RoleId>) -> Result<u64, ServerError> {
+        match role {
+            None => Ok(0),
+            Some(id) => self.role(id).map(|r| u64::from(r.position)).ok_or(ServerError::NoSuchRole),
+        }
+    }
+
+    /// The actor's permissions in a channel they can read, for managing it.
+    ///
+    /// Managing a channel you cannot see is refused: otherwise `manage_channels` would be a
+    /// way to un-hide a private channel for yourself by editing the overrides that hid it.
+    fn require_channel_manager(
+        &self,
+        actor: UserId,
+        room: RoomId,
+    ) -> Result<Permissions, ServerError> {
+        self.require(actor, Permissions::MANAGE_CHANNELS, "manage_channels")?;
+        let channel = self.channel(room).ok_or(ServerError::NoSuchChannel)?;
+        let here = self.channel_permissions(actor, channel).ok_or(ServerError::NotASpaceMember)?;
+        if !here.contains(Permissions::READ) {
+            return Err(ServerError::NoSuchChannel);
+        }
+        Ok(here)
+    }
+
+    /// Who can read a channel, as a room member list. Used where the room-level API asks.
+    fn channel_readers(&self, room: RoomId) -> Vec<RoomMember> {
+        let Some(channel) = self.channel(room) else { return Vec::new() };
+        self.members
+            .iter()
+            .filter(|m| {
+                self.channel_permissions(m.user, channel)
+                    .is_some_and(|p| p.contains(Permissions::READ))
+            })
+            .map(|m| RoomMember {
+                user: m.user,
+                role: if m.user == self.owner { RoomRole::Owner } else { RoomRole::Member },
+            })
+            .collect()
+    }
+}
+
+impl Instance {
+    /// What `actor` may do in a room: read and send for a member of an ordinary room, the
+    /// computed set for a channel. `None` means no access at all.
+    ///
+    /// **The one place a channel's access is decided.** Every read and write path — messages,
+    /// attachments, the member list, the timer — asks this, so removing someone from a space
+    /// or changing a role takes effect on the next request rather than whenever some second
+    /// list is remembered. Called with the rooms lock held; takes the spaces lock, which is
+    /// the documented order.
+    fn room_access(&self, room: &Room, room_id: RoomId, actor: UserId) -> Option<Permissions> {
+        match room.space {
+            None => room.has_member(actor).then_some(Permissions::CHANNEL_SCOPED),
+            Some(space) => {
+                let spaces = self.spaces.lock().expect("spaces mutex poisoned");
+                let sp = spaces.get(&space)?;
+                // A deleted channel keeps its room and its space link, so it falls out here:
+                // no channel record, no access, for anyone, owner included.
+                let channel = sp.channel(room_id)?;
+                sp.channel_permissions(actor, channel).filter(|p| p.contains(Permissions::READ))
+            }
+        }
+    }
+
+    /// Mutate one space under its lock, committing the result before memory changes.
+    ///
+    /// The closure works on a copy. A rule that refuses part-way, or a storage write that
+    /// fails, leaves the space exactly as it was — rather than half-applied in memory and
+    /// different on disk, which a restart would then silently "fix".
+    fn with_space<T>(
+        &self,
+        space: SpaceId,
+        f: impl FnOnce(&mut Space) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError> {
+        let mut spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let current = spaces.get_mut(&space).ok_or(ServerError::NoSuchSpace)?;
+        let mut draft = current.clone();
+        let out = f(&mut draft)?;
+        self.write(&[Write::Space(space, draft.clone())])?;
+        *current = draft;
+        Ok(out)
+    }
+
+    /// Create a space. The creator is its owner.
+    ///
+    /// `member_ceiling` is sealed here and every channel's shape is derived from it, so it is
+    /// an input to every channel's tier: above `T2_MAX_MEMBERS` no channel in the space can be
+    /// end-to-end encrypted. A client asking for a big space is asking for a public one.
+    pub fn create_space(
+        &self,
+        actor: UserId,
+        name: &str,
+        member_ceiling: u32,
+    ) -> Result<SpaceId, ServerError> {
+        let name = clean_name(name)?;
+        if member_ceiling == 0 {
+            return Err(ServerError::BadCeiling);
+        }
+        let id = SpaceId::new();
+        let space = Space {
+            name,
+            owner: actor,
+            member_ceiling,
+            everyone: Permissions::DEFAULT_EVERYONE,
+            roles: Vec::new(),
+            members: vec![SpaceMember { user: actor, roles: Vec::new() }],
+            channels: Vec::new(),
+            barred: Vec::new(),
+        };
+        let mut spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        self.write(&[Write::Space(id, space.clone())])?;
+        spaces.insert(id, space);
+        Ok(id)
+    }
+
+    /// The spaces `actor` belongs to.
+    pub fn spaces_of(&self, actor: UserId) -> Vec<SpaceSummary> {
+        let spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let mut out: Vec<SpaceSummary> = spaces
+            .iter()
+            .filter(|(_, s)| s.member(actor).is_some())
+            .map(|(id, s)| SpaceSummary { id: *id, name: s.name.clone() })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        out
+    }
+
+    /// A space as `actor` may see it. Members only.
+    pub fn describe_space(&self, space: SpaceId, actor: UserId) -> Result<SpaceView, ServerError> {
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let sp = spaces.get(&space).ok_or(ServerError::NoSuchSpace)?;
+        let mine = sp.base_permissions(actor).ok_or(ServerError::NotASpaceMember)?;
+        let rank = sp.rank_of(actor).unwrap_or(0);
+        let manages_roles = mine.contains(Permissions::MANAGE_ROLES);
+        let manages_channels = mine.contains(Permissions::MANAGE_CHANNELS);
+
+        let channels = sp
+            .channels
+            .iter()
+            .filter_map(|c| {
+                let here = sp.channel_permissions(actor, c)?;
+                if !here.contains(Permissions::READ) {
+                    return None;
+                }
+                let tier = rooms.get(&c.room)?.seal.tier();
+                Some(ChannelView {
+                    room: c.room,
+                    name: c.name.clone(),
+                    tier: tier.label(),
+                    e2ee: tier.is_e2ee(),
+                    my_permissions: here,
+                    overrides: manages_channels.then(|| c.overrides.clone()),
+                })
+            })
+            .collect();
+        let mut roles: Vec<RoleView> = sp
+            .roles
+            .iter()
+            .map(|r| RoleView {
+                id: r.id,
+                name: r.name.clone(),
+                permissions: r.permissions,
+                position: r.position,
+                manageable: manages_roles && u64::from(r.position) < rank,
+                assignable: manages_roles
+                    && u64::from(r.position) < rank
+                    && mine.contains(r.permissions),
+            })
+            .collect();
+        roles.sort_by(|a, b| b.position.cmp(&a.position).then(a.name.cmp(&b.name)));
+        let members = sp
+            .members
+            .iter()
+            .map(|m| SpaceMemberView {
+                user: m.user,
+                roles: m.roles.clone(),
+                owner: m.user == sp.owner,
+                manageable: m.user != actor
+                    && m.user != sp.owner
+                    && sp.rank_of(m.user).is_some_and(|r| r < rank),
+                roles_editable: manages_roles
+                    && (m.user == actor || sp.rank_of(m.user).is_some_and(|r| r < rank)),
+            })
+            .collect();
+        Ok(SpaceView {
+            id: space,
+            name: sp.name.clone(),
+            owner: sp.owner,
+            member_ceiling: sp.member_ceiling,
+            my_permissions: mine,
+            everyone: sp.everyone,
+            everyone_manageable: manages_roles && rank > 0,
+            roles,
+            members,
+            channels,
+        })
+    }
+
+    /// Create a channel: a new room, sealed now, belonging to this space.
+    ///
+    /// The tier is derived from the space's ceiling and whether the channel is public, by the
+    /// same `derive_tier` every room uses, and sealed into the room. Nothing that follows can
+    /// change it: there is no call that edits a seal, and a channel's record holds no tier of
+    /// its own to edit. "Changing" a channel's tier means deleting it and creating another,
+    /// which mints a different room id with an empty history.
+    pub fn create_channel(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        name: &str,
+        public: bool,
+    ) -> Result<(RoomId, RoomSeal), ServerError> {
+        let name = clean_name(name)?;
+        let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let mut spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let sp = spaces.get_mut(&space).ok_or(ServerError::NoSuchSpace)?;
+        sp.require(actor, Permissions::MANAGE_CHANNELS, "manage_channels")?;
+        if sp.channels.len() >= MAX_CHANNELS_PER_SPACE {
+            return Err(ServerError::SpaceLimitReached);
+        }
+        let seal = RoomSeal::new(RoomShape {
+            is_direct: false,
+            is_publicly_discoverable: public,
+            member_ceiling: sp.member_ceiling,
+        })?;
+        let id = RoomId::new();
+        let room = Room {
+            seal,
+            next_seq: 0,
+            last_franked: None,
+            // Empty for good: a channel's members are whoever the space says can read it.
+            members: Vec::new(),
+            disappear_after_ms: None,
+            space: Some(space),
+        };
+        let mut draft = sp.clone();
+        draft.channels.push(Channel { room: id, name, overrides: Vec::new() });
+        // Room and space together. Split, a crash between them leaves either a channel naming
+        // a room that does not exist or a room claiming a space that never listed it.
+        self.write(&[Write::Room(id, room.clone()), Write::Space(space, draft.clone())])?;
+        *sp = draft;
+        rooms.insert(id, room);
+        Ok((id, seal))
+    }
+
+    /// Rename a channel. Takes a name and nothing else, so it cannot carry a tier.
+    pub fn rename_channel(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        room: RoomId,
+        name: &str,
+    ) -> Result<(), ServerError> {
+        let name = clean_name(name)?;
+        self.with_space(space, |sp| {
+            sp.require_channel_manager(actor, room)?;
+            if let Some(c) = sp.channels.iter_mut().find(|c| c.room == room) {
+                c.name = name;
+            }
+            Ok(())
+        })
+    }
+
+    /// Delete a channel. Its room and messages stay in storage, unreachable by anyone.
+    ///
+    /// Kept rather than erased for the reason `remove_room_member` keeps a removed member's
+    /// messages: they are evidence, and a moderator able to destroy a channel's transcript
+    /// could destroy the franked record of what was said in it.
+    pub fn delete_channel(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        room: RoomId,
+    ) -> Result<(), ServerError> {
+        self.with_space(space, |sp| {
+            sp.require_channel_manager(actor, room)?;
+            sp.channels.retain(|c| c.room != room);
+            Ok(())
+        })
+    }
+
+    /// Set, or with both sets empty clear, one channel override.
+    ///
+    /// Three refusals beyond the permission itself, each closing an escalation: the target
+    /// role must rank below the actor, only read and send may be touched, and nothing may be
+    /// *allowed* that the actor does not hold in this channel.
+    pub fn set_channel_override(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        room: RoomId,
+        role: Option<RoleId>,
+        allow: Permissions,
+        deny: Permissions,
+    ) -> Result<(), ServerError> {
+        if !Permissions::CHANNEL_SCOPED.contains(allow.union(deny))
+            || !allow.intersection(deny).is_empty()
+        {
+            return Err(ServerError::BadOverride);
+        }
+        self.with_space(space, |sp| {
+            let here = sp.require_channel_manager(actor, room)?;
+            sp.require_below(actor, sp.role_position(role)?)?;
+            if !here.contains(allow) {
+                return Err(ServerError::CannotGrantUnheld);
+            }
+            let channel = sp
+                .channels
+                .iter_mut()
+                .find(|c| c.room == room)
+                .ok_or(ServerError::NoSuchChannel)?;
+            channel.overrides.retain(|o| o.role != role);
+            if !(allow.is_empty() && deny.is_empty()) {
+                channel.overrides.push(ChannelOverride { role, allow, deny });
+            }
+            Ok(())
+        })
+    }
+
+    /// Create a role below the actor's own rank, carrying only permissions the actor holds.
+    pub fn create_role(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        name: &str,
+        permissions: Permissions,
+        position: u32,
+    ) -> Result<RoleId, ServerError> {
+        let name = clean_name(name)?;
+        if position == 0 {
+            return Err(ServerError::BadPosition);
+        }
+        self.with_space(space, |sp| {
+            let held = sp.require(actor, Permissions::MANAGE_ROLES, "manage_roles")?;
+            sp.require_below(actor, u64::from(position))?;
+            if !held.contains(permissions) {
+                return Err(ServerError::CannotGrantUnheld);
+            }
+            if sp.roles.len() >= MAX_ROLES_PER_SPACE {
+                return Err(ServerError::SpaceLimitReached);
+            }
+            let id = RoleId::new();
+            sp.roles.push(SpaceRole { id, name, permissions, position });
+            Ok(id)
+        })
+    }
+
+    /// Edit a role, or `@everyone` when `role` is `None`.
+    ///
+    /// Both the role's current position and any new one must be below the actor, so a role
+    /// can be neither edited from above nor lifted to or past its editor. Only bits being
+    /// **added** must be held by the actor: removing a power you lack from a role beneath you
+    /// takes nothing from anyone that you could not already have taken by deleting the role.
+    pub fn edit_role(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        role: Option<RoleId>,
+        name: Option<&str>,
+        permissions: Option<Permissions>,
+        position: Option<u32>,
+    ) -> Result<(), ServerError> {
+        let name = name.map(clean_name).transpose()?;
+        if position == Some(0) || (role.is_none() && (position.is_some() || name.is_some())) {
+            return Err(ServerError::BadPosition);
+        }
+        self.with_space(space, |sp| {
+            let held = sp.require(actor, Permissions::MANAGE_ROLES, "manage_roles")?;
+            sp.require_below(actor, sp.role_position(role)?)?;
+            if let Some(p) = position {
+                sp.require_below(actor, u64::from(p))?;
+            }
+            let current = match role {
+                None => sp.everyone,
+                Some(id) => sp.role(id).ok_or(ServerError::NoSuchRole)?.permissions,
+            };
+            if let Some(new) = permissions {
+                if !held.contains(new.difference(current)) {
+                    return Err(ServerError::CannotGrantUnheld);
+                }
+            }
+            match role {
+                None => {
+                    if let Some(new) = permissions {
+                        sp.everyone = new;
+                    }
+                }
+                Some(id) => {
+                    let r =
+                        sp.roles.iter_mut().find(|r| r.id == id).ok_or(ServerError::NoSuchRole)?;
+                    if let Some(n) = name {
+                        r.name = n;
+                    }
+                    if let Some(new) = permissions {
+                        r.permissions = new;
+                    }
+                    if let Some(p) = position {
+                        r.position = p;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Delete a role below the actor. It leaves every member who held it and every override.
+    pub fn delete_role(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        role: RoleId,
+    ) -> Result<(), ServerError> {
+        self.with_space(space, |sp| {
+            sp.require(actor, Permissions::MANAGE_ROLES, "manage_roles")?;
+            sp.require_below(actor, sp.role_position(Some(role))?)?;
+            sp.roles.retain(|r| r.id != role);
+            for m in &mut sp.members {
+                m.roles.retain(|r| *r != role);
+            }
+            for c in &mut sp.channels {
+                c.overrides.retain(|o| o.role != Some(role));
+            }
+            Ok(())
+        })
+    }
+
+    /// Give a member a role.
+    ///
+    /// The role must rank below the actor, the target must be the actor or rank below them,
+    /// and the role may carry nothing the actor does not hold. The last clause is what stops
+    /// `manage_roles` being a way to pick up `kick` from a role somebody else defined.
+    pub fn assign_role(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        target: UserId,
+        role: RoleId,
+    ) -> Result<(), ServerError> {
+        self.with_space(space, |sp| {
+            let held = sp.require(actor, Permissions::MANAGE_ROLES, "manage_roles")?;
+            sp.require_below(actor, sp.role_position(Some(role))?)?;
+            sp.require_outranks(actor, target)?;
+            let carried = sp.role(role).ok_or(ServerError::NoSuchRole)?.permissions;
+            if !held.contains(carried) {
+                return Err(ServerError::CannotGrantUnheld);
+            }
+            let m = sp
+                .members
+                .iter_mut()
+                .find(|m| m.user == target)
+                .ok_or(ServerError::TargetNotAMember)?;
+            if !m.roles.contains(&role) {
+                m.roles.push(role);
+            }
+            Ok(())
+        })
+    }
+
+    /// Take a role from a member. Same hierarchy as assigning it.
+    pub fn unassign_role(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        target: UserId,
+        role: RoleId,
+    ) -> Result<(), ServerError> {
+        self.with_space(space, |sp| {
+            sp.require(actor, Permissions::MANAGE_ROLES, "manage_roles")?;
+            sp.require_below(actor, sp.role_position(Some(role))?)?;
+            sp.require_outranks(actor, target)?;
+            let m = sp
+                .members
+                .iter_mut()
+                .find(|m| m.user == target)
+                .ok_or(ServerError::TargetNotAMember)?;
+            m.roles.retain(|r| *r != role);
+            Ok(())
+        })
+    }
+
+    /// Remove a member from a space, or leave it when `target` is the actor.
+    ///
+    /// Access to every channel goes at once, because channel access is computed from space
+    /// membership on each request ([`Instance::room_access`]) rather than copied anywhere.
+    ///
+    /// A kick also **bars** the account from rejoining by invite and revokes the invites it
+    /// minted. Without the bar, a kick lasted as long as it took to paste a link back in: any
+    /// live invite — including one the kicked member had minted for themselves while they
+    /// could — readmitted them. Leaving voluntarily bars nothing.
+    ///
+    /// What this cannot do is take back the keys. In an end-to-end encrypted channel the
+    /// removed device still holds the MLS group state until a member commits its removal; the
+    /// instance has stopped serving it ciphertext, which holds against everyone except the
+    /// instance itself. See ADR-011.
+    pub fn kick_from_space(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        target: UserId,
+    ) -> Result<(), ServerError> {
+        let mut spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let current = spaces.get_mut(&space).ok_or(ServerError::NoSuchSpace)?;
+        let mut sp = current.clone();
+        if target == sp.owner {
+            return Err(ServerError::OwnerIsPermanent);
+        }
+        let leaving = actor == target;
+        if !leaving {
+            sp.require(actor, Permissions::KICK, "kick")?;
+            sp.require_outranks(actor, target)?;
+        }
+        if sp.member(target).is_none() {
+            return Err(ServerError::TargetNotAMember);
+        }
+        sp.members.retain(|m| m.user != target);
+        let mut invites = self.space_invites.lock().expect("space invites mutex poisoned");
+        let mut revoked = Vec::new();
+        if !leaving {
+            if !sp.barred.contains(&target) {
+                sp.barred.push(target);
+            }
+            for (hash, record) in invites.iter() {
+                if record.space == space && record.created_by == target && !record.revoked {
+                    revoked.push((
+                        hash.clone(),
+                        SpaceInviteRecord { revoked: true, ..record.clone() },
+                    ));
+                }
+            }
+        }
+        // Everything in one commit, and memory only after it lands: a kick that half-persisted
+        // would come undone at the next restart.
+        let mut writes: Vec<Write> =
+            revoked.iter().map(|(h, r)| Write::SpaceInvite(h.clone(), r.clone())).collect();
+        writes.push(Write::Space(space, sp.clone()));
+        self.write(&writes)?;
+        for (hash, record) in revoked {
+            invites.insert(hash, record);
+        }
+        *current = sp;
+        Ok(())
+    }
+
+    /// Lift a kick's bar, so the account may rejoin by invite. Needs `kick`.
+    pub fn unbar_from_space(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        target: UserId,
+    ) -> Result<(), ServerError> {
+        self.with_space(space, |sp| {
+            sp.require(actor, Permissions::KICK, "kick")?;
+            sp.barred.retain(|u| *u != target);
+            Ok(())
+        })
+    }
+
+    /// Mint an invite to a space. Needs `invite`. The token is returned once.
+    pub fn create_space_invite(
+        &self,
+        space: SpaceId,
+        actor: UserId,
+        uses: u32,
+        expires_at_ms: Option<i64>,
+    ) -> Result<String, ServerError> {
+        if uses == 0 || uses > MAX_INVITE_USES {
+            return Err(ServerError::InviteUsesTooHigh);
+        }
+        let spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let sp = spaces.get(&space).ok_or(ServerError::NoSuchSpace)?;
+        sp.require(actor, Permissions::INVITE, "invite")?;
+        let token = mint_token();
+        let record = SpaceInviteRecord {
+            space,
+            created_by: actor,
+            uses_remaining: uses,
+            expires_at_ms,
+            revoked: false,
+        };
+        let hash = hash_token(&token);
+        let mut invites = self.space_invites.lock().expect("space invites mutex poisoned");
+        self.write(&[Write::SpaceInvite(hash.clone(), record.clone())])?;
+        invites.insert(hash, record);
+        Ok(token)
+    }
+
+    /// Redeem a space invite. Joins with `@everyone` only.
+    ///
+    /// Every refusal that concerns the token — unknown, spent, expired, revoked, *or held by
+    /// a barred account* — is the same error, so a barred account cannot use this to learn
+    /// which of its hoarded links are still live and pass one to a second account.
+    pub fn redeem_space_invite(
+        &self,
+        actor: UserId,
+        token: &str,
+        now_ms: i64,
+    ) -> Result<SpaceId, ServerError> {
+        let hash = hash_token(token);
+        let mut spaces = self.spaces.lock().expect("spaces mutex poisoned");
+        let mut invites = self.space_invites.lock().expect("space invites mutex poisoned");
+        let record = invites.get_mut(&hash).ok_or(ServerError::RoomInviteInvalid)?;
+        if record.revoked
+            || record.uses_remaining == 0
+            || record.expires_at_ms.is_some_and(|exp| now_ms >= exp)
+        {
+            return Err(ServerError::RoomInviteInvalid);
+        }
+        let space_id = record.space;
+        let current = spaces.get_mut(&space_id).ok_or(ServerError::RoomInviteInvalid)?;
+        if current.barred.contains(&actor) {
+            return Err(ServerError::RoomInviteInvalid);
+        }
+        if current.member(actor).is_some() {
+            return Ok(space_id);
+        }
+        if current.members.len() as u32 >= current.member_ceiling {
+            return Err(ServerError::SpaceFull);
+        }
+        let mut sp = current.clone();
+        sp.members.push(SpaceMember { user: actor, roles: Vec::new() });
+        let mut spent = record.clone();
+        spent.uses_remaining -= 1;
+        self.write(&[Write::Space(space_id, sp.clone()), Write::SpaceInvite(hash, spent.clone())])?;
+        *current = sp;
+        *record = spent;
+        Ok(space_id)
+    }
 }
 
 #[cfg(test)]
@@ -3844,5 +4889,714 @@ mod disappearing {
         let inst = Instance::in_memory();
         assert!(matches!(inst.create_invite("for-alice", None), Err(ServerError::InviteTooShort)));
         inst.create_invite(&"x".repeat(MIN_INVITE_TOKEN_LEN), None).unwrap();
+    }
+}
+
+/// Spaces, channels and roles: the rules, attacked.
+///
+/// The attacks here began as probes that tried what their names say and printed what
+/// happened. All were refused on the first run, so none is a regression test in the sense of
+/// "this once shipped broken". What earns them a place is the mutation run recorded in
+/// ADR-011: thirteen rules were each deleted in turn — the bar, invite revocation, the subset
+/// check on assignment, READ-to-manage, strict rank, SEND-without-READ, overrides, the
+/// channel guard on `join_room`, SEND on `accept` and on uploads, commit-before-apply for a
+/// space and for a kick, and a deleted channel's lockout — and each turned at least one test
+/// here red. Two did not at first; see the ADR for what that
+/// found.
+#[cfg(test)]
+mod spaces {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn ct() -> EnvelopePayload {
+        EnvelopePayload::MlsApplication { ciphertext: vec![1, 2, 3] }
+    }
+
+    struct World {
+        inst: Instance,
+        space: SpaceId,
+        channel: RoomId,
+        owner: TestSender,
+        member: TestSender,
+        stranger: TestSender,
+    }
+
+    /// An owner, one private channel with a message in it, and a plain member who joined by
+    /// invite. The stranger is registered on the instance and in nothing else.
+    fn world() -> World {
+        let inst = Instance::in_memory();
+        let owner = TestSender::registered(&inst);
+        let member = TestSender::registered(&inst);
+        let stranger = TestSender::registered(&inst);
+        let space = inst.create_space(owner.user, "Trailhead", 50).unwrap();
+        let (channel, _) = inst.create_channel(space, owner.user, "general", false).unwrap();
+        let token = inst.create_space_invite(space, owner.user, 5, None).unwrap();
+        inst.redeem_space_invite(member.user, &token, 0).unwrap();
+        inst.accept(owner.envelope(channel, ct()), 0).unwrap();
+        World { inst, space, channel, owner, member, stranger }
+    }
+
+    fn join(w: &World, who: &TestSender) {
+        let t = w.inst.create_space_invite(w.space, w.owner.user, 1, None).unwrap();
+        w.inst.redeem_space_invite(who.user, &t, 0).unwrap();
+    }
+
+    fn role(w: &World, name: &str, p: Permissions, position: u32) -> RoleId {
+        w.inst.create_role(w.space, w.owner.user, name, p, position).unwrap()
+    }
+
+    fn denied<T: std::fmt::Debug>(r: Result<T, ServerError>) -> ServerError {
+        r.expect_err("the attack must be refused")
+    }
+
+    #[test]
+    fn a_member_can_read_and_send_in_a_channel() {
+        // The counterfactual every refusal below depends on: without it, "refused" might only
+        // mean "nothing works".
+        let w = world();
+        assert_eq!(w.inst.messages_since(w.channel, w.member.user, 0, 0).unwrap().len(), 1);
+        w.inst.accept(w.member.envelope(w.channel, ct()), 0).unwrap();
+        let blob = w.inst.store_blob(w.member.user, w.channel, vec![1], 0).unwrap();
+        assert_eq!(w.inst.fetch_blob(w.owner.user, blob).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn a_non_member_cannot_read_or_write_a_channel() {
+        let w = world();
+        let s = w.stranger.user;
+        let blob = w.inst.store_blob(w.owner.user, w.channel, vec![1, 2], 0).unwrap();
+        assert!(matches!(
+            denied(w.inst.messages_since(w.channel, s, 0, 0)),
+            ServerError::NotAMember
+        ));
+        assert!(matches!(
+            denied(w.inst.accept(w.stranger.envelope(w.channel, ct()), 0)),
+            ServerError::NotAMember
+        ));
+        assert!(matches!(denied(w.inst.fetch_blob(s, blob)), ServerError::NotAMember));
+        denied(w.inst.store_blob(s, w.channel, vec![1], 0));
+        denied(w.inst.room_members(w.channel, s));
+        denied(w.inst.set_room_ttl(w.channel, s, Some(1_000)));
+        assert!(matches!(denied(w.inst.describe_space(w.space, s)), ServerError::NotASpaceMember));
+        assert_eq!(w.inst.room_role(w.channel, s), None);
+        assert!(w.inst.spaces_of(s).is_empty());
+    }
+
+    #[test]
+    fn a_channel_cannot_be_joined_through_the_room_membership_calls() {
+        // A channel's room has no member list of its own. If any room-level call could add to
+        // one, that list would be a second way in that a kick does not empty.
+        let w = world();
+        let (public, seal) = w.inst.create_channel(w.space, w.owner.user, "lobby", true).unwrap();
+        assert_eq!(seal.tier(), cairn_proto::Tier::PublicCommunity);
+        let o = w.owner.user;
+        let s = w.stranger.user;
+        for room in [w.channel, public] {
+            assert!(matches!(denied(w.inst.join_room(room, s)), ServerError::ManagedBySpace));
+            assert!(matches!(
+                denied(w.inst.add_room_member(room, o, s)),
+                ServerError::ManagedBySpace
+            ));
+            assert!(matches!(
+                denied(w.inst.create_room_invite(o, room, 1, None)),
+                ServerError::ManagedBySpace
+            ));
+            assert!(matches!(
+                denied(w.inst.remove_room_member(room, o, w.member.user)),
+                ServerError::ManagedBySpace
+            ));
+            assert!(matches!(
+                denied(w.inst.set_room_role(room, o, w.member.user, RoomRole::Owner)),
+                ServerError::ManagedBySpace
+            ));
+            denied(w.inst.messages_since(room, s, 0, 0));
+        }
+    }
+
+    #[test]
+    fn a_member_without_permission_cannot_manage_the_space() {
+        let w = world();
+        let m = w.member.user;
+        let kicker = role(&w, "kicker", Permissions::KICK, 5);
+        let missing =
+            |r: Result<(), ServerError>| matches!(r, Err(ServerError::MissingPermission(_)));
+        assert!(missing(w.inst.create_channel(w.space, m, "mine", false).map(|_| ())));
+        assert!(missing(w.inst.create_role(w.space, m, "boss", Permissions::NONE, 1).map(|_| ())));
+        assert!(missing(w.inst.assign_role(w.space, m, m, kicker)));
+        assert!(missing(w.inst.rename_channel(w.space, m, w.channel, "pwned")));
+        assert!(missing(w.inst.delete_channel(w.space, m, w.channel)));
+        assert!(missing(w.inst.edit_role(w.space, m, None, None, Some(Permissions::ALL), None)));
+        assert!(missing(w.inst.set_channel_override(
+            w.space,
+            m,
+            w.channel,
+            None,
+            Permissions::NONE,
+            Permissions::READ
+        )));
+        assert!(missing(w.inst.create_space_invite(w.space, m, 1, None).map(|_| ())));
+        assert!(missing(w.inst.set_room_ttl(w.channel, m, Some(1_000))));
+        assert!(missing(w.inst.kick_from_space(w.space, m, w.stranger.user)));
+    }
+
+    #[test]
+    fn nobody_can_take_or_build_a_role_at_or_above_their_own() {
+        let w = world();
+        let m = w.member.user;
+        let moderator =
+            role(&w, "mod", Permissions::MANAGE_ROLES.union(Permissions::DEFAULT_EVERYONE), 5);
+        let admin = role(&w, "admin", Permissions::ALL, 10);
+        let peer = role(&w, "peer", Permissions::READ, 5);
+        w.inst.assign_role(w.space, w.owner.user, m, moderator).unwrap();
+
+        let rank = |r: Result<(), ServerError>| matches!(r, Err(ServerError::RankTooLow));
+        assert!(rank(w.inst.assign_role(w.space, m, m, admin)), "a higher role");
+        assert!(rank(w.inst.assign_role(w.space, m, m, peer)), "an equal one");
+        assert!(rank(w.inst.create_role(w.space, m, "x", Permissions::READ, 5).map(|_| ())));
+        assert!(rank(w.inst.create_role(w.space, m, "x", Permissions::READ, 50).map(|_| ())));
+        assert!(
+            rank(w.inst.edit_role(w.space, m, Some(moderator), None, None, Some(50))),
+            "lift your own"
+        );
+        assert!(rank(w.inst.edit_role(
+            w.space,
+            m,
+            Some(admin),
+            None,
+            Some(Permissions::NONE),
+            None
+        )));
+        assert!(rank(w.inst.delete_role(w.space, m, admin)));
+        assert!(rank(w.inst.unassign_role(w.space, m, w.owner.user, admin)), "strip the owner");
+
+        // Something below them they built themselves cannot be lifted past them either.
+        let low = w.inst.create_role(w.space, m, "low", Permissions::READ, 3).unwrap();
+        assert!(rank(w.inst.edit_role(w.space, m, Some(low), None, None, Some(5))));
+        w.inst.edit_role(w.space, m, Some(low), None, None, Some(4)).unwrap();
+        assert!(
+            w.inst.create_role(w.space, m, "lower", Permissions::READ, 0).is_err(),
+            "0 is @everyone's"
+        );
+    }
+
+    #[test]
+    fn manage_roles_cannot_hand_out_a_permission_its_holder_lacks() {
+        // Escalation sideways rather than upward: a moderator without `kick` collecting it from
+        // a lower role someone else defined, or writing it into one.
+        let w = world();
+        let m = w.member.user;
+        let moderator =
+            role(&w, "mod", Permissions::MANAGE_ROLES.union(Permissions::DEFAULT_EVERYONE), 5);
+        let kicker = role(&w, "kicker", Permissions::KICK, 2);
+        w.inst.assign_role(w.space, w.owner.user, m, moderator).unwrap();
+
+        let unheld = |r: Result<(), ServerError>| matches!(r, Err(ServerError::CannotGrantUnheld));
+        assert!(unheld(w.inst.assign_role(w.space, m, m, kicker)));
+        assert!(unheld(w.inst.create_role(w.space, m, "x", Permissions::ALL, 1).map(|_| ())));
+        let low = w.inst.create_role(w.space, m, "low", Permissions::READ, 1).unwrap();
+        assert!(unheld(w.inst.edit_role(
+            w.space,
+            m,
+            Some(low),
+            None,
+            Some(Permissions::KICK),
+            None
+        )));
+        assert!(unheld(w.inst.edit_role(
+            w.space,
+            m,
+            None,
+            None,
+            Some(Permissions::DEFAULT_EVERYONE.union(Permissions::KICK)),
+            None
+        )));
+        // Taking away a power they lack is not granting one.
+        w.inst
+            .edit_role(
+                w.space,
+                w.owner.user,
+                Some(low),
+                None,
+                Some(Permissions::KICK.union(Permissions::READ)),
+                None,
+            )
+            .unwrap();
+        w.inst.edit_role(w.space, m, Some(low), None, Some(Permissions::READ), None).unwrap();
+        assert!(!w.inst.spaces.lock().unwrap()[&w.space]
+            .base_permissions(m)
+            .unwrap()
+            .contains(Permissions::KICK));
+    }
+
+    #[test]
+    fn equals_cannot_act_on_each_other() {
+        let w = world();
+        join(&w, &w.stranger);
+        let (a, b) = (w.member.user, w.stranger.user);
+        let senior = role(&w, "mod", Permissions::ALL, 5);
+        w.inst.assign_role(w.space, w.owner.user, a, senior).unwrap();
+        w.inst.assign_role(w.space, w.owner.user, b, senior).unwrap();
+        assert!(matches!(denied(w.inst.kick_from_space(w.space, a, b)), ServerError::RankTooLow));
+        assert!(matches!(
+            denied(w.inst.unassign_role(w.space, a, b, senior)),
+            ServerError::RankTooLow
+        ));
+        assert!(matches!(
+            denied(w.inst.kick_from_space(w.space, a, w.owner.user)),
+            ServerError::OwnerIsPermanent
+        ));
+    }
+
+    #[test]
+    fn an_override_cannot_reach_beyond_read_and_send_or_above_its_setter() {
+        let w = world();
+        let m = w.member.user;
+        let manager = role(&w, "chanmgr", Permissions::MANAGE_CHANNELS.union(Permissions::READ), 5);
+        let admin = role(&w, "admin", Permissions::ALL, 10);
+        w.inst.assign_role(w.space, w.owner.user, m, manager).unwrap();
+        let set = |r: Option<RoleId>, allow, deny| {
+            w.inst.set_channel_override(w.space, m, w.channel, r, allow, deny)
+        };
+        assert!(matches!(
+            set(None, Permissions::KICK, Permissions::NONE),
+            Err(ServerError::BadOverride)
+        ));
+        assert!(matches!(
+            set(None, Permissions::READ, Permissions::READ),
+            Err(ServerError::BadOverride)
+        ));
+        assert!(matches!(
+            set(Some(manager), Permissions::NONE, Permissions::READ),
+            Err(ServerError::RankTooLow)
+        ));
+        assert!(matches!(
+            set(Some(admin), Permissions::NONE, Permissions::READ),
+            Err(ServerError::RankTooLow)
+        ));
+        // Nothing may be allowed that the setter does not hold *in this channel*. With SEND
+        // taken from everyone here, the manager has lost it too, and cannot hand it back.
+        w.inst
+            .set_channel_override(
+                w.space,
+                w.owner.user,
+                w.channel,
+                None,
+                Permissions::NONE,
+                Permissions::SEND,
+            )
+            .unwrap();
+        assert!(matches!(
+            set(None, Permissions::SEND, Permissions::NONE),
+            Err(ServerError::CannotGrantUnheld)
+        ));
+        set(None, Permissions::NONE, Permissions::CHANNEL_SCOPED.difference(Permissions::READ))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_hidden_channel_stays_hidden_from_a_channel_manager_who_cannot_see_it() {
+        // `manage_channels` must not be a way to un-hide a channel for yourself by editing the
+        // overrides that hid it.
+        let w = world();
+        let (o, m) = (w.owner.user, w.member.user);
+        let (staff, _) = w.inst.create_channel(w.space, o, "staff", false).unwrap();
+        w.inst
+            .set_channel_override(w.space, o, staff, None, Permissions::NONE, Permissions::READ)
+            .unwrap();
+        let manager = role(
+            &w,
+            "chanmgr",
+            Permissions::MANAGE_CHANNELS.union(Permissions::DEFAULT_EVERYONE),
+            4,
+        );
+        w.inst.assign_role(w.space, o, m, manager).unwrap();
+
+        denied(w.inst.messages_since(staff, m, 0, 0));
+        let hidden = |r: Result<(), ServerError>| matches!(r, Err(ServerError::NoSuchChannel));
+        assert!(hidden(w.inst.set_channel_override(
+            w.space,
+            m,
+            staff,
+            None,
+            Permissions::NONE,
+            Permissions::NONE
+        )));
+        assert!(hidden(w.inst.set_channel_override(
+            w.space,
+            m,
+            staff,
+            Some(manager),
+            Permissions::READ,
+            Permissions::NONE
+        )));
+        assert!(hidden(w.inst.rename_channel(w.space, m, staff, "x")));
+        assert!(hidden(w.inst.delete_channel(w.space, m, staff)));
+        let view = w.inst.describe_space(w.space, m).unwrap();
+        assert!(view.channels.iter().all(|c| c.room != staff), "not even listed");
+        // While the owner, exempt from overrides, still reads it.
+        w.inst.messages_since(staff, o, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn a_role_override_lets_its_holders_into_a_hidden_channel_and_nobody_else() {
+        let w = world();
+        join(&w, &w.stranger);
+        let o = w.owner.user;
+        let (staff, _) = w.inst.create_channel(w.space, o, "staff", false).unwrap();
+        let mods = role(&w, "mods", Permissions::NONE, 3);
+        w.inst
+            .set_channel_override(w.space, o, staff, None, Permissions::NONE, Permissions::READ)
+            .unwrap();
+        w.inst
+            .set_channel_override(
+                w.space,
+                o,
+                staff,
+                Some(mods),
+                Permissions::CHANNEL_SCOPED,
+                Permissions::NONE,
+            )
+            .unwrap();
+        w.inst.assign_role(w.space, o, w.member.user, mods).unwrap();
+
+        w.inst.messages_since(staff, w.member.user, 0, 0).unwrap();
+        w.inst.accept(w.member.envelope(staff, ct()), 0).unwrap();
+        denied(w.inst.messages_since(staff, w.stranger.user, 0, 0));
+        let readers: Vec<UserId> =
+            w.inst.room_members(staff, o).unwrap().iter().map(|m| m.user).collect();
+        assert!(readers.contains(&w.member.user) && !readers.contains(&w.stranger.user));
+
+        // Taking the role away takes the channel with it, on the next request.
+        w.inst.unassign_role(w.space, o, w.member.user, mods).unwrap();
+        denied(w.inst.messages_since(staff, w.member.user, 0, 0));
+    }
+
+    #[test]
+    fn nobody_can_send_into_a_channel_they_cannot_read() {
+        let w = world();
+        w.inst
+            .set_channel_override(
+                w.space,
+                w.owner.user,
+                w.channel,
+                None,
+                Permissions::SEND,
+                Permissions::READ,
+            )
+            .unwrap();
+        denied(w.inst.accept(w.member.envelope(w.channel, ct()), 0));
+        let view = w.inst.describe_space(w.space, w.member.user).unwrap();
+        assert!(view.channels.is_empty());
+        // Checked at the source as well as at the door. `room_access` also filters on READ,
+        // which hides this clause from the two assertions above; a mutation run removing it
+        // went unnoticed until this line existed.
+        let spaces = w.inst.spaces.lock().unwrap();
+        let sp = &spaces[&w.space];
+        let here = sp.channel_permissions(w.member.user, sp.channel(w.channel).unwrap()).unwrap();
+        assert!(!here.contains(Permissions::SEND));
+    }
+
+    #[test]
+    fn read_only_is_read_only() {
+        let w = world();
+        w.inst
+            .set_channel_override(
+                w.space,
+                w.owner.user,
+                w.channel,
+                None,
+                Permissions::NONE,
+                Permissions::SEND,
+            )
+            .unwrap();
+        w.inst.messages_since(w.channel, w.member.user, 0, 0).unwrap();
+        assert!(matches!(
+            denied(w.inst.accept(w.member.envelope(w.channel, ct()), 0)),
+            ServerError::MissingPermission("send")
+        ));
+        denied(w.inst.store_blob(w.member.user, w.channel, vec![1], 0));
+    }
+
+    #[test]
+    fn a_kicked_member_loses_every_channel_at_once() {
+        let w = world();
+        let (o, m) = (w.owner.user, w.member.user);
+        let (second, _) = w.inst.create_channel(w.space, o, "second", false).unwrap();
+        let blob = w.inst.store_blob(o, w.channel, vec![9], 0).unwrap();
+        w.inst.messages_since(second, m, 0, 0).unwrap();
+
+        w.inst.kick_from_space(w.space, o, m).unwrap();
+
+        for room in [w.channel, second] {
+            denied(w.inst.messages_since(room, m, 0, 0));
+            denied(w.inst.room_members(room, m));
+            let listed = w.inst.room_members(room, o).unwrap();
+            assert!(
+                listed.iter().all(|x| x.user != m),
+                "dropped from what clients compare the roster to"
+            );
+        }
+        denied(w.inst.accept(w.member.envelope(w.channel, ct()), 0));
+        denied(w.inst.fetch_blob(m, blob));
+        denied(w.inst.describe_space(w.space, m));
+        assert!(w.inst.spaces_of(m).is_empty());
+    }
+
+    #[test]
+    fn a_kicked_member_cannot_walk_back_in_with_an_invite() {
+        // Without the bar a kick lasts as long as pasting a link takes: any live invite —
+        // including one the member minted for themselves while they could — readmits them.
+        let w = world();
+        let (o, m) = (w.owner.user, w.member.user);
+        let inviter = role(&w, "inviter", Permissions::INVITE, 1);
+        w.inst.assign_role(w.space, o, m, inviter).unwrap();
+        let theirs = w.inst.create_space_invite(w.space, m, 5, None).unwrap();
+        let someone_elses = w.inst.create_space_invite(w.space, o, 5, None).unwrap();
+
+        w.inst.kick_from_space(w.space, o, m).unwrap();
+
+        let invalid =
+            |r: Result<SpaceId, ServerError>| matches!(r, Err(ServerError::RoomInviteInvalid));
+        assert!(invalid(w.inst.redeem_space_invite(m, &theirs, 0)));
+        assert!(invalid(w.inst.redeem_space_invite(m, &someone_elses, 0)));
+        // Their links are revoked for everyone, so they cannot be handed to a second account.
+        assert!(invalid(w.inst.redeem_space_invite(w.stranger.user, &theirs, 0)));
+
+        // Lifting the bar is a decision someone with `kick` makes, and then the link works.
+        w.inst.unbar_from_space(w.space, o, m).unwrap();
+        w.inst.redeem_space_invite(m, &someone_elses, 0).unwrap();
+        w.inst.messages_since(w.channel, m, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn leaving_is_not_a_kick() {
+        let w = world();
+        let m = w.member.user;
+        w.inst.kick_from_space(w.space, m, m).unwrap();
+        denied(w.inst.messages_since(w.channel, m, 0, 0));
+        let t = w.inst.create_space_invite(w.space, w.owner.user, 1, None).unwrap();
+        w.inst.redeem_space_invite(m, &t, 0).unwrap();
+        assert!(matches!(
+            denied(w.inst.kick_from_space(w.space, w.owner.user, w.owner.user)),
+            ServerError::OwnerIsPermanent
+        ));
+    }
+
+    #[test]
+    fn a_kick_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("cairn-kick-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (channel, staff, m, token, mods) = {
+            let inst =
+                Instance::open(Arc::new(crate::storage::DbStorage::new(&dir).unwrap())).unwrap();
+            let o = TestSender::registered(&inst);
+            let m = TestSender::registered(&inst);
+            let space = inst.create_space(o.user, "S", 10).unwrap();
+            let (channel, _) = inst.create_channel(space, o.user, "c", false).unwrap();
+            let (staff, _) = inst.create_channel(space, o.user, "staff", false).unwrap();
+            let mods = inst.create_role(space, o.user, "mods", Permissions::NONE, 2).unwrap();
+            inst.set_channel_override(
+                space,
+                o.user,
+                staff,
+                None,
+                Permissions::NONE,
+                Permissions::READ,
+            )
+            .unwrap();
+            inst.set_channel_override(
+                space,
+                o.user,
+                staff,
+                Some(mods),
+                Permissions::READ,
+                Permissions::NONE,
+            )
+            .unwrap();
+            let token = inst.create_space_invite(space, o.user, 5, None).unwrap();
+            inst.redeem_space_invite(m.user, &token, 0).unwrap();
+            inst.assign_role(space, o.user, m.user, mods).unwrap();
+            inst.messages_since(staff, m.user, 0, 0).unwrap();
+            inst.kick_from_space(space, o.user, m.user).unwrap();
+            (channel, staff, m.user, token, mods)
+        };
+        let inst = Instance::open(Arc::new(crate::storage::DbStorage::new(&dir).unwrap())).unwrap();
+        denied(inst.messages_since(channel, m, 0, 0));
+        denied(inst.messages_since(staff, m, 0, 0));
+        assert!(matches!(
+            denied(inst.redeem_space_invite(m, &token, 0)),
+            ServerError::RoomInviteInvalid
+        ));
+        // And the rest of the space came back too: the role, its override, the seal.
+        assert_eq!(inst.room_seal(staff).unwrap().tier(), cairn_proto::Tier::PrivateCommunity);
+        let space = inst.spaces.lock().unwrap().values().next().unwrap().clone();
+        assert!(space.role(mods).is_some());
+        assert_eq!(space.channel(staff).unwrap().overrides.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_channels_tier_is_sealed_at_creation_and_nothing_moves_it() {
+        let w = world();
+        let o = w.owner.user;
+        let before = w.inst.room_seal(w.channel).unwrap();
+        assert!(before.tier().is_e2ee());
+
+        // Everything an owner can do to a channel short of deleting it.
+        w.inst.rename_channel(w.space, o, w.channel, "renamed").unwrap();
+        w.inst
+            .set_channel_override(w.space, o, w.channel, None, Permissions::READ, Permissions::NONE)
+            .unwrap();
+        w.inst.set_room_ttl(w.channel, o, Some(60_000)).unwrap();
+        denied(w.inst.join_room(w.channel, w.stranger.user));
+        assert_eq!(w.inst.room_seal(w.channel).unwrap(), before);
+        assert!(matches!(
+            denied(w.inst.accept(
+                w.owner.envelope(w.channel, EnvelopePayload::Plaintext { body: "hi".into() }),
+                0
+            )),
+            ServerError::Rejected(_)
+        ));
+
+        // "Changing" it means a different room, and the old one is gone for everyone.
+        w.inst.delete_channel(w.space, o, w.channel).unwrap();
+        let (again, seal) = w.inst.create_channel(w.space, o, "renamed", true).unwrap();
+        assert_ne!(again, w.channel);
+        assert!(!seal.tier().is_e2ee());
+        assert!(
+            w.inst.messages_since(again, o, 0, 0).unwrap().is_empty(),
+            "no history carried over"
+        );
+        denied(w.inst.messages_since(w.channel, o, 0, 0));
+        assert_eq!(w.inst.room_seal(w.channel).unwrap(), before, "the old room keeps its seal");
+    }
+
+    #[test]
+    fn a_space_too_big_to_encrypt_cannot_have_an_encrypted_channel() {
+        // The ceiling is an input to every channel's tier. A private channel in a space of
+        // 2,001 is T3 — said by the seal, not hidden behind the word "private".
+        let w = world();
+        let big = w
+            .inst
+            .create_space(w.owner.user, "Big", cairn_proto::tier::T2_MAX_MEMBERS + 1)
+            .unwrap();
+        let (room, seal) = w.inst.create_channel(big, w.owner.user, "private?", false).unwrap();
+        assert!(!seal.tier().is_e2ee());
+        assert_eq!(w.inst.describe_space(big, w.owner.user).unwrap().channels[0].room, room);
+        assert!(!w.inst.describe_space(big, w.owner.user).unwrap().channels[0].e2ee);
+    }
+
+    #[test]
+    fn a_space_cannot_exceed_its_ceiling() {
+        let inst = Instance::in_memory();
+        let o = TestSender::registered(&inst);
+        let a = TestSender::registered(&inst);
+        let b = TestSender::registered(&inst);
+        let space = inst.create_space(o.user, "Two", 2).unwrap();
+        let t = inst.create_space_invite(space, o.user, 5, None).unwrap();
+        inst.redeem_space_invite(a.user, &t, 0).unwrap();
+        assert!(matches!(inst.redeem_space_invite(b.user, &t, 0), Err(ServerError::SpaceFull)));
+        inst.redeem_space_invite(a.user, &t, 0).unwrap();
+    }
+
+    #[test]
+    fn the_view_says_what_the_viewer_may_do_and_the_rules_agree() {
+        // The UI renders `manageable` rather than computing the hierarchy, so the flag must be
+        // the rule's answer, not an approximation of it.
+        let w = world();
+        join(&w, &w.stranger);
+        let m = w.member.user;
+        let senior = role(&w, "senior", Permissions::ALL.difference(Permissions::KICK), 5);
+        let kicker = role(&w, "kicker", Permissions::KICK, 1);
+        let junior = role(&w, "junior", Permissions::READ, 2);
+        let top = role(&w, "top", Permissions::READ, 9);
+        w.inst.assign_role(w.space, w.owner.user, m, senior).unwrap();
+        let view = w.inst.describe_space(w.space, m).unwrap();
+        for r in &view.roles {
+            let attempt = w.inst.edit_role(w.space, m, Some(r.id), Some("probe"), None, None);
+            assert_eq!(r.manageable, attempt.is_ok(), "role {}", r.name);
+            let attempt = w.inst.assign_role(w.space, m, w.stranger.user, r.id);
+            assert_eq!(r.assignable, attempt.is_ok(), "assigning {}", r.name);
+        }
+        let edits_self = view.members.iter().find(|x| x.user == m).unwrap();
+        assert!(edits_self.roles_editable && !edits_self.manageable, "self: re-role yes, kick no");
+        let _ = (junior, top, kicker);
+        assert!(!view.my_permissions.contains(Permissions::KICK));
+        let stranger = view.members.iter().find(|x| x.user == w.stranger.user).unwrap();
+        let owner = view.members.iter().find(|x| x.user == w.owner.user).unwrap();
+        assert!(stranger.manageable && !owner.manageable && owner.owner);
+        assert!(view.channels[0].overrides.is_some(), "a channel manager sees overrides");
+        let plain = w.inst.describe_space(w.space, w.stranger.user).unwrap();
+        assert!(plain.channels[0].overrides.is_none());
+        assert!(plain.roles.iter().all(|r| !r.manageable));
+    }
+
+    /// A store whose commits can be made to fail.
+    #[derive(Debug, Default)]
+    struct FailingStorage {
+        inner: crate::storage::MemoryStorage,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::storage::Storage for FailingStorage {
+        fn load_or_create_franking_key(
+            &self,
+        ) -> Result<cairn_crypto::franking::ServerFrankingKey, StorageError> {
+            self.inner.load_or_create_franking_key()
+        }
+        fn load_directory(&self) -> Result<crate::storage::Directory, StorageError> {
+            self.inner.load_directory()
+        }
+        fn commit(&self, writes: &[Write]) -> Result<(), StorageError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StorageError::Io(std::io::Error::other("disk full")));
+            }
+            self.inner.commit(writes)
+        }
+        fn messages_since(
+            &self,
+            room: RoomId,
+            after: u64,
+        ) -> Result<Vec<StoredMessage>, StorageError> {
+            self.inner.messages_since(room, after)
+        }
+        fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
+            self.inner.blob_meta(id)
+        }
+        fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.blob_bytes(id)
+        }
+    }
+
+    #[test]
+    fn a_change_that_fails_to_persist_is_not_applied() {
+        // Memory and disk must agree. A role granted in memory and lost on disk is a grant that
+        // works until the next restart and then silently vanishes — or, for a kick, an
+        // ejection that silently undoes itself.
+        let storage = Arc::new(FailingStorage::default());
+        let inst = Instance::open(storage.clone()).unwrap();
+        let o = TestSender::registered(&inst);
+        let m = TestSender::registered(&inst);
+        let space = inst.create_space(o.user, "S", 10).unwrap();
+        let (channel, _) = inst.create_channel(space, o.user, "c", false).unwrap();
+        let mods = inst.create_role(space, o.user, "mods", Permissions::KICK, 2).unwrap();
+        let t = inst.create_space_invite(space, o.user, 1, None).unwrap();
+        inst.redeem_space_invite(m.user, &t, 0).unwrap();
+
+        storage.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            inst.assign_role(space, o.user, m.user, mods),
+            Err(ServerError::Storage(_))
+        ));
+        assert!(matches!(
+            inst.kick_from_space(space, o.user, m.user),
+            Err(ServerError::Storage(_))
+        ));
+        storage.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let held = inst.spaces.lock().unwrap()[&space].base_permissions(m.user).unwrap();
+        assert!(!held.contains(Permissions::KICK), "the failed grant is not in memory");
+        inst.messages_since(channel, m.user, 0, 0).expect("nor is the failed kick");
     }
 }

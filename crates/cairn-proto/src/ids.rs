@@ -93,6 +93,13 @@ opaque_id!(
 );
 opaque_id!(RoomId, "rom", "A conversation: DM, group chat, or community channel.");
 opaque_id!(MessageId, "msg", "A single message.");
+opaque_id!(
+    SpaceId,
+    "spc",
+    "A space: a container of channels, each of which is a room with its own sealed tier. \
+     See `docs/adr/011-spaces-channels-roles.md`."
+);
+opaque_id!(RoleId, "rol", "A role within one space. Meaningless outside it.");
 opaque_id!(InstanceId, "ins", "A Cairn server instance.");
 opaque_id!(
     BlobId,

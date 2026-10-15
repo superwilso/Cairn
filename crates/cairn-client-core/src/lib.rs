@@ -27,6 +27,7 @@ pub mod history;
 pub mod profile;
 #[cfg(feature = "http")]
 pub mod session;
+pub mod spaces;
 pub mod statedir;
 pub mod store;
 pub mod thread;
