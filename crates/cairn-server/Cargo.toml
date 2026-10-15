@@ -32,6 +32,12 @@ redb = "2.6"
 sha2.workspace = true
 subtle.workspace = true
 rand.workspace = true
+zeroize.workspace = true
+# coturn's REST-auth relay credentials (state.rs, "TURN relay credentials"): the scheme is
+# HMAC-SHA1, base64. All three are already in the lock file.
+hmac.workspace = true
+sha1 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 cairn-client-core.workspace = true

@@ -624,5 +624,9 @@ const CairnProfile = (() => {
         hooks = { roomOpen: () => true, ...hooks, ...h };
     }
 
-    return { init, signedIn, load, handle, author, member, openCard, openEditor, relabel };
+    return {
+        init, signedIn, load, handle, author, member, openCard, openEditor, relabel,
+        // For the call screens: the same avatar and name every other surface draws.
+        avatar, nameInto, view: viewOf,
+    };
 })();

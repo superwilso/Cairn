@@ -86,6 +86,7 @@ pub fn router_behind(instance: SharedInstance, proxies: TrustedProxies) -> Route
         )
         .route("/v1/blobs/{blob}", get(download_blob))
         .route("/v1/rooms/{room}/ttl", post(set_room_ttl))
+        .route("/v1/rooms/{room}/turn", post(turn_credentials))
         .route("/v1/rooms/{room}/invites", post(create_room_invite))
         .route("/v1/invites/redeem", post(redeem_room_invite))
         .route("/v1/usernames", post(claim_username))
@@ -168,7 +169,9 @@ impl IntoResponse for ServerError {
             ServerError::GifTargetRefused => StatusCode::FORBIDDEN,
             ServerError::GifUpstreamUnreachable => StatusCode::BAD_GATEWAY,
             // Startup only, like `InviteTooShort`.
-            ServerError::GifConfigInvalid(_) => StatusCode::BAD_REQUEST,
+            ServerError::GifConfigInvalid(_) | ServerError::TurnConfigInvalid(_) => {
+                StatusCode::BAD_REQUEST
+            }
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -493,6 +496,45 @@ async fn list_room_members(
             })
             .collect(),
     ))
+}
+
+/// What a member asking for relay credentials gets back.
+///
+/// `ice_servers` is empty when the operator runs no relay. That is an answer, not an error:
+/// the client tells its user calls are STUN-only rather than treating it as a failure.
+#[derive(Serialize)]
+struct TurnResponse {
+    ice_servers: Vec<IceServerResponse>,
+    ttl_secs: u64,
+}
+
+#[derive(Serialize)]
+struct IceServerResponse {
+    urls: Vec<String>,
+    username: String,
+    credential: String,
+}
+
+/// Short-lived TURN credentials for a call in this room. Rules in
+/// [`crate::state::Instance::turn_credentials`]; a POST so nothing caches the answer.
+async fn turn_credentials(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<TurnResponse>, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "turn_credentials", Some(room.into()))?;
+    Ok(Json(match instance.turn_credentials(room, actor, now_ms())? {
+        Some(grant) => TurnResponse {
+            ttl_secs: grant.ttl_secs,
+            ice_servers: vec![IceServerResponse {
+                urls: grant.urls,
+                username: grant.username,
+                credential: grant.credential,
+            }],
+        },
+        None => TurnResponse { ice_servers: Vec::new(), ttl_secs: 0 },
+    }))
 }
 
 #[derive(Deserialize)]

@@ -283,6 +283,15 @@ struct OpenRoom {
 /// the room stays open.
 const TIMER_RECHECK_MS: i64 = 10_000;
 
+/// A call this device is being rung for: which call, and who announced it.
+///
+/// Who is kept so a decline can be addressed to them — a decline broadcast to the room
+/// would tell every participant, rather than the person who rang.
+struct Ringing {
+    call: String,
+    from: String,
+}
+
 /// One signed-in client.
 pub struct Session {
     client: Client<HttpTransport>,
@@ -306,7 +315,7 @@ pub struct Session {
     /// This is what makes a call *ring*. Without it the only way into a call was for both
     /// people to press the button independently and hope their minted ids reconciled —
     /// there was no way to be told a call had started at all.
-    ringing: Option<String>,
+    ringing: Option<Ringing>,
     /// Attachments seen in the open room, with the keys that open them. Never handed to a
     /// frontend; see `attachments.rs` for why a frontend can only fetch what is in here.
     attachments: attachments::Known,
@@ -750,7 +759,7 @@ impl Session {
                         // Own signals come back through the room; applying one to yourself
                         // would have a peer negotiating with itself.
                         if from != me && signal.is_for(&me) {
-                            if let Some(signal) = self.reconcile(*signal) {
+                            if let Some(signal) = self.reconcile(&from, *signal) {
                                 events.push(Event::Signal { from, signal });
                             }
                         }
@@ -965,7 +974,7 @@ impl Session {
         let call = self
             .call
             .clone()
-            .or_else(|| self.ringing.take())
+            .or_else(|| self.ringing.take().map(|r| r.call))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.call = Some(call.clone());
         self.signal(CallSignal {
@@ -991,6 +1000,54 @@ impl Session {
         Ok(())
     }
 
+    /// Say no to the call this device is being rung for.
+    ///
+    /// Addressed to whoever rang, and sent under *their* call id: this device is not in a
+    /// call, so there is no id of its own to stamp. Forgets the ring, so pressing "call"
+    /// afterwards starts a call rather than quietly joining the one just declined.
+    ///
+    /// A no-op when nothing is ringing: declining twice, or after the caller hung up, must
+    /// not put a stray signal on the wire.
+    pub fn call_decline(&mut self) -> Result<(), SessionError> {
+        if self.call.is_some() {
+            return Ok(());
+        }
+        let Some(ring) = self.ringing.take() else { return Ok(()) };
+        let decline = CallSignal {
+            call: ring.call,
+            kind: SignalKind::Decline,
+            to: Some(ring.from),
+            payload: String::new(),
+        };
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let outbound = open.convo.send_signal(decline, now_ms())?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+        Ok(())
+    }
+
+    /// What a call in the open room should use: ICE servers, with fresh relay credentials
+    /// when the instance runs a relay, and whether the room is a DM.
+    ///
+    /// Asked for on every join rather than once per session, because relay credentials
+    /// expire. Without an open room there is no call to configure, and the answer is the
+    /// STUN-only default.
+    pub fn call_config(&self) -> Result<crate::call::CallConfig, SessionError> {
+        let (instance, direct) = match &self.open {
+            Some(open) => (self.client.turn_credentials(open.convo.room())?, open.seal.is_direct()),
+            None => (Vec::new(), false),
+        };
+        let ice_servers = crate::call::ice_servers_with(instance);
+        Ok(crate::call::CallConfig {
+            has_relay: crate::call::has_relay(&ice_servers),
+            ice_servers,
+            max_participants: crate::call::MAX_MESH_PARTICIPANTS,
+            direct,
+        })
+    }
+
     /// Decide whether an incoming signal belongs to the call this device is in — and, when
     /// two devices disagree about which call that is, settle it.
     ///
@@ -1014,7 +1071,7 @@ impl Session {
     /// attacker nothing they did not have; it is recorded because the failure is silent and
     /// looks like a network fault. Closing it needs a roster the call does not have —
     /// `docs/12-realtime-media.md` §2's per-call MLS group is where that comes from.
-    fn reconcile(&mut self, mut signal: CallSignal) -> Option<CallSignal> {
+    fn reconcile(&mut self, from: &str, mut signal: CallSignal) -> Option<CallSignal> {
         let Some(mine) = self.call.clone() else {
             // Not in the call. Arrival and departure announcements are still worth
             // surfacing: the first is the only way this device learns a call is happening —
@@ -1025,14 +1082,15 @@ impl Session {
             // its user has not accepted.
             return match signal.kind {
                 SignalKind::Join => {
-                    self.ringing = Some(signal.call.clone());
+                    self.ringing =
+                        Some(Ringing { call: signal.call.clone(), from: from.to_string() });
                     Some(signal)
                 }
                 SignalKind::Leave => {
                     // Whoever was calling has given up. Forgetting the id stops a later
                     // `call_join` adopting a call nobody is in; if somebody else is still in
                     // it, their acknowledgement renames this device into it anyway.
-                    if self.ringing.as_deref() == Some(signal.call.as_str()) {
+                    if self.ringing.as_ref().is_some_and(|r| r.call == signal.call) {
                         self.ringing = None;
                     }
                     Some(signal)

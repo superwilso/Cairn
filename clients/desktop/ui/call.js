@@ -27,6 +27,15 @@
 // video transceiver from the start and `replaceTrack` fills it later. Turning a camera on
 // mid-call, and starting a screen share, then cost one function call and no new SDP — which
 // is also why they are instant rather than taking a second to re-handshake with everyone.
+//
+// ## Mute state travels peer to peer, not through the instance
+//
+// Whether someone is muted or deafened rides a WebRTC data channel on each peer connection —
+// DTLS, end to end between the two devices, like the media. Sending it as a signal would
+// have worked too, and would have handed the instance a timestamped log of every time each
+// participant muted or unmuted. The channel is created on both sides as `negotiated` with a
+// fixed id, so neither side waits for the other to announce it. What arrives on it is
+// attributed to the connection it came in on, never to anything it claims about itself.
 
 /* eslint-env browser */
 
@@ -36,7 +45,19 @@ const CairnCall = (() => {
     let me = null;
     let local = null;          // MediaStream: the mic, and the camera when it is on
     let screen = null;         // MediaStream from getDisplayMedia, when sharing
-    const peers = new Map();   // user id -> { pc, pending, stream, audioSender, videoSender }
+    const peers = new Map();   // user id -> { pc, pending, stream, audioSender, videoSender, channel }
+
+    // What the microphone is doing. `enabled` on the track is derived from all four, so no
+    // combination of buttons and keys can leave it open by accident.
+    const mic = { muted: false, deafened: false, ptt: false, held: false };
+
+    // Capture and routing choices from Settings → Voice & video.
+    const prefs = {
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true,
+        relayOnly: false,
+    };
 
     // The UI hands these in so this file has no opinions about the DOM.
     let ui = {
@@ -44,12 +65,16 @@ const CairnCall = (() => {
         onState: () => {},     // (userId, connectionState)
         onNotice: () => {},    // (text)
         onEnd: () => {},       // ()
+        onPeerState: () => {}, // (userId, { muted, deafened }) — from their data channel
+        onDecline: () => {},   // (userId) — somebody rung for this call said no
     };
 
     const wanted = { mic: "", camera: "", speaker: "" };
 
+    // Fetched afresh rather than cached: relay credentials in it expire, and it describes
+    // the open room, which changes.
     async function loadConfig() {
-        if (!config) config = await window.__TAURI__.core.invoke("call_config");
+        config = await window.__TAURI__.core.invoke("call_config");
         return config;
     }
 
@@ -67,7 +92,16 @@ const CairnCall = (() => {
         };
     }
 
-    const micConstraint = () => (wanted.mic ? { deviceId: { exact: wanted.mic } } : true);
+    // The three processing switches are browser features, applied before anything is
+    // encoded. Off is for people with a good microphone who want it to sound like itself —
+    // and echo cancellation off with speakers rather than headphones will feed the room back
+    // to itself, which the settings copy says.
+    const micConstraint = () => ({
+        ...(wanted.mic ? { deviceId: { exact: wanted.mic } } : {}),
+        noiseSuppression: prefs.noiseSuppression,
+        echoCancellation: prefs.echoCancellation,
+        autoGainControl: prefs.autoGainControl,
+    });
     const camConstraint = () => ({
         ...(wanted.camera ? { deviceId: { exact: wanted.camera } } : {}),
         width: { ideal: 1280 },
@@ -94,8 +128,10 @@ const CairnCall = (() => {
         const existing = peers.get(user);
         if (existing) return existing;
 
-        const pc = new RTCPeerConnection({ iceServers: (config && config.ice_servers) || [] });
-        const entry = { pc, pending: [], stream: new MediaStream(), audioSender: null, videoSender: null };
+        const pc = new RTCPeerConnection(rtcConfig());
+        const entry = {
+            pc, pending: [], stream: new MediaStream(), audioSender: null, videoSender: null, channel: null,
+        };
         peers.set(user, entry);
 
         const audio = local && local.getAudioTracks()[0];
@@ -117,6 +153,8 @@ const CairnCall = (() => {
                 : pc.addTransceiver("video", { direction: "sendrecv" });
             entry.videoSender = tx.sender;
         }
+
+        openStateChannel(user, entry);
 
         pc.onicecandidate = (ev) => {
             if (!ev.candidate) return;
@@ -144,6 +182,58 @@ const CairnCall = (() => {
             }
         };
         return entry;
+    }
+
+    // "Always use the relay" is `iceTransportPolicy: "relay"`: the browser gathers relay
+    // candidates only, so no host or server-reflexive address — the two that reveal where
+    // this device is — is ever offered to a peer. Without a relay configured that means no
+    // candidates at all, which is why `join` refuses rather than letting the call hang.
+    function rtcConfig() {
+        return {
+            iceServers: (config && config.ice_servers) || [],
+            iceTransportPolicy: prefs.relayOnly ? "relay" : "all",
+        };
+    }
+
+    // ---- mute state, peer to peer -----------------------------------------
+
+    function openStateChannel(user, entry) {
+        if (typeof entry.pc.createDataChannel !== "function") return;
+        let channel;
+        try {
+            channel = entry.pc.createDataChannel("cairn-state", { negotiated: true, id: 0, ordered: true });
+        } catch (_) { return; }
+        entry.channel = channel;
+        channel.onopen = () => sendState(entry);
+        channel.onmessage = (ev) => {
+            // A peer's own client wrote this, so it is checked rather than trusted: two
+            // booleans, nothing else, and never a claim about *who* is muted — that is the
+            // connection's to say.
+            const raw = String(ev.data);
+            if (raw.length > 256) return;
+            let state;
+            try { state = JSON.parse(raw); } catch (_) { return; }
+            if (!state || typeof state !== "object") return;
+            ui.onPeerState(user, { muted: state.muted === true, deafened: state.deafened === true });
+        };
+    }
+
+    const ownState = () => ({ muted: mic.muted || mic.deafened, deafened: mic.deafened });
+
+    function sendState(entry) {
+        const ch = entry.channel;
+        if (!ch || ch.readyState !== "open") return;
+        try { ch.send(JSON.stringify(ownState())); } catch (_) { /* closing */ }
+    }
+
+    function broadcastState() {
+        for (const entry of peers.values()) sendState(entry);
+    }
+
+    // The one place the microphone is opened or closed.
+    function applyMic() {
+        const open = !mic.muted && !mic.deafened && (!mic.ptt || mic.held);
+        if (local) local.getAudioTracks().forEach((t) => { t.enabled = open; });
     }
 
     async function offerTo(user) {
@@ -198,6 +288,11 @@ const CairnCall = (() => {
 
             if (signal.kind === "leave") {
                 drop(from);
+                return;
+            }
+
+            if (signal.kind === "decline") {
+                ui.onDecline(from);
                 return;
             }
 
@@ -271,6 +366,14 @@ const CairnCall = (() => {
 
     async function join({ video, myUser }) {
         await loadConfig();
+        // Refused before the microphone opens. With relay-only on and no relay, the browser
+        // gathers no candidate at all, and the call would sit at "connecting" for ever.
+        if (prefs.relayOnly && !config.has_relay) {
+            throw new Error(
+                "“Always use the relay” is on, but this instance runs no relay, so a call " +
+                "cannot connect. Turn it off in Settings → Voice & video to call directly."
+            );
+        }
         me = myUser;
         local = await navigator.mediaDevices.getUserMedia({
             audio: micConstraint(),
@@ -284,6 +387,7 @@ const CairnCall = (() => {
             stopTracks();
             throw e;
         }
+        applyMic();
         return { callId, local, config };
     }
 
@@ -297,6 +401,12 @@ const CairnCall = (() => {
         ui.onEnd();
     }
 
+    function resetMic() {
+        mic.muted = false;
+        mic.deafened = false;
+        mic.held = false;
+    }
+
     function stopTracks() {
         for (const s of [local, screen]) if (s) s.getTracks().forEach((t) => t.stop());
         local = null;
@@ -306,10 +416,46 @@ const CairnCall = (() => {
     // ---- in-call controls --------------------------------------------------
 
     // Muting is `enabled = false`, not stopping the track: stopping it would tear down the
-    // negotiated media line and need a renegotiation to come back. The remote sees the
-    // track go muted, which is what a mute indicator should be driven by.
+    // negotiated media line and need a renegotiation to come back. A disabled track sends
+    // silence, which a remote cannot tell from a quiet room — so the state also goes to every
+    // peer over the data channel, which is what their mute indicator shows.
     function setMuted(muted) {
-        if (local) local.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+        mic.muted = !!muted;
+        applyMic();
+        broadcastState();
+    }
+
+    // Deafened is muted as well, as in every product people know it from: hearing nobody
+    // while still transmitting is a hot mic nobody meant to leave on. Silencing what this
+    // device *plays* is callaudio.js's; this side closes the microphone and tells peers.
+    function setDeafened(deafened) {
+        mic.deafened = !!deafened;
+        applyMic();
+        broadcastState();
+    }
+
+    // Push-to-talk gates the microphone on a held key. Not signalled to peers: the speaking
+    // ring already shows when someone talks.
+    function setPushToTalk(on) {
+        mic.ptt = !!on;
+        mic.held = false;
+        applyMic();
+    }
+
+    function setTalking(held) {
+        mic.held = !!held;
+        applyMic();
+    }
+
+    // New values apply to the next call; a running one recaptures the microphone so the
+    // processing switches take effect at once. The relay choice cannot be changed under a
+    // live connection without restarting ICE, so it waits for the next call, and says so.
+    async function setPrefs(next) {
+        const before = { ...prefs };
+        for (const k of Object.keys(prefs)) if (k in next) prefs[k] = !!next[k];
+        const processing = ["noiseSuppression", "echoCancellation", "autoGainControl"];
+        if (local && processing.some((k) => before[k] !== prefs[k])) await useMicrophone(wanted.mic);
+        return { relayChangedMidCall: !!callId && before.relayOnly !== prefs.relayOnly };
     }
 
     // Every peer's video sender at once. `replaceTrack(null)` genuinely stops sending
@@ -369,6 +515,7 @@ const CairnCall = (() => {
         }
         local.getAudioTracks().forEach((t) => { t.stop(); local.removeTrack(t); });
         local.addTrack(track);
+        applyMic();
     }
 
     async function useCamera(deviceId) {
@@ -387,11 +534,15 @@ const CairnCall = (() => {
     const shortId = (id) => String(id).replace(/^usr_/, "").slice(0, 8);
 
     return {
-        loadConfig, devices, join, leave, handle,
-        setMuted, setCameraOn,
+        loadConfig, devices, join, leave, handle, resetMic,
+        setMuted, setDeafened, setPushToTalk, setTalking, setPrefs, setCameraOn,
         startScreenShare, stopScreenShare,
         useMicrophone, useCamera, useSpeaker, applySpeaker, canChooseSpeaker,
         get callId() { return callId; },
+        get local() { return local; },
+        get transmitting() { return !!local && local.getAudioTracks().some((t) => t.enabled); },
+        get prefs() { return { ...prefs }; },
+        get config() { return config; },
         get peerCount() { return peers.size; },
         bind(handlers) { ui = { ...ui, ...handlers }; },
     };
