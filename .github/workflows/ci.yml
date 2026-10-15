@@ -141,6 +141,12 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/settings.browser.test.js
+      - name: Spaces in a browser
+        # The rail, channels and people draw the instance's permission flags and decide none
+        # of them; the rules are attacked in cargo (ADR-011).
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/spaces.browser.test.js
 
   lint:
     name: fmt + clippy

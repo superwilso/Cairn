@@ -37,9 +37,9 @@ Discord is the benchmark; nobody else is close.
 
 | Feature | Discord | Signal | WhatsApp | Instagram | Telegram | Cairn |
 |---|---|---|---|---|---|---|
-| Servers / spaces | ✅ | ❌ | ⚠️ Communities | ❌ | ⚠️ Channels | 🎯 v1 |
-| Channels within a server | ✅ | ❌ | ⚠️ | ❌ | ❌ | 🎯 v1 |
-| Roles & granular permissions | ✅ | ❌ | ⚠️ admin only | ❌ | ⚠️ admin only | 🎯 v1 |
+| Servers / spaces | ✅ | ❌ | ⚠️ Communities | ❌ | ⚠️ Channels | ✅ spaces, ADR-011 |
+| Channels within a server | ✅ | ❌ | ⚠️ | ❌ | ❌ | ✅ each its own room and tier |
+| Roles & granular permissions | ✅ | ❌ | ⚠️ admin only | ❌ | ⚠️ admin only | ⚠️ six bits + overrides; instance-held |
 | Voice channels (drop-in) | ✅ | ❌ | ❌ | ❌ | ⚠️ voice chats | 🎯 v2 |
 | Screen share | ✅ | ⚠️ in call | ⚠️ in call | ❌ | ✅ | 🎯 v2 |
 | Stage / broadcast | ✅ | ❌ | ❌ | ⚠️ Live | ✅ | 🎯 v3 |

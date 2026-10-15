@@ -18,13 +18,15 @@ ui/call.js          WebRTC: peer connections, devices, screen share
 ui/timer.js         the disappearing-message control and its notices
 ui/messages.js      drawing a message; replying and reacting to it
 ui/profile.js       avatars, names, the profile card and editor (+ profile.css)
+ui/spaces.js        the space rail, a space's channels and people (+ spaces.css); draws the
+                    instance's permission flags and decides none of them (ADR-011)
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
 Everything the UI can do goes through `cairn_client_core::session::Session`. **The FFI line
 falls between Rust and JavaScript**: `src-tauri` is below it, `ui/` is above it, and the UI
-only ever receives plain data. It never constructs an envelope, decides a tier, or touches a
-key — the rule [ADR-006](../../docs/adr/006-platform-architecture.md) drew for five native
+only ever receives plain data. It never constructs an envelope, decides a tier, decides a
+permission, or touches a key — the rule [ADR-006](../../docs/adr/006-platform-architecture.md) drew for five native
 clients and [ADR-008](../../docs/adr/008-client-architecture.md) kept when it replaced them
 with one.
 

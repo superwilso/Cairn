@@ -396,6 +396,22 @@ Four calls made by the owner, so a session does not re-litigate them:
       that is somebody's short id) are flagged and shown with the id rather than trusted.
       **Not done:** binding the decrypted ciphertext to the envelope's signer (needs the MLS
       sender from `cairn-crypto`), and sending changes into rooms that are not open.
+- [x] **Spaces, channels and roles** ([ADR-011](adr/011-spaces-channels-roles.md)). A space
+      holds channels, each an ordinary room with its own sealed, immutable tier; roles carry
+      six permission bits under a strict rank rule, with per-channel read/send overrides.
+      Rules in `state.rs` behind one access check, routes in `spaces_http.rs`, the client
+      half in `cairn-client-core`, and a space rail and channel list in the desktop client
+      that draws the instance's flags rather than deciding any.
+
+      **Probed before trusted**, and every probe — non-member reads, unpermitted channel and
+      role changes, escalation, a kicked member keeping access, a tier change — was refused,
+      in-process and over HTTP. Removing each rule to see its test go red is what found
+      things: two tests that could not fail, and a kick that revoked invites in memory before
+      the write could fail.
+
+      **Stated rather than hidden:** roles are instance-held metadata the operator can see
+      and fabricate; a kick stops the instance serving a member but does not take back an
+      encrypted channel's keys until a member commits the removal (`remove_departed`).
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
@@ -426,6 +442,12 @@ Four calls made by the owner, so a session does not re-litigate them:
 - [ ] **Subscribable policy lists** — `04-safety-architecture.md` §2 calls this the
       highest-leverage safety item, and it is still unbuilt
 - [ ] Group franking reviewed under the current server-anchored design
+- [ ] **Roles inside the MLS group**, reviewed. Space roles are instance-held by the owner's
+      decision ([ADR-011](adr/011-spaces-channels-roles.md)), so a malicious instance can
+      fabricate moderators undetectably. Carrying the role table in each channel's group —
+      role changes as commits clients validate — is the candidate fix. It changes what
+      commits carry and touches `cairn-crypto`, so it is designed **with** the external
+      reviewers, not before.
 - [ ] Security disclosure process exercised at least once
 - [ ] Findings fixed and published
 

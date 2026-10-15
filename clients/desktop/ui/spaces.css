@@ -1,0 +1,150 @@
+/* Spaces — the rail of waymarks down the far left, and a space's channels in the sidebar.
+
+   Tokens only, from style.css, so every theme reaches it. The tier badges on channels are
+   ordinary `.badge` elements and take their colours from the security layer, which no theme
+   or user CSS can outrank; nothing here styles them. */
+
+:root { --rail-w: 64px; }
+
+#app { grid-template-columns: var(--rail-w) var(--sidebar-w) minmax(0, 1fr) var(--people-w); }
+
+/* ---- the rail ---------------------------------------------------------- */
+
+#space-rail {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 14px 0;
+  background: var(--bg);
+  border-right: 1px solid var(--line-soft);
+  overflow-y: auto;
+  min-height: 0;
+}
+#space-list { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+
+.rail-btn {
+  position: relative;
+  width: 42px; height: 42px;
+  padding: 0;
+  display: grid; place-items: center;
+  border-radius: var(--av-radius);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font: 600 13px/1 var(--mono);
+  letter-spacing: 0.02em;
+  transition: border-radius 160ms ease, background 140ms ease, color 140ms ease;
+}
+.rail-btn:hover { border-radius: var(--radius); color: var(--text); }
+.rail-btn.space {
+  background: hsl(var(--h, 36) var(--av-sat) var(--av-l));
+  border-color: transparent;
+  color: var(--av-ink);
+}
+.rail-btn svg { width: 22px; height: 22px; color: var(--accent); }
+.rail-btn.add { background: transparent; border-style: dashed; color: var(--dim); font-size: 18px; }
+.rail-btn.add:hover { color: var(--accent); border-color: var(--accent-line); }
+/* The blaze again, where the trail turns: the space you are in. */
+.rail-btn.active { border-radius: var(--radius); outline: 2px solid var(--accent); outline-offset: 2px; }
+.rail-btn.active::before {
+  content: "";
+  position: absolute; left: -12px; top: 22%; bottom: 22%;
+  width: 4px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+  transform: skewY(-12deg);
+}
+.rail-sep { width: 26px; height: 1px; background: var(--line); margin: 2px 0; flex: none; }
+
+/* ---- forms the rail opens ---------------------------------------------- */
+
+.rail-form { display: flex; gap: 7px; padding: 10px 12px 0; }
+.rail-form[hidden] { display: none; }
+.rail-form input { flex: 2; min-width: 0; }
+.rail-form button { flex: 1; padding: 7px 8px; }
+
+/* The two panes share the sidebar's flex column, so they do not draw boxes of their own. */
+#home-pane, #space-pane { display: contents; }
+#home-pane[hidden], #space-pane[hidden] { display: none; }
+
+/* ---- one space --------------------------------------------------------- */
+
+.space-head { display: flex; align-items: center; gap: 8px; margin: 16px 12px 0 16px; }
+#space-name {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 500 19px/1.15 var(--display);
+  font-variation-settings: "opsz" 48, "SOFT" 30;
+  letter-spacing: -0.01em;
+}
+.space-head button { padding: 5px 9px; font-size: 12px; }
+#space-note {
+  margin: 8px 12px 0 16px;
+  color: var(--dim);
+  font-size: 11.5px; line-height: 1.45;
+}
+
+#channels {
+  position: relative;
+  overflow-y: auto;
+  padding: 0 8px 14px;
+  flex: 1;
+}
+#channels li {
+  position: relative;
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 10px 7px 12px;
+  margin: 1px 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--muted);
+  transition: background 140ms ease, color 140ms ease;
+}
+#channels li:hover { background: var(--hover); color: var(--text); }
+#channels li.active { background: var(--accent-soft); color: var(--text); }
+#channels li.active::before {
+  content: "";
+  position: absolute; left: -8px; top: 22%; bottom: 22%;
+  width: 4px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+  transform: skewY(-12deg);
+}
+#channels li.empty { cursor: default; font-style: italic; color: var(--dim); }
+#channels li.empty:hover { background: transparent; }
+.channel-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.channel-name::before { content: "#"; color: var(--dim); margin-right: 4px; font-family: var(--mono); }
+#channels .pending { color: var(--warn); font: 500 10.5px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; }
+.chan-flag { color: var(--dim); font: 500 10px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; }
+
+/* ---- the space's people ------------------------------------------------ */
+
+#space-people[hidden] { display: none; }
+#space-members { padding: 0 10px 6px; overflow-y: auto; max-height: 42vh; }
+#space-members li { padding: 6px 4px; border-bottom: 1px solid var(--line-soft); }
+#space-members li:last-child { border-bottom: 0; }
+.sm-head { display: flex; align-items: center; gap: 8px; }
+.sm-head .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sm-head .kick { padding: 3px 7px; font-size: 11.5px; color: var(--danger); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 0 34px; }
+.role-chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, hsl(var(--h, 36) 55% var(--name-l)) 45%, transparent);
+  color: hsl(var(--h, 36) 55% var(--name-l));
+  font: 500 10.5px/1.6 var(--mono);
+}
+.role-chip.owner { border-color: var(--accent-line); color: var(--accent); }
+.chip-x { padding: 0 2px; border: 0; background: transparent; color: inherit; font-size: 12px; line-height: 1; }
+.role-pick { width: auto; padding: 1px 6px; font: 500 10.5px/1.6 var(--mono); border-radius: 999px; }
+
+/* ---- narrow windows ---------------------------------------------------- */
+/* After the base rule on purpose: it has the same specificity as style.css's narrow-window
+   grid, and source order is what decides between them. */
+@media (max-width: 960px) {
+  #app { grid-template-columns: var(--rail-w) min(var(--sidebar-w), 230px) minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  :root { --rail-w: 56px; }
+  .rail-btn { width: 38px; height: 38px; }
+}

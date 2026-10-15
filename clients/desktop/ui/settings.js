@@ -294,6 +294,7 @@ const CairnLook = (() => {
         if (el.id === "room-tier") return "the room's encryption badge";
         if (el.id === "transport") return "the connection badge";
         if (el.closest("#rooms")) return "a room's encryption badge";
+        if (el.closest("#channels")) return "a channel's encryption badge";
         if (el.closest("#member-list")) return "a member's safety indicator";
         if (el.closest("#safety")) return "a safety-number indicator";
         return "a security indicator";

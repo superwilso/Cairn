@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="profile.css">
 <link rel="stylesheet" href="linkcards.css">
 <link rel="stylesheet" href="settings.css">
+<link rel="stylesheet" href="spaces.css">
 <!-- In <head> on purpose: applies the saved theme before first paint. -->
 <script src="settings.js"></script>
 </head>
@@ -104,6 +105,18 @@
 </div>
 
 <div id="app" hidden>
+  <!-- Spaces. Home is DMs and groups; each waymark below it is a space. What a space lets
+       you do is the instance's decision, handed over by Rust — spaces.js only draws it. -->
+  <nav id="space-rail" aria-label="Spaces">
+    <button id="rail-home" class="rail-btn active" title="Direct messages and groups" aria-label="Home">
+      <svg aria-hidden="true"><use href="#i-cairn"/></svg>
+    </button>
+    <span class="rail-sep" aria-hidden="true"></span>
+    <ul id="space-list"></ul>
+    <button id="new-space" class="rail-btn add" title="Create a space" aria-label="Create a space">+</button>
+    <button id="join-space" class="rail-btn add" title="Join a space with an invite" aria-label="Join a space">&#8618;</button>
+  </nav>
+
   <aside>
     <div class="mast">
       <svg class="stones" aria-hidden="true"><use href="#i-cairn"/></svg>
@@ -119,16 +132,46 @@
            say so rather than imply a protection that is not there. -->
       <span id="transport" class="badge"></span>
     </div>
-    <div class="actions">
-      <button id="new-group">New group</button>
-      <button id="new-direct">New DM</button>
+    <form id="space-create" class="rail-form" hidden>
+      <input id="space-create-name" placeholder="Space name" spellcheck="false" autocomplete="off" maxlength="100">
+      <button type="submit" class="primary">Create</button>
+    </form>
+    <form id="space-join" class="rail-form" hidden>
+      <input id="space-join-token" placeholder="space invite token" spellcheck="false" autocomplete="off">
+      <button type="submit">Join</button>
+    </form>
+
+    <div id="home-pane">
+      <div class="actions">
+        <button id="new-group">New group</button>
+        <button id="new-direct">New DM</button>
+      </div>
+      <div class="actions">
+        <input id="invite-token" placeholder="invite token" spellcheck="false" autocomplete="off">
+        <button id="join">Join</button>
+      </div>
+      <h2 class="section">Rooms</h2>
+      <ul id="rooms"></ul>
     </div>
-    <div class="actions">
-      <input id="invite-token" placeholder="invite token" spellcheck="false" autocomplete="off">
-      <button id="join">Join</button>
+
+    <div id="space-pane" hidden>
+      <div class="space-head">
+        <span id="space-name"></span>
+        <button id="space-leave" class="ghost" title="Leave this space">Leave</button>
+      </div>
+      <!-- Filled from Rust: what the instance can see of a space is a threat-model claim. -->
+      <p id="space-note"></p>
+      <div class="actions">
+        <button id="new-channel">New channel</button>
+        <button id="space-invite">Invite</button>
+      </div>
+      <form id="channel-create" class="rail-form" hidden>
+        <input id="channel-create-name" placeholder="channel name" spellcheck="false" autocomplete="off" maxlength="100">
+        <button type="submit" class="primary">Create</button>
+      </form>
+      <h2 class="section">Channels</h2>
+      <ul id="channels"></ul>
     </div>
-    <h2 class="section">Rooms</h2>
-    <ul id="rooms"></ul>
   </aside>
 
   <main>
@@ -200,6 +243,14 @@
       <button id="admit" class="primary">Admit them</button>
     </div>
 
+    <!-- The other half of a removal. The instance has stopped serving these accounts this
+         room, but their devices still hold its keys until a member commits their removal
+         from the encrypted group. Never automatic, for the same reason admitting is not. -->
+    <div id="departed" class="waiting" hidden>
+      <span id="departed-text"></span>
+      <button id="evict" class="primary">Remove from the group</button>
+    </div>
+
     <ul id="timeline"></ul>
 
     <!-- Shown while a reply is being written. The text here is a preview from this screen;
@@ -230,6 +281,10 @@
   </main>
 
   <section class="people">
+    <div id="space-people" hidden>
+      <h2 class="section">In this space</h2>
+      <ul id="space-members"></ul>
+    </div>
     <h2 class="section">Members</h2>
     <ul id="member-list"></ul>
 
@@ -304,6 +359,7 @@
 <script src="linkcards.js"></script>
 <script src="messages.js"></script>
 <script src="profile.js"></script>
+<script src="spaces.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
