@@ -30,12 +30,14 @@ onmessage = (ev) => {
 
 onrtctransform = (ev) => {
     const t = ev.transformer;
-    const { side, index } = t.options;
+    const { side, index, board } = t.options;
     const run = CairnFrame.transformer(side, {
         mode: () => state.mode,
         sealing: () => state.sealing,
         keyFor: (epoch, leaf) => state.keys.get(epoch + ":" + leaf) || null,
-        flags: () => state.flags,
+        // The soundboard sender marks its frames as such, inside the seal; the microphone
+        // sender carries the mute bits.
+        flags: () => (board ? CairnFrame.FLAG_SOUNDBOARD : state.flags),
         count: (what) => { state.stats[what]++; },
         // Who is on this receive slot, by the key their frame opened under — not by the
         // SFU's word. Reported a few times a second, not per frame.

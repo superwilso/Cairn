@@ -145,6 +145,10 @@ instance is in the media path.
   shows the same occupancy to its members, by design (`12-realtime-media.md` §6).
 - **Packet sizes and timing per sender**, which track speech closely: who talks, when, for how
   long. No padding is done.
+- **When each person plays a soundboard clip, and for how long.** Clips go out on a second
+  track per participant, so each listener can mute one person's clips apart from their voice;
+  the SFU sees that track carry audio. Not which clip: the frames are sealed like the voice,
+  and marked as clips by a flag inside the seal (`cairn_crypto::media::FLAG_SOUNDBOARD`).
 - **The SDP offer**: codecs, the device's ICE candidates and addresses, its DTLS fingerprint.
 - **Each frame's trailer**: the MLS epoch's low 32 bits and the sender's leaf index.
 - **Not** the `ssrc-audio-level` header extension: the SFU's answer omits it, so browsers do

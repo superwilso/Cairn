@@ -176,20 +176,37 @@ What this costs, plainly:
 
 ### The soundboard
 
-A clip is **mixed into the outgoing microphone track** (`CairnCall.mixIntoMic`, a
-`MediaStreamAudioDestinationNode` carrying mic + clip), and played locally. There is no
-"play X" message: it would cross the instance — encrypted, but timed — whereas the mix is
-just audio on a peer-to-peer track the instance never carries. A two-browser test measures
-the tone at the listener and checks that no signal was sent. Muting still mutes, and a muted
-participant cannot play a clip.
+A clip goes out on **its own audio track**, separate from the microphone, and plays locally
+at the same level. In a rung call that is a second audio line per peer, negotiated up front
+beside the empty video line (`CairnCall.playClip`); in a voice channel it is a second track
+to the SFU (`CairnVoiceChannel.playClip`), sealed end to end like the voice and marked as a
+clip by a flag *inside* the seal. There is no "play X" message. Muting still mutes, and a
+muted participant cannot play a clip. (Decided by the owner over the earlier design, which
+mixed clips into the microphone.)
 
-The cost of mixing, stated where the controls are: **a listener hears a clip as part of the
-sender's voice.** The soundboard's volume is therefore the *sender's* — how loud your clips
-are for everyone — and "soundboard off" stops this device playing clips; neither can turn
-down or silence clips other people mix into their own microphones, short of turning those
-people down. Per-listener control would need each clip on its own track, which costs a
-negotiated transceiver per peer in the mesh. **Open for the owner:** whether that is worth
-it.
+**What each listener controls, on their own device only:** a per-person soundboard volume and
+"mute their soundboard" in the same popover as that person's voice volume, and **"Mute
+everyone's soundboard clips"** in Settings → Voice & video. None of it is sent anywhere; the
+person is not told. The slider in the soundboard panel is the sender's: how loud their clips
+go out. A listener knows which incoming track is a soundboard from the call's own structure —
+the second audio line in the mesh, the sealed flag in an end-to-end voice channel — so in an
+E2EE voice channel the SFU cannot pass a voice off as a clip or the reverse.
+
+**What this costs: whoever carries the media can tell when a clip is playing.** The clip's
+track is silent between clips and carries audio while one plays, so its packet activity and
+timing show each moment someone presses a soundboard button — and for how long. In a voice
+channel that is **the instance's SFU**, for every participant; in a rung call it is only
+the other participants' devices, plus the operator's TURN relay when a call goes through
+one. What they cannot tell, in an end-to-end call, is *which* clip: the audio is sealed like
+the voice. Under the earlier mixed design the instance learned nothing it did not already
+see from the voice.
+
+Tested between two real browsers (`soundboard.browser.test.js`): the clip arrives on the
+soundboard track and not in the voice; muting the sender's soundboard silences what the
+listener's device plays for it while the sender's voice keeps arriving; "mute everyone's"
+does the same; no signal is sent. And through the real SFU (`voicechannel.browser.test.js`):
+every soundboard frame the SFU held was sealed, opens under the sender's key in Rust, and
+carries the clip flag; muting it leaves the voice slot playing.
 
 ## 4. Themes yes, plugins are a different question
 

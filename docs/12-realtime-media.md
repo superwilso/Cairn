@@ -121,7 +121,8 @@ by key, not by the SFU's slot mapping. In an end-to-end call a frame that does n
 dropped — including plaintext the SFU might inject.
 
 **What the SFU sees**: who is connected, from which address, when; per-sender packet sizes
-and timing, which show who is speaking; the SDP offer; each frame's epoch and leaf. Not the
+and timing, which show who is speaking — and, on the separate soundboard track, when each
+person plays a clip; the SDP offer; each frame's epoch and leaf. Not the
 `ssrc-audio-level` header — the SFU's answer leaves it out, so browsers do not send a loudness
 value in the clear.
 
@@ -146,8 +147,9 @@ cannot prove who is listening; removal is immediate at the SFU and only eventual
 cryptography (until the removal commit, old-epoch keys still open frames). SFrame (RFC 9605)
 itself — the format is SFrame-shaped, not SFrame. Video and screen share through the SFU. A
 TURN relay in front of the SFU's UDP port. A voice channel in a room you do not have open:
-switching rooms leaves it, because the client polls the open room only. Per-person volume
-and the speaking ring in voice channels (the mesh has both).
+switching rooms leaves it, because the client polls the open room only. Boosting a voice past
+100% and the speaking ring in voice channels (the mesh has both; per-person volume up to 100%,
+"mute for me" and the per-person soundboard controls work in both).
 
 **Tests.** `cairn-crypto` pins the frame format with a vector Node's WebCrypto produced, and
 re-runs §2's exporter premises as `voice_media_keys_agree_across_members_and_rotate_when_someone_is_removed`.

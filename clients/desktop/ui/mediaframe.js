@@ -115,7 +115,10 @@ const CairnFrame = (() => {
         };
     }
 
-    return { VERSION, TRAILER, importKey, peek, seal, open, transformer };
+    // Bit 2 of the sealed flags byte: a soundboard frame, not a voice (media.rs FLAG_SOUNDBOARD).
+    const FLAG_SOUNDBOARD = 0x04;
+
+    return { VERSION, TRAILER, FLAG_SOUNDBOARD, importKey, peek, seal, open, transformer };
 })();
 
 if (typeof module !== "undefined") module.exports = CairnFrame;

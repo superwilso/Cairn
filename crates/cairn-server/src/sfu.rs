@@ -3,11 +3,12 @@
 //! ## What it is
 //!
 //! An in-process SFU built on [`str0m`], a sans-IO WebRTC library: one UDP socket, one
-//! thread, one `Rtc` per connected device. Each client offers **one** audio track it sends
-//! and [`RECEIVE_SLOTS`] audio tracks it receives, all in its first offer, so nobody ever
-//! renegotiates as people come and go — the same trick the mesh uses with its empty video
-//! line, and for the same reason: renegotiation is where call bugs live. The SFU assigns each
-//! other participant to a free receive slot the first time they speak.
+//! thread, one `Rtc` per connected device. Each client offers **two** audio tracks it sends —
+//! its microphone, then its soundboard ([`VoiceTrack`]) — and [`RECEIVE_SLOTS`] audio tracks
+//! it receives, all in its first offer, so nobody ever renegotiates as people come and go —
+//! the same trick the mesh uses with its empty video line, and for the same reason:
+//! renegotiation is where call bugs live. The SFU assigns each other participant's track to a
+//! free receive slot the first time it carries anything.
 //!
 //! ## What it sees, stated rather than implied
 //!
@@ -18,6 +19,8 @@
 //! - **Who is connected, from which IP address and port, from when until when.**
 //! - **Packet sizes and timing per sender.** Opus at a steady frame rate still varies in
 //!   size with speech, so who is talking, and when, is visible without decrypting anything.
+//! - **When each participant plays a soundboard clip**, because clips arrive on their own
+//!   track. The price of letting each listener turn one person's clips down separately.
 //! - **The SDP offer**: codecs, the client's ICE candidates (its addresses), its DTLS
 //!   fingerprint.
 //! - **The frame trailer**: the MLS epoch's low bits and the sender's leaf index.
@@ -50,10 +53,12 @@ use str0m::net::{Protocol, Receive};
 use str0m::rtp::{Extension, ExtensionMap};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
+pub use crate::state::VoiceTrack;
 use crate::state::{SharedVoice, VoiceSessionId, MAX_VOICE_PARTICIPANTS};
 
-/// How many audio tracks each client offers to receive: everyone but itself.
-pub const RECEIVE_SLOTS: usize = MAX_VOICE_PARTICIPANTS - 1;
+/// How many audio tracks each client offers to receive: a voice and a soundboard from
+/// everyone but itself.
+pub const RECEIVE_SLOTS: usize = 2 * (MAX_VOICE_PARTICIPANTS - 1);
 
 /// A connection that has not completed ICE and DTLS by now never will. Its seat is given
 /// back, so a client that asked and never connected does not linger in the roster.
@@ -73,6 +78,7 @@ pub struct SfuConfig {
 #[derive(Debug, Clone)]
 pub struct TappedFrame {
     pub session: VoiceSessionId,
+    pub track: VoiceTrack,
     pub room: RoomId,
     pub payload: Vec<u8>,
 }
@@ -89,7 +95,7 @@ enum Command {
     },
     Slots {
         session: VoiceSessionId,
-        reply: SyncSender<Vec<(String, VoiceSessionId)>>,
+        reply: SyncSender<Vec<(String, VoiceSessionId, VoiceTrack)>>,
     },
 }
 
@@ -176,10 +182,11 @@ impl Sfu {
         let _ = self.send(Command::Close { session });
     }
 
-    /// Which receive slot (by MID) carries which other session, for `session`'s own
-    /// connection. The SFU's claim, not an authenticated one: in an E2EE call a client trusts
-    /// the key a frame opens under instead. Blocking.
-    pub fn slots(&self, session: VoiceSessionId) -> Vec<(String, VoiceSessionId)> {
+    /// Which receive slot (by MID) carries which other session's which track, for
+    /// `session`'s own connection. The SFU's claim, not an authenticated one: in an E2EE call
+    /// a client trusts the key a frame opens under, and its sealed soundboard flag, instead.
+    /// Blocking.
+    pub fn slots(&self, session: VoiceSessionId) -> Vec<(String, VoiceSessionId, VoiceTrack)> {
         let (reply, slots) = mpsc::sync_channel(1);
         if self.send(Command::Slots { session, reply }).is_err() {
             return Vec::new();
@@ -206,10 +213,10 @@ struct Peer {
     rtc: Rtc,
     created: Instant,
     connected: bool,
-    /// The one track this client sends.
-    mic: Option<Mid>,
-    /// The tracks it receives, and whose voice each carries.
-    slots: Vec<(Mid, Option<VoiceSessionId>)>,
+    /// The tracks this client sends: its microphone, then its soundboard, in offer order.
+    sends: Vec<(Mid, VoiceTrack)>,
+    /// The tracks it receives, and whose voice or soundboard each carries.
+    slots: Vec<(Mid, Option<(VoiceSessionId, VoiceTrack)>)>,
 }
 
 struct Worker {
@@ -239,8 +246,8 @@ impl Worker {
             for peer in &mut self.peers {
                 timeout = timeout.min(drive(peer, &self.socket, &mut forwards));
             }
-            for (from, data) in forwards {
-                self.forward(from, data);
+            for (from, track, data) in forwards {
+                self.forward(from, track, data);
             }
 
             let wait =
@@ -292,7 +299,7 @@ impl Worker {
                     .map(|p| {
                         p.slots
                             .iter()
-                            .filter_map(|(mid, src)| src.map(|s| (mid.to_string(), s)))
+                            .filter_map(|(mid, src)| src.map(|(s, t)| (mid.to_string(), s, t)))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -331,7 +338,7 @@ impl Worker {
             rtc,
             created: Instant::now(),
             connected: false,
-            mic: None,
+            sends: Vec::new(),
             slots: Vec::new(),
         });
         Ok(answer.to_sdp_string())
@@ -360,14 +367,14 @@ impl Worker {
         self.peers.retain(|p| p.rtc.is_alive());
         for p in &mut self.peers {
             for (_, src) in &mut p.slots {
-                if src.is_some_and(|s| dead.contains(&s)) {
+                if src.is_some_and(|(s, _)| dead.contains(&s)) {
                     *src = None;
                 }
             }
         }
     }
 
-    fn forward(&mut self, from: VoiceSessionId, data: MediaData) {
+    fn forward(&mut self, from: VoiceSessionId, track: VoiceTrack, data: MediaData) {
         // Chromium sends padding-only packets, which depacketise to an empty payload. They
         // carry no media and no frame to seal; found when the browser test's tap counted 12
         // "unsealed frames" in 1000 and every one was zero bytes. Not forwarded.
@@ -388,7 +395,7 @@ impl Worker {
         #[cfg(feature = "test-tap")]
         {
             let mut tap = self.tap.lock().expect("tap mutex poisoned");
-            tap.push_back(TappedFrame { session: from, room, payload: data.data.to_vec() });
+            tap.push_back(TappedFrame { session: from, track, room, payload: data.data.to_vec() });
             while tap.len() > 2000 {
                 tap.pop_front();
             }
@@ -398,11 +405,11 @@ impl Worker {
             if p.session == from || seated.get(&p.session) != Some(&room) || p.room != room {
                 continue;
             }
-            let slot = match p.slots.iter().position(|(_, s)| *s == Some(from)) {
+            let slot = match p.slots.iter().position(|(_, s)| *s == Some((from, track))) {
                 Some(i) => i,
                 None => match p.slots.iter().position(|(_, s)| s.is_none()) {
                     Some(i) => {
-                        p.slots[i].1 = Some(from);
+                        p.slots[i].1 = Some((from, track));
                         i
                     }
                     None => continue,
@@ -422,7 +429,7 @@ impl Worker {
 fn drive(
     peer: &mut Peer,
     socket: &UdpSocket,
-    forwards: &mut Vec<(VoiceSessionId, MediaData)>,
+    forwards: &mut Vec<(VoiceSessionId, VoiceTrack, MediaData)>,
 ) -> Instant {
     loop {
         if !peer.rtc.is_alive() {
@@ -439,16 +446,26 @@ fn drive(
                     peer.rtc.disconnect()
                 }
                 Event::MediaAdded(m) if m.kind == MediaKind::Audio => match m.direction {
-                    // Directions are the SFU's: RecvOnly is what the client sends.
-                    Direction::RecvOnly | Direction::SendRecv if peer.mic.is_none() => {
-                        peer.mic = Some(m.mid)
+                    // Directions are the SFU's: RecvOnly is what the client sends. The first is
+                    // its microphone and the second its soundboard; a third is ignored.
+                    Direction::RecvOnly | Direction::SendRecv if peer.sends.len() < 2 => {
+                        let track = if peer.sends.is_empty() {
+                            VoiceTrack::Voice
+                        } else {
+                            VoiceTrack::Board
+                        };
+                        peer.sends.push((m.mid, track))
                     }
                     Direction::SendOnly if peer.slots.len() < RECEIVE_SLOTS => {
                         peer.slots.push((m.mid, None))
                     }
                     _ => {}
                 },
-                Event::MediaData(d) if Some(d.mid) == peer.mic => forwards.push((peer.session, d)),
+                Event::MediaData(d) => {
+                    if let Some(&(_, track)) = peer.sends.iter().find(|(mid, _)| *mid == d.mid) {
+                        forwards.push((peer.session, track, d));
+                    }
+                }
                 _ => {}
             },
             Err(_) => peer.rtc.disconnect(),

@@ -84,10 +84,22 @@ const CairnVoicePanel = (() => {
                 w.title = "The instance lists this device, but the room's encrypted group does not contain it.";
                 li.append(w);
             }
+            // Their voice and their soundboard, for this device only: the same popover a
+            // rung call's tiles open.
+            if (!p.me && typeof CairnCallUi !== "undefined" && CairnCallUi.openVolume) {
+                const menu = el("button", "vc-menu ghost");
+                menu.type = "button";
+                menu.title = "Volume and soundboard for this person";
+                menu.setAttribute("aria-label", menu.title);
+                menu.innerHTML = '<svg width="14" height="14" aria-hidden="true"><use href="#i-volume"/></svg>';
+                menu.addEventListener("click", (e) => { e.stopPropagation(); CairnCallUi.openVolume(p.user, menu); });
+                li.append(menu);
+            }
             list.append(li);
         }
         if (!state.participants.length) list.append(el("li", "vc-empty", "Nobody is here."));
         const joined = !!CairnVoiceChannel.session;
+        $("voice-channel").classList.toggle("joined", joined);
         $("vc-join").hidden = joined;
         for (const id of ["vc-mute", "vc-deafen", "vc-leave"]) $(id).hidden = !joined;
         $("vc-mute").setAttribute("aria-pressed", String(CairnVoiceChannel.muted));

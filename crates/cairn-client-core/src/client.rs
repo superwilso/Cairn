@@ -155,12 +155,19 @@ pub struct VoiceRosterEntry {
     pub joined_at_ms: i64,
 }
 
-/// Which receive slot the SFU says carries whom.
+/// Which receive slot the SFU says carries whom, and which of their tracks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VoiceSlot {
     pub mid: String,
     pub user: String,
     pub device: String,
+    /// "voice" or "board". The SFU's word; an E2EE client goes by the sealed frame flag.
+    #[serde(default = "voice_track")]
+    pub track: String,
+}
+
+fn voice_track() -> String {
+    "voice".into()
 }
 
 #[derive(Deserialize)]

@@ -162,7 +162,8 @@ instance cannot cause one ([ADR-012](adr/012-sfu-voice-channels.md) §4).
 **Voice channels put the instance in the media path.** They run through an SFU the instance
 operates. In an E2EE room the audio is sealed end to end and the SFU forwards ciphertext, but
 it necessarily sees **who is connected, from which IP address, from when to when, and the
-size and timing of each person's packets — which shows who is speaking and when**, plus the
+size and timing of each person's packets — which shows who is speaking and when, and when
+each person plays a soundboard clip (clips travel on a track of their own)**, plus the
 SDP offer and each frame's key epoch and sender leaf. The roster of who is in a channel is
 the instance's word; a device not in the room's encrypted group is marked, but nothing proves
 who is listening. A member removed from the room is dropped by the SFU at once, but until the

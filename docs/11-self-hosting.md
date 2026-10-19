@@ -209,11 +209,13 @@ and every room gets a voice channel. Without them there are none, and calls are 
 **What it costs you.** All of a channel's audio crosses your connection: each speaker's
 stream goes in once and out to every other participant, so egress grows as N×(N−1) Opus
 streams — around 40 kbps each, so a full channel of 16 is roughly 10 Mbps out at worst, and
-an ordinary handful of people far less. No video goes through it.
+an ordinary handful of people far less. A participant who has played a soundboard clip adds
+a second stream, nearly silent between clips. No video goes through it.
 
 **What it lets you see**, and your users are told the same: who is in which channel, from
-which IP address, and when; and the size and timing of each person's packets, which shows who
-is speaking. In an end-to-end encrypted room you do **not** get the audio — frames are sealed
+which IP address, and when; the size and timing of each person's packets, which shows who
+is speaking; and when each person plays a soundboard clip, which travels on a track of its own
+so listeners can mute clips apart from voices. In an end-to-end encrypted room you do **not** get the audio — frames are sealed
 on the device before they reach you — unless a participant's client cannot seal, in which case
 the call is badged transport-only for everyone and then you do.
 

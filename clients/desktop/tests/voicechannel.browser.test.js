@@ -106,7 +106,7 @@ class Harness {
 // ui/ over http://localhost — a secure context, which getUserMedia and workers need.
 function serveUi() {
     const page = `<!doctype html><meta charset="utf-8"><body>
-<script src="mediaframe.js"></script><script src="voicechannel.js"></script></body>`;
+<script src="mediaframe.js"></script><script src="voicechannel.js"></script><script src="callaudio.js"></script></body>`;
     const server = http.createServer((req, res) => {
         const name = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "");
         if (name === "" || name === "harness.html") {
@@ -256,6 +256,49 @@ test("a voice channel carries sealed audio through the SFU", { timeout: 180_000 
         });
         assert.ok(owner && owner.attested, "the slot is attributed by the key its frames open under");
         assert.strictEqual(owner.user, users.alice);
+
+        // 3b. A soundboard clip goes out on its own track: sealed like the voice, marked as a
+        // clip inside the seal, attributed by key — and a listener's per-person mute silences
+        // that slot while the speaker's voice slot plays on.
+        await harness.call({ op: "tap_clear" });
+        await alice.evaluate(async () => {
+            const rate = 48000;
+            const buf = new AudioBuffer({ length: rate * 2, sampleRate: rate, numberOfChannels: 1 });
+            const d = buf.getChannelData(0);
+            for (let i = 0; i < d.length; i++) d[i] = 0.8 * Math.sin((2 * Math.PI * 2600 * i) / rate);
+            await CairnVoiceChannel.playClip(buf);
+        });
+        const slots = await until("bob finds alice's voice and soundboard slots", async () => {
+            const found = await bob.evaluate(() => {
+                const out = {};
+                for (const i of CairnVoiceChannel.audio.keys()) {
+                    const o = CairnVoiceChannel.slotOwner(i);
+                    if (o) out[o.track] = { index: i, ...o };
+                }
+                return out;
+            });
+            return found.board && found.voice && found;
+        });
+        assert.strictEqual(slots.board.user, users.alice);
+        assert.ok(slots.board.attested, "the soundboard slot is known by the key and the sealed flag");
+        assert.notStrictEqual(slots.board.index, slots.voice.index);
+        await sleep(1500);
+        const boardTap = await harness.call({ op: "tap" });
+        const ab = boardTap["alice:board"];
+        console.log("alice's soundboard at the SFU:", JSON.stringify(ab));
+        assert.ok(ab && ab.frames > 10, "alice's clip crossed the SFU on her soundboard track");
+        assert.strictEqual(ab.sealed, ab.frames, "every soundboard frame the SFU held was sealed");
+        assert.strictEqual(ab.opened, ab.frames, "and opens under alice's key, in Rust");
+        assert.strictEqual(ab.board_flag, ab.opened, "and is marked as a clip inside the seal");
+        assert.ok(boardTap.alice && boardTap.alice.board_flag === 0, "her voice frames are not marked as clips");
+        const levels = await bob.evaluate(([b, v, who]) => {
+            CairnCallAudio.setBoardMuted(who, true);
+            const el = (i) => CairnVoiceChannel.audio.get(i);
+            return { board: el(b).muted, voice: el(v).muted };
+        }, [slots.board.index, slots.voice.index, users.alice]);
+        assert.deepStrictEqual(levels, { board: true, voice: false },
+            "muting alice's soundboard silences her clip slot and leaves her voice playing");
+        await bob.evaluate((who) => CairnCallAudio.setBoardMuted(who, false), users.alice);
 
         // 4. The §5 fallback. Carol's webview "cannot transform".
         const carol = await openPage(browser, base, harness, "carol", notes);

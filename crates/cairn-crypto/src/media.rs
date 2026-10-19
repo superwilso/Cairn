@@ -86,6 +86,12 @@ const TAG_LEN: usize = 16;
 pub const FLAG_MUTED: u8 = 0b01;
 /// Bit 1: the sender is deafened (and therefore muted as well).
 pub const FLAG_DEAFENED: u8 = 0b10;
+/// Bit 2: this frame is from the sender's soundboard track, not their microphone.
+///
+/// Sealed with the frame, so in an end-to-end call a listener tells a soundboard clip from a
+/// voice by the sender's own word, not the SFU's slot mapping — which is what lets "mute this
+/// person's soundboard" mute only the clips, whatever the SFU does with the slots.
+pub const FLAG_SOUNDBOARD: u8 = 0b100;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MediaError {
@@ -161,7 +167,7 @@ pub fn peek(sealed: &[u8]) -> Result<FrameKeyId, MediaError> {
     })
 }
 
-/// Seal one codec frame. `flags` is [`FLAG_MUTED`] / [`FLAG_DEAFENED`].
+/// Seal one codec frame. `flags` is [`FLAG_MUTED`] / [`FLAG_DEAFENED`] / [`FLAG_SOUNDBOARD`].
 pub fn seal(key: &MediaKey, id: FrameKeyId, flags: u8, frame: &[u8]) -> Vec<u8> {
     let mut iv = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);

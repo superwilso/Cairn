@@ -404,13 +404,14 @@ Four calls made by the owner, so a session does not re-litigate them:
       sender from `cairn-crypto`), and sending changes into rooms that are not open.
 - [x] **Custom emoji, stickers and a soundboard the instance cannot read** — a room's set
       travels as one encrypted record, every member downloads all of it when it changes, and
-      drawing one makes no request (`13-customisation.md` §3a). Clips are mixed into the
-      caller's microphone, so playing one sends nothing.
+      drawing one makes no request (`13-customisation.md` §3a). Clips go out on their own
+      track, so each listener can turn one person's soundboard down or off, or everyone's —
+      at the cost that whoever carries the media (the SFU in a voice channel) sees when a clip
+      plays. Playing one sends no message.
 
       **Probed:** a plain member whose client believed it was the owner sent a set, and every
       other member ignored it. **Not done:** roles are the instance's word, so a malicious
-      instance can grant a member the right to change a set; listeners cannot turn down a
-      mixed clip apart from the voice it rides in; a user's personal emoji in DMs.
+      instance can grant a member the right to change a set; a user's personal emoji in DMs.
 - [x] **Drop-in voice channels through an SFU**, per [ADR-012](adr/012-sfu-voice-channels.md):
       an in-process SFU on `str0m` (pure-Rust crypto via a patched backend; rustc 1.88,
       so behind a default-on `sfu` feature the 1.85 MSRV check leaves off), audio frames sealed end to
@@ -428,7 +429,7 @@ Four calls made by the owner, so a session does not re-litigate them:
 
       **Not done:** the per-call MLS group (so the channel's roster is the instance's word),
       SFrame proper, video and screen share through the SFU, TURN in front of it, staying in a
-      voice channel while viewing another room, per-person volume in voice channels.
+      voice channel while viewing another room, boosting a voice past 100% in voice channels.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.

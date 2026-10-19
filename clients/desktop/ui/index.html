@@ -373,6 +373,7 @@
   <fieldset class="sites">
     <legend>Calls</legend>
     <label class="toggle"><input type="checkbox" id="pref-ring"> Ring sound for incoming calls</label>
+    <label class="toggle"><input type="checkbox" id="pref-sb-mute-all"> Mute everyone's soundboard clips (on this device only)</label>
     <label class="toggle"><input type="checkbox" id="pref-vc-leave"> Leave a voice channel that stops being end-to-end encrypted</label>
     <label class="toggle"><input type="checkbox" id="pref-relay-only"> Always use the relay (hide my IP address from other participants)</label>
     <p id="relay-only-note" class="note"></p>
@@ -386,6 +387,9 @@
   <p class="volume-head"><span id="volume-who" class="grow"></span><output id="volume-out" class="mono">100%</output></p>
   <input id="volume-range" type="range" min="0" max="200" step="5" value="100" aria-label="Volume">
   <label class="toggle"><input type="checkbox" id="volume-mute"> Mute for me</label>
+  <p class="volume-head volume-sub"><span class="grow">Their soundboard</span><output id="board-out" class="mono">100%</output></p>
+  <input id="board-range" type="range" min="0" max="100" step="5" value="100" aria-label="Soundboard volume">
+  <label class="toggle"><input type="checkbox" id="board-mute"> Mute their soundboard</label>
   <p class="note">Only on this device. They are not told.</p>
   <button type="button" id="volume-reset" class="ghost">Reset</button>
 </div>

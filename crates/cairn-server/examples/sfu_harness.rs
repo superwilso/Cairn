@@ -179,8 +179,13 @@ fn tap(
         let device = registry.lock().unwrap().occupant(frame.session).map(|o| o.device.to_string());
         let Some(device) = device else { continue };
         let Some((name, key, leaf)) = by_device.get(&device) else { continue };
-        let entry = report.entry(name.clone()).or_insert_with(|| {
-            json!({"frames": 0, "sealed": 0, "opened": 0, "leaf_matches": 0, "toc": null, "sample": null})
+        // A participant's soundboard track is reported apart from their voice, as "name:board".
+        let label = match frame.track {
+            cairn_server::sfu::VoiceTrack::Voice => name.clone(),
+            cairn_server::sfu::VoiceTrack::Board => format!("{name}:board"),
+        };
+        let entry = report.entry(label).or_insert_with(|| {
+            json!({"frames": 0, "sealed": 0, "opened": 0, "leaf_matches": 0, "board_flag": 0, "toc": null, "sample": null})
         });
         entry["frames"] = json!(entry["frames"].as_u64().unwrap() + 1);
         if let Ok(id) = cairn_crypto::media::peek(&frame.payload) {
@@ -195,8 +200,11 @@ fn tap(
                 list.push(json!(hex::encode(&frame.payload[..frame.payload.len().min(16)])));
             }
         }
-        if let Ok((_, plain)) = cairn_crypto::media::open(key, &frame.payload) {
+        if let Ok((flags, plain)) = cairn_crypto::media::open(key, &frame.payload) {
             entry["opened"] = json!(entry["opened"].as_u64().unwrap() + 1);
+            if flags & cairn_crypto::media::FLAG_SOUNDBOARD != 0 {
+                entry["board_flag"] = json!(entry["board_flag"].as_u64().unwrap() + 1);
+            }
             if entry["toc"].is_null() && !plain.is_empty() {
                 entry["toc"] = json!(plain[0]);
             }

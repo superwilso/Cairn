@@ -17,14 +17,23 @@
 //
 // ## No renegotiation
 //
-// The first offer carries one sendonly audio track and SLOTS recvonly ones. The SFU fills a
-// slot when somebody first speaks. Nothing is ever added later, so there is no glare and no
-// second offer — the same reasoning as call.js's empty video line.
+// The first offer carries two sendonly audio tracks — the microphone, then the soundboard —
+// and SLOTS recvonly ones. The SFU fills a slot when a track first carries anything. Nothing
+// is ever added later, so there is no glare and no second offer — the same reasoning as
+// call.js's empty video line.
+//
+// ## Soundboards, per listener
+//
+// Clips go out on the soundboard track, sealed like the voice and marked as clips by a flag
+// *inside* the seal (CairnFrame.FLAG_SOUNDBOARD). So in an end-to-end call a listener knows a
+// slot is somebody's soundboard by that person's own word, and turns it down or off with the
+// per-person and "mute all" settings in callaudio.js without touching anyone's voice. The
+// cost: the SFU sees when each person plays a clip, from the second track's activity.
 
 /* eslint-env browser */
 
 const CairnVoiceChannel = (() => {
-    const SLOTS = 15;                 // MAX_VOICE_PARTICIPANTS - 1, see state.rs
+    const SLOTS = 30;                 // 2 × (MAX_VOICE_PARTICIPANTS - 1): a voice and a soundboard each
     const KEEP_OLD_EPOCH_MS = 10_000; // senders cross an epoch at slightly different moments
     const REFRESH_MS = 1000;
 
@@ -44,6 +53,8 @@ const CairnVoiceChannel = (() => {
     const old = [];                   // [{ until, keys: Map }]
     const mic = { muted: false, deafened: false };
     const heard = new Map();          // slot index -> { leaf, flags, at }
+    let boardSender = null;           // the soundboard's RTCRtpSender
+    let board = null;                 // { ctx, dest, track } once a clip has played
     const audio = new Map();          // slot index -> HTMLAudioElement
     const stats = { sealed: 0, opened: 0, passed: 0, dropped: 0 };
     const slotMid = [];               // slot index -> mid, once negotiated
@@ -131,18 +142,20 @@ const CairnVoiceChannel = (() => {
             await leave();
             return;
         }
+        applyLevels();
         ui.onState(next);
     }
 
-    function attachTransform(target, side, index) {
+    function attachTransform(target, side, index, isBoard = false) {
         if (path === "script") {
-            target.transform = new RTCRtpScriptTransform(worker, { side, index });
+            target.transform = new RTCRtpScriptTransform(worker, { side, index, board: isBoard });
             return;
         }
         if (path !== "legacy") return;
         const { readable, writable } = target.createEncodedStreams();
         const run = CairnFrame.transformer(side, {
-            mode, sealing: () => sealing, keyFor, flags,
+            mode, sealing: () => sealing, keyFor,
+            flags: isBoard ? () => CairnFrame.FLAG_SOUNDBOARD : flags,
             count: (w) => { stats[w]++; },
             opened: (leaf, f) => noteHeard(index, leaf, f),
         });
@@ -151,8 +164,40 @@ const CairnVoiceChannel = (() => {
 
     function noteHeard(index, leaf, f) {
         const who = leafInfo.get(leaf);
+        const before = heard.get(index);
         heard.set(index, { leaf, flags: f, at: Date.now() });
-        if (who) ui.onHeard(index, { ...who, muted: !!(f & 1), deafened: !!(f & 2) });
+        if (!before || before.leaf !== leaf || (before.flags & 4) !== (f & 4)) applyLevel(index);
+        if (who && !(f & CairnFrame.FLAG_SOUNDBOARD)) {
+            ui.onHeard(index, { ...who, muted: !!(f & 1), deafened: !!(f & 2) });
+        }
+    }
+
+    // This device's chosen level for one receive slot: the owner's voice or soundboard
+    // setting from callaudio.js, deafen included. A slot nobody is known to own yet plays at
+    // full volume unless deafened — in an E2EE call that lasts until its first frame opens.
+    function applyLevel(index) {
+        const el = audio.get(index);
+        if (!el) return;
+        const owner = slotOwner(index);
+        const levels = typeof CairnCallAudio !== "undefined" ? CairnCallAudio : null;
+        let level = mic.deafened ? 0 : 1;
+        if (owner && levels) {
+            level = owner.track === "board" ? levels.boardLevel(owner.user) : levels.voiceLevel(owner.user);
+        }
+        if (mic.deafened) level = 0;
+        el.muted = level === 0;
+        el.volume = Math.max(0, Math.min(1, level));
+    }
+
+    function applyLevels() {
+        for (const index of audio.keys()) applyLevel(index);
+    }
+    // Registered on first join: callaudio.js loads after this file.
+    let listening = false;
+    function listenForLevels() {
+        if (listening || typeof CairnCallAudio === "undefined" || !CairnCallAudio.onBoardChange) return;
+        listening = true;
+        CairnCallAudio.onBoardChange(() => applyLevels());
     }
 
     function waitForIce(peer) {
@@ -168,6 +213,7 @@ const CairnVoiceChannel = (() => {
     // the browser test uses it to exercise the §5 fallback with a real Chromium.
     async function join({ deviceId, simulateNoTransforms = false } = {}) {
         if (pc) await leave();
+        listenForLevels();
         path = simulateNoTransforms ? "none" : capability();
         local = await navigator.mediaDevices.getUserMedia({
             audio: deviceId ? { deviceId: { exact: deviceId } } : true, video: false,
@@ -183,6 +229,10 @@ const CairnVoiceChannel = (() => {
         }
         const send = pc.addTransceiver(local.getAudioTracks()[0], { direction: "sendonly", streams: [local] });
         attachTransform(send.sender, "send", -1);
+        // The soundboard: second, so the SFU takes it for one. Empty until the first clip.
+        const boardTx = pc.addTransceiver("audio", { direction: "sendonly" });
+        boardSender = boardTx.sender;
+        attachTransform(boardTx.sender, "send", -2, true);
         const recv = [];
         for (let i = 0; i < SLOTS; i++) {
             const t = pc.addTransceiver("audio", { direction: "recvonly" });
@@ -195,8 +245,8 @@ const CairnVoiceChannel = (() => {
             const el = audio.get(index) || new Audio();
             el.autoplay = true;
             el.srcObject = new MediaStream([ev.track]);
-            el.muted = mic.deafened;
             audio.set(index, el);
+            applyLevel(index);
             if (typeof CairnCall !== "undefined" && CairnCall.applySpeaker) CairnCall.applySpeaker(el);
             el.play().catch(() => {});
         };
@@ -231,6 +281,9 @@ const CairnVoiceChannel = (() => {
         if (pc) { try { pc.close(); } catch (_) {} }
         if (local) local.getTracks().forEach((t) => t.stop());
         if (worker) worker.terminate();
+        if (board) { try { board.ctx.close(); } catch (_) {} }
+        board = null;
+        boardSender = null;
         for (const el of audio.values()) { el.srcObject = null; }
         audio.clear();
         heard.clear();
@@ -253,8 +306,30 @@ const CairnVoiceChannel = (() => {
 
     function setDeafened(d) {
         mic.deafened = !!d;
-        for (const el of audio.values()) el.muted = mic.deafened;
+        applyLevels();
         setMuted(mic.muted);
+    }
+
+    // A soundboard clip, on the soundboard track — the same contract as CairnCall.playClip.
+    async function playClip(buffer, { gain = 1, maxSeconds = 5 } = {}) {
+        if (!pc || !local || !boardSender) throw new Error("not in a voice channel");
+        const track = local.getAudioTracks()[0];
+        if (!track || !track.enabled) throw new Error("unmute to play a sound");
+        if (!board) {
+            const ctx = new AudioContext();
+            const dest = ctx.createMediaStreamDestination();
+            board = { ctx, dest, track: dest.stream.getAudioTracks()[0] };
+            await boardSender.replaceTrack(board.track);
+        }
+        if (board.ctx.state === "suspended") await board.ctx.resume();
+        const clip = board.ctx.createBufferSource();
+        clip.buffer = buffer;
+        const level = board.ctx.createGain();
+        level.gain.value = Math.max(0, Math.min(1, gain));
+        clip.connect(level).connect(board.dest);
+        clip.start();
+        clip.stop(board.ctx.currentTime + Math.min(buffer.duration, maxSeconds));
+        return clip;
     }
 
     async function readStats() {
@@ -271,18 +346,22 @@ const CairnVoiceChannel = (() => {
 
     // Who is on a slot: by the key their frames open under in an E2EE call; by the SFU's
     // claim (state.slots) only when the call is transport-only.
+    // And which of their tracks: in an E2EE call by the sealed soundboard flag.
     function slotOwner(index) {
         const h = heard.get(index);
-        if (h && leafInfo.has(h.leaf)) return { ...leafInfo.get(h.leaf), attested: true };
+        if (h && leafInfo.has(h.leaf)) {
+            const track = h.flags & CairnFrame.FLAG_SOUNDBOARD ? "board" : "voice";
+            return { ...leafInfo.get(h.leaf), track, attested: true };
+        }
         if (state && mode() === "transport") {
             const s = (state.slots || []).find((x) => x.mid === slotMid[index]);
-            if (s) return { user: s.user, device: s.device, attested: false };
+            if (s) return { user: s.user, device: s.device, track: s.track || "voice", attested: false };
         }
         return null;
     }
 
     return {
-        join, leave, refresh, setMuted, setDeafened, readStats, slotOwner, capability,
+        join, leave, refresh, setMuted, setDeafened, readStats, slotOwner, capability, playClip,
         setPrefs(p) { prefs = { ...prefs, ...p }; },
         get session() { return session; },
         get state() { return state; },

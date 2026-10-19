@@ -635,6 +635,8 @@ struct VoiceSlotResponse {
     mid: String,
     user: String,
     device: String,
+    /// "voice" or "board": which of their two tracks the slot carries.
+    track: &'static str,
 }
 
 /// Who is in the room's voice channel. Rules in [`crate::state::Instance::voice_roster`].
@@ -656,12 +658,13 @@ async fn voice_roster(
                     .unwrap_or_default();
                 let registry = instance.voice_registry();
                 let registry = registry.lock().expect("voice mutex poisoned");
-                for (mid, source) in assigned {
+                for (mid, source, track) in assigned {
                     if let Some(who) = registry.occupant(source) {
                         slots.push(VoiceSlotResponse {
                             mid,
                             user: who.user.to_string(),
                             device: who.device.to_string(),
+                            track: track.as_str(),
                         });
                     }
                 }

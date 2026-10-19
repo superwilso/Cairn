@@ -2,20 +2,22 @@
 //
 // ## How a clip reaches everyone
 //
-// Mixed into this device's outgoing microphone track (`CairnCall.mixIntoMic`), and played
-// locally at the same level so the person pressing the button hears what they sent. There is
-// no "play X" message: one would cross the instance — encrypted, but timed — whereas the mix
-// is just more audio on a peer-to-peer track the instance never carries. The clip's bytes come
-// from this device's cache of the room's set; pressing a button fetches nothing.
+// On this device's **soundboard track** — a second audio track beside the microphone, in a
+// rung call (`CairnCall.playClip`) or a voice channel (`CairnVoiceChannel.playClip`) — and
+// played locally at the same level so the person pressing the button hears what they sent.
+// There is no "play X" message. The clip's bytes come from this device's cache of the room's
+// set; pressing a button fetches nothing.
 //
-// ## What that costs, said where the controls are
+// ## What listeners control, and what it costs
 //
-// A listener receives a clip as part of the sender's voice. So **the volume here is the
-// sender's**: it sets how loud your clips are for everyone, you included. A listener cannot
-// turn one person's clips down without turning that person down, and "soundboard off" on
-// this device stops you playing clips and previews — it cannot silence clips other people
-// mix into their own microphones. Doing that would need each clip on a separate track,
-// which costs a renegotiation per call in the mesh; recorded in docs/13-customisation.md.
+// Because clips are their own track, every listener can turn one person's soundboard down or
+// off, or mute everyone's, on their own device (callaudio.js; the per-person popover and
+// Settings → Voice & video). The volume here is the sender's: how loud your clips go out.
+//
+// The cost, said in docs/13-customisation.md and in the panel below: whoever carries the
+// media can tell when a clip is playing, from the soundboard track's activity and timing —
+// the instance's SFU in a voice channel, a TURN relay in a rung call. Not which clip: in an
+// end-to-end call the audio is sealed like the voice.
 
 const CairnSoundboard = (() => {
     const $ = (id) => document.getElementById(id);
@@ -23,7 +25,9 @@ const CairnSoundboard = (() => {
     const OFF_KEY = "cairn.soundboard.off";
     let hooks = { onError: () => {}, inCall: () => false, onPlayed: () => {} };
     let panel = null;
-    let button = null;
+    let button = null;          // the call bar's button
+    let anchor = null;          // whichever button opened the panel
+    const extra = [];           // further buttons, e.g. in the voice-channel panel
     let ctx = null;
     const decoded = new Map();   // asset id -> AudioBuffer
     let limitMs = 5000;
@@ -63,12 +67,14 @@ const CairnSoundboard = (() => {
         src.stop(c.currentTime + Math.min(buf.duration, limitMs / 1000));
     }
 
-    // Play into the call: everyone hears it in this device's microphone track.
+    // Play into the call this device is in, on its soundboard track.
     async function play(it) {
         if (off()) throw new Error("The soundboard is off on this device.");
         if (!hooks.inCall()) throw new Error("Join a call to play a sound.");
         const buf = await buffer(it);
-        await CairnCall.mixIntoMic(buf, { gain: volume(), maxSeconds: limitMs / 1000 });
+        const call = typeof CairnVoiceChannel !== "undefined" && CairnVoiceChannel.session
+            ? CairnVoiceChannel : CairnCall;
+        await call.playClip(buf, { gain: volume(), maxSeconds: limitMs / 1000 });
         playLocally(buf);
         hooks.onPlayed(it);
     }
@@ -93,9 +99,9 @@ const CairnSoundboard = (() => {
             <label class="sb-volume">Your clips' volume
               <input type="range" id="sb-volume" min="0" max="100" step="1"></label>
             <label class="toggle"><input type="checkbox" id="sb-off"> Soundboard off on this device</label>
-            <p class="note">Clips are mixed into your microphone, so everyone in the call hears
-              them at this volume. Listeners cannot turn your clips down apart from your voice,
-              and turning the soundboard off here does not silence other people's.</p>
+            <p class="note">How loud your clips go out. Each listener can also turn your clips
+              down or off for themselves. Clips travel as their own stream, so the server
+              carrying the call can tell when one is playing, though not what it is.</p>
           </div>`;
         document.body.append(panel);
         const slider = $("sb-volume");
@@ -105,7 +111,8 @@ const CairnSoundboard = (() => {
         toggle.checked = off();
         toggle.addEventListener("change", () => { store(OFF_KEY, toggle.checked); draw(); });
         document.addEventListener("pointerdown", (e) => {
-            if (!panel.hidden && !panel.contains(e.target) && !button.contains(e.target)) close();
+            const onButton = [button, ...extra].some((b) => b && b.contains(e.target));
+            if (!panel.hidden && !panel.contains(e.target) && !onButton) close();
         });
         document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
         CairnEmoji.onChange(() => {
@@ -142,7 +149,7 @@ const CairnSoundboard = (() => {
     }
 
     function place() {
-        const a = button.getBoundingClientRect();
+        const a = (anchor || button).getBoundingClientRect();
         const w = Math.min(320, window.innerWidth - 16);
         panel.style.width = w + "px";
         panel.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, a.left)) + "px";
@@ -153,22 +160,46 @@ const CairnSoundboard = (() => {
         panel.style.top = (above >= 8 ? above : Math.min(window.innerHeight - h - 8, a.bottom + 6)) + "px";
     }
 
-    function open() {
+    function open(from) {
         if (!panel) build();
+        anchor = from || button;
         draw();
         panel.hidden = false;
         place();
-        button.classList.add("on");
+        if (anchor) anchor.classList.add("on");
     }
 
     function close() {
         if (panel) panel.hidden = true;
-        if (button) button.classList.remove("on");
+        for (const b of [button, ...extra]) if (b) b.classList.remove("on");
     }
 
     // The button only exists in a call's control bar, and only when the room has sounds.
     function sync() {
-        if (button) button.hidden = CairnEmoji.items("sound").length === 0;
+        const none = CairnEmoji.items("sound").length === 0;
+        for (const b of [button, ...extra]) if (b) b.hidden = none;
+    }
+
+    function makeButton(id) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.id = id;
+        b.className = "icon";
+        b.title = "Soundboard";
+        b.setAttribute("aria-label", "Soundboard");
+        b.innerHTML = '<svg width="15" height="15" aria-hidden="true"><use href="#i-sound"/></svg> <span>Sounds</span>';
+        b.addEventListener("click", () => (panel && !panel.hidden && anchor === b ? close() : open(b)));
+        return b;
+    }
+
+    // A second way in, for the voice channel's controls: the same panel, opened beside it.
+    function addButton(container) {
+        if (!container) return;
+        const b = makeButton("soundboard-btn-" + (extra.length + 1));
+        extra.push(b);
+        container.append(b);
+        if (!panel) build();
+        sync();
     }
 
     // `bar` is the call's control bar; the button goes in before its spacer, kept apart from
@@ -177,19 +208,12 @@ const CairnSoundboard = (() => {
         hooks = { ...hooks, ...h };
         if (h.limitMs) limitMs = h.limitMs;
         if (!h.bar) return;
-        button = document.createElement("button");
-        button.type = "button";
-        button.id = "soundboard-btn";
-        button.className = "icon";
-        button.title = "Soundboard";
-        button.setAttribute("aria-label", "Soundboard");
-        button.innerHTML = '<svg width="15" height="15" aria-hidden="true"><use href="#i-sound"/></svg> <span>Sounds</span>';
-        button.addEventListener("click", () => (panel && !panel.hidden ? close() : open()));
+        button = makeButton("soundboard-btn");
         const spacer = h.bar.querySelector(".grow");
         h.bar.insertBefore(button, spacer || null);
         if (!panel) build();
         sync();
     }
 
-    return { bind, play, preview, open, close, volume, off };
+    return { bind, addButton, play, preview, open, close, volume, off };
 })();

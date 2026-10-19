@@ -1956,6 +1956,24 @@ mod turn {
 /// renegotiate as people arrive.
 pub const MAX_VOICE_PARTICIPANTS: usize = 16;
 
+/// Which of a participant's two outgoing tracks a stream is: their microphone, or their
+/// soundboard. Separate so each listener can turn one person's clips down without turning
+/// their voice down — and, as the cost of that, so the SFU can see when a clip is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VoiceTrack {
+    Voice,
+    Board,
+}
+
+impl VoiceTrack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoiceTrack::Voice => "voice",
+            VoiceTrack::Board => "board",
+        }
+    }
+}
+
 /// An SFU connection's id. Random, and never a capability on its own: every operation on
 /// one is checked against the account that opened it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

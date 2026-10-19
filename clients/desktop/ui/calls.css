@@ -157,6 +157,7 @@
 .volume-pop .toggle input { width: auto; margin: 0; accent-color: var(--accent); }
 .volume-pop .note { margin-top: 6px; }
 .volume-pop #volume-reset { margin-top: 6px; padding: 3px 8px; font-size: 12px; }
+.volume-pop .volume-sub { margin-top: 12px; font-weight: 500; font-size: 12px; }
 
 /* ---- the timeline ------------------------------------------------------- */
 

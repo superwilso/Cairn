@@ -44,7 +44,7 @@ Discord is the benchmark; nobody else is close.
 | Screen share | ✅ | ⚠️ in call | ⚠️ in call | ❌ | ✅ | 🎯 v2 |
 | Stage / broadcast | ✅ | ❌ | ❌ | ⚠️ Live | ✅ | 🎯 v3 |
 | Custom emoji / stickers | ✅ | ⚠️ stickers | ⚠️ stickers | ⚠️ | ✅ | ✅ desktop — per room, set distributed up front **inside the encrypted stream**, drawn from a local cache |
-| Soundboard | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ desktop — clips mixed into the caller's microphone; nothing announced |
+| Soundboard | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ desktop — clips on their own track, each listener can mute anyone's; the server carrying a call sees when one plays |
 | Profiles (bio, banner, status, nicknames) | ✅ server-side | ⚠️ name + avatar, encrypted | ⚠️ server-side | ✅ server-side | ✅ server-side | ✅ **end to end**, per room |
 | Bots & app platform | ✅ | ❌ | ⚠️ Business API | ❌ | ✅ | 🎯 v2 |
 | Server discovery | ✅ | ❌ | ❌ | ❌ | ✅ | 🎯 v2 |

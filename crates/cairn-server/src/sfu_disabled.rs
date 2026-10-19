@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 use cairn_proto::RoomId;
 
+pub use crate::state::VoiceTrack;
 use crate::state::{SharedVoice, VoiceSessionId, MAX_VOICE_PARTICIPANTS};
 
 /// As in the real module.
-pub const RECEIVE_SLOTS: usize = MAX_VOICE_PARTICIPANTS - 1;
+pub const RECEIVE_SLOTS: usize = 2 * (MAX_VOICE_PARTICIPANTS - 1);
 
 /// As in the real module.
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +56,7 @@ impl Sfu {
         match self.never {}
     }
 
-    pub fn slots(&self, _session: VoiceSessionId) -> Vec<(String, VoiceSessionId)> {
+    pub fn slots(&self, _session: VoiceSessionId) -> Vec<(String, VoiceSessionId, VoiceTrack)> {
         match self.never {}
     }
 }

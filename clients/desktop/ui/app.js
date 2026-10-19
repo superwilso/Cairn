@@ -520,9 +520,11 @@ CairnCustomise.bind({
 });
 CairnSoundboard.bind({
     bar: document.querySelector("#stage .callbar"),
-    inCall: () => inCall,
+    // A rung call or a voice channel: clips go out on whichever one this device is in.
+    inCall: () => inCall || CairnVoicePanel.active,
     onError: (e) => fail($("error"), e),
 });
+CairnSoundboard.addButton(document.querySelector("#voice-channel .vc-controls"));
 
 // ---- calls -----------------------------------------------------------------
 
