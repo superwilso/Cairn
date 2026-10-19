@@ -179,15 +179,23 @@ jobs:
               speaking indicator, push-to-talk (while the window is focused), per-person volume,
               noise suppression / echo cancellation / gain toggles, screen sharing. Optional TURN
               relay, opt-in, if your instance operator configures one.
+            - **Voice channels**: drop in and out of a room's voice channel, audio only, through
+              an SFU built into the instance. In an encrypted room the audio stays end-to-end
+              encrypted through it; if someone cannot do that, the call shows its own badge and
+              tells everyone. The SFU sees who is connected, when, and packet sizes and timing.
             - **Profiles and customisation**: encrypted profiles, nicknames, themes, custom CSS.
-            - **Custom emoji, stickers and a soundboard** per room, as one encrypted set.
+            - **Custom emoji, stickers and a soundboard** per room, as one encrypted set. Each
+              listener can turn one person's clips down, or everyone's off. Whoever carries the
+              audio can tell when a clip plays, not which.
             - **Link previews** made by the sender (off by default, per-site opt-in) and **GIF
               search** through the instance — needs the operator's KLIPY or GIPHY key.
 
             ### What does not (yet)
 
-            - **Group calls are a mesh**: everyone sends to everyone, and each person sees the
-              others' IP addresses unless the relay is on.
+            - **Calls you ring are a mesh**: everyone sends to everyone, and each person sees
+              the others' IP addresses unless the relay is on. Voice channels use the SFU instead.
+            - **Voice channels are audio only**, with no TURN in front of the SFU, and you leave
+              the channel if you open another room.
             - **Rings only reach the room you have open.**
             - **Windows only.** No macOS build; on Linux, WebKitGTK denies the microphone.
             - **No key backup.** Losing the profile directory loses that device's history.
@@ -202,11 +210,14 @@ jobs:
                ```powershell
                $env:CAIRN_REGISTRATION_POLICY = "invite_only"
                $env:CAIRN_INVITES = "me-7f3k9q2m4x8w,friend-2n6v1r5t9z3c"
+               $env:CAIRN_SFU_BIND = "127.0.0.1:3480"   # voice channels; omit to turn them off
                .\cairn-server.exe
                ```
 
                It listens on `127.0.0.1:8080`. For a friend on another machine, set
-               `$env:CAIRN_BIND = "0.0.0.0:8080"` and give them your address — but over plain
+               `$env:CAIRN_BIND = "0.0.0.0:8080"`, plus `$env:CAIRN_SFU_BIND = "0.0.0.0:3480"` and
+               `$env:CAIRN_SFU_ADVERTISE = "<your-ip>:3480"` for voice channels (UDP; allow it
+               through Windows Firewall), and give them your address — but over plain
                `http://` account ids, membership and timing are visible on the network (message
                bodies stay end-to-end encrypted). Put it behind TLS for anything real.
             2. Install and open Cairn, enter `http://127.0.0.1:8080` as the instance, pick a
