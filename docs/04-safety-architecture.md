@@ -119,8 +119,10 @@ not implemented.
 
 Rooms now have owner/moderator/member roles with removal, which is the floor: before this
 a room could never eject anyone, so a single malicious member could admit attackers
-permanently. That is per-room enforcement only — the cross-instance, subscribable part
-below is still ahead.
+permanently. Spaces add Discord-style roles with permission bits, per-channel overrides, and
+kicks that bar rejoining by invite ([ADR-011](adr/011-spaces-channels-roles.md)). Both are
+per-community enforcement, held and applied by the instance — the cross-instance,
+subscribable part below is still ahead.
 
 Matrix's subscribable ban lists (Mjolnir, then Draupnir) are the most effective federated
 moderation tool that exists in the wild. Communities publish ban lists as data; other

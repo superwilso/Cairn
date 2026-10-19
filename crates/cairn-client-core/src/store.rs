@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use cairn_proto::{RoomId, RoomSeal, Tier};
+use cairn_proto::{RoomId, RoomSeal, SpaceId, Tier};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -56,6 +56,13 @@ pub struct ConversationRecord {
     /// failing, which for an old index means one final replay and then correctness.
     #[serde(default)]
     pub cursor: u64,
+    /// The space this room is a channel of, if any.
+    ///
+    /// Recorded so a frontend can list channels under their space rather than among the
+    /// DMs and groups. Display only: who may read a channel is the instance's decision, and
+    /// nothing on this device consults this field to make it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceId>,
 }
 
 /// A room id → MLS group id index, persisted as one JSON file.
@@ -111,11 +118,39 @@ impl ConversationIndex {
         // Recording a room again must not rewind its cursor: `record` is called after a
         // join and after an add, both of which happen mid-conversation.
         let cursor = self.rooms.get(&room).map_or(0, |existing| existing.cursor);
+        let space = self.rooms.get(&room).and_then(|existing| existing.space);
         self.rooms.insert(
             room,
-            ConversationRecord { group_id: group_id.map(hex::encode), tier: seal.tier(), cursor },
+            ConversationRecord {
+                group_id: group_id.map(hex::encode),
+                tier: seal.tier(),
+                cursor,
+                space,
+            },
         );
         self.save()
+    }
+
+    /// Record a room as a channel of `space`, keeping any group already recorded for it.
+    ///
+    /// The tier check is [`ConversationIndex::record`]'s: a channel this device has seen at one
+    /// tier is refused at another, so an instance that later relists an encrypted channel as
+    /// public is caught here rather than believed.
+    pub fn record_channel(
+        &mut self,
+        room: RoomId,
+        seal: &RoomSeal,
+        space: SpaceId,
+    ) -> Result<(), IndexError> {
+        let group = self.group_id(&room)?;
+        self.record(room, seal, group.as_deref())?;
+        if let Some(record) = self.rooms.get_mut(&room) {
+            if record.space.is_none() {
+                record.space = Some(space);
+                return self.save();
+            }
+        }
+        Ok(())
     }
 
     /// Note that everything up to `seq` has been processed.

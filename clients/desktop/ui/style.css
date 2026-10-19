@@ -1318,7 +1318,7 @@ html[data-motion="reduce"] *::after {
   }
   #safety-changed strong { color: #ff8a80 !important; }
 
-  #waiting {
+  #waiting, #departed {
     visibility: visible !important;
     opacity: 1 !important;
     filter: none !important;

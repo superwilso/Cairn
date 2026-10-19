@@ -24,7 +24,8 @@ use cairn_client_core::custom::Kind as CustomKind;
 use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
     CustomLimits, CustomSetView, Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView,
-    ProfileEdit, ProfileLimits, ProfileView, ReactionView, RoomSummary, Session,
+    ProfileEdit, ProfileLimits, ProfileView, ReactionView, RoomSummary, Session, SpaceDisplay,
+    SpaceListing,
 };
 use cairn_client_core::verify::SafetyView;
 use tauri::State;
@@ -242,6 +243,119 @@ fn create_invite(state: State<'_, AppState>, uses: u32, hours: i64) -> CmdResult
 #[tauri::command]
 fn redeem_invite(state: State<'_, AppState>, token: String) -> CmdResult<String> {
     with(&state, |s| s.redeem_invite(&token))
+}
+
+// ---- spaces ----------------------------------------------------------------------------
+//
+// One-line delegations, like everything else here. Every permission the UI shows arrives in
+// `space`'s answer, decided by the instance; nothing below or above this line computes one.
+
+#[tauri::command]
+fn spaces(state: State<'_, AppState>) -> CmdResult<Vec<SpaceListing>> {
+    with(&state, |s| s.spaces())
+}
+
+#[tauri::command]
+fn space(state: State<'_, AppState>, space: String) -> CmdResult<SpaceDisplay> {
+    with(&state, |s| s.space(&space))
+}
+
+#[tauri::command]
+fn create_space(state: State<'_, AppState>, name: String) -> CmdResult<String> {
+    with(&state, |s| s.create_space(&name, None))
+}
+
+#[tauri::command]
+fn create_channel(state: State<'_, AppState>, space: String, name: String) -> CmdResult<String> {
+    with(&state, |s| s.create_channel(&space, &name))
+}
+
+#[tauri::command]
+fn rename_channel(
+    state: State<'_, AppState>,
+    space: String,
+    channel: String,
+    name: String,
+) -> CmdResult<()> {
+    with(&state, |s| s.rename_channel(&space, &channel, &name))
+}
+
+#[tauri::command]
+fn delete_channel(state: State<'_, AppState>, space: String, channel: String) -> CmdResult<()> {
+    with(&state, |s| s.delete_channel(&space, &channel))
+}
+
+#[tauri::command]
+fn set_channel_override(
+    state: State<'_, AppState>,
+    space: String,
+    channel: String,
+    role: Option<String>,
+    allow: Vec<String>,
+    deny: Vec<String>,
+) -> CmdResult<()> {
+    with(&state, |s| s.set_channel_override(&space, &channel, role.as_deref(), &allow, &deny))
+}
+
+#[tauri::command]
+fn create_role(
+    state: State<'_, AppState>,
+    space: String,
+    name: String,
+    grants: Vec<String>,
+    position: u32,
+) -> CmdResult<String> {
+    with(&state, |s| s.create_role(&space, &name, &grants, position))
+}
+
+#[tauri::command]
+fn assign_role(
+    state: State<'_, AppState>,
+    space: String,
+    user: String,
+    role: String,
+) -> CmdResult<()> {
+    with(&state, |s| s.assign_role(&space, &user, &role))
+}
+
+#[tauri::command]
+fn unassign_role(
+    state: State<'_, AppState>,
+    space: String,
+    user: String,
+    role: String,
+) -> CmdResult<()> {
+    with(&state, |s| s.unassign_role(&space, &user, &role))
+}
+
+#[tauri::command]
+fn kick(state: State<'_, AppState>, space: String, user: String) -> CmdResult<()> {
+    with(&state, |s| s.kick(&space, &user))
+}
+
+#[tauri::command]
+fn leave_space(state: State<'_, AppState>, space: String) -> CmdResult<()> {
+    with(&state, |s| s.leave_space(&space))
+}
+
+#[tauri::command]
+fn create_space_invite(
+    state: State<'_, AppState>,
+    space: String,
+    uses: u32,
+    hours: i64,
+) -> CmdResult<String> {
+    with(&state, |s| s.create_space_invite(&space, uses, hours))
+}
+
+#[tauri::command]
+fn redeem_space_invite(state: State<'_, AppState>, token: String) -> CmdResult<String> {
+    with(&state, |s| s.redeem_space_invite(&token))
+}
+
+#[tauri::command]
+fn remove_departed(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    with(&state, |s| s.remove_departed())
 }
 
 #[tauri::command]
@@ -670,6 +784,21 @@ fn main() {
             custom_add,
             custom_remove,
             send_sticker,
+            spaces,
+            space,
+            create_space,
+            create_channel,
+            rename_channel,
+            delete_channel,
+            set_channel_override,
+            create_role,
+            assign_role,
+            unassign_role,
+            kick,
+            leave_space,
+            create_space_invite,
+            redeem_space_invite,
+            remove_departed,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

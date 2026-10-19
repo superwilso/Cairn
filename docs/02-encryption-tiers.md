@@ -23,7 +23,8 @@ ADR-001; this is the operational specification.
 
 - **Applies to:** invite-only communities under the T2 ceiling
 - **Crypto:** MLS, one group per channel; membership changes are commits
-- **Server sees:** ciphertext, plus full metadata including channel structure
+- **Server sees:** ciphertext, plus full metadata including channel structure, roles and
+  who holds them ([ADR-011](adr/011-spaces-channels-roles.md))
 - **Search:** client-side only
 - **Moderation:** franking reports plus admin tooling operating on client-supplied
   evidence; admins cannot read history they were not present for

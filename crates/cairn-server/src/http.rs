@@ -94,6 +94,7 @@ pub fn router_behind(instance: SharedInstance, proxies: TrustedProxies) -> Route
         .route("/v1/reports", post(submit_report))
         .route("/v1/gifs", get(gif_capability))
         .route("/v1/gifs/tunnel/{target}", get(gif_tunnel))
+        .merge(crate::spaces_http::routes())
         .with_state(state)
 }
 
@@ -172,6 +173,24 @@ impl IntoResponse for ServerError {
             ServerError::GifConfigInvalid(_) | ServerError::TurnConfigInvalid(_) => {
                 StatusCode::BAD_REQUEST
             }
+            ServerError::NoSuchSpace | ServerError::NoSuchRole | ServerError::NoSuchChannel => {
+                StatusCode::NOT_FOUND
+            }
+            // Authorization, all of it: the caller proved who they are and is not entitled.
+            // A room-level call on a channel is in this group too — it is not malformed, it
+            // is asking the room for something only the space may grant.
+            ServerError::NotASpaceMember
+            | ServerError::MissingPermission(_)
+            | ServerError::RankTooLow
+            | ServerError::CannotGrantUnheld
+            | ServerError::OwnerIsPermanent
+            | ServerError::ManagedBySpace => StatusCode::FORBIDDEN,
+            ServerError::SpaceFull | ServerError::SpaceLimitReached => StatusCode::CONFLICT,
+            ServerError::BadName
+            | ServerError::BadOverride
+            | ServerError::BadPosition
+            | ServerError::UnknownPermission
+            | ServerError::BadCeiling => StatusCode::BAD_REQUEST,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -273,7 +292,7 @@ fn client_address(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> st
 ///
 /// Membership checks in the state layer are only as good as the identity they are checked
 /// against, so every membership-gated endpoint proves the caller's account first.
-fn signed_actor(
+pub(crate) fn signed_actor(
     instance: &SharedInstance,
     headers: &HeaderMap,
     action: &str,
@@ -841,7 +860,7 @@ where
     carried
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }

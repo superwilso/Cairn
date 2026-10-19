@@ -65,6 +65,9 @@ $("go").onclick = async () => {
         // failure looks like "my friend cannot add me" much later.
         try { await invoke("publish_key_packages", { count: 5 }); } catch (_) {}
         await refreshRooms();
+        // Spaces are an addition to the app, not a gate on it: an instance too old to have
+        // them, or one refusing the list, must not stop the rest of sign-in.
+        try { await CairnSpaces.signedIn(); } catch (e) { fail($("error"), e); }
         await listDevices();
         await CairnLinkCards.loadSettings();
     } catch (e) {
@@ -161,6 +164,7 @@ async function selectRoom(room) {
     CairnMessages.cancelReply();
     $("room-id").textContent = short(room);
     $("room-id").title = room;
+    CairnSpaces.opened(room);
     $("timeline").textContent = "";
     CairnAttach.reset();
     CairnEmoji.reset();
@@ -201,6 +205,7 @@ async function refreshMembers() {
     const list = $("member-list");
     list.textContent = "";
     const waiting = [];
+    const departed = [];
     for (const m of members) {
         const li = document.createElement("li");
 
@@ -225,6 +230,7 @@ async function refreshMembers() {
             li.classList.add("openable");
             li.onclick = () => openSafety(m.user);
 
+            if (m.role === "unlisted") departed.push(m.user);
             if (m.role === "unlisted") {
                 // Rust found them in the group's roster; the instance's member list left
                 // them out. They can read the room, so they are shown — loudly.
@@ -259,7 +265,20 @@ async function refreshMembers() {
     show($("waiting"), waiting.length > 0);
     $("waiting-text").textContent =
         waiting.length + " joined by invite and cannot read this room yet";
+    // Rust labelled them: in the encrypted group, no longer on the instance's list. A kick
+    // from a space leaves exactly this behind.
+    show($("departed"), departed.length > 0);
+    $("departed-text").textContent =
+        departed.length + " no longer in this room still hold its keys";
 }
+
+$("evict").onclick = async () => {
+    try {
+        const removed = await invoke("remove_departed");
+        addNotice("Removed " + removed.length + " from the encrypted group.");
+        await refreshMembers();
+    } catch (e) { fail($("error"), e); }
+};
 
 $("admit").onclick = async () => {
     try {
@@ -856,7 +875,10 @@ async function tick() {
             await refreshRooms();
         }
     }
-    if (membershipChanged) await refreshMembers();
+    if (membershipChanged) {
+        await refreshMembers();
+        CairnSpaces.membershipChanged();
+    }
 }
 
 // ---- rendering -------------------------------------------------------------
@@ -887,6 +909,7 @@ CairnProfile.init({
     onError: (e) => fail($("error"), e),
 });
 CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
+CairnSpaces.bind({ invoke, selectRoom, addNotice, fail, short, initials, me: () => myUser });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

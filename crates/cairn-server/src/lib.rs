@@ -18,5 +18,6 @@ pub mod address;
 pub mod backup;
 pub mod gif_relay;
 pub mod http;
+pub mod spaces_http;
 pub mod state;
 pub mod storage;
