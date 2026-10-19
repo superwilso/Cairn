@@ -40,23 +40,22 @@ Discord is the benchmark; nobody else is close.
 | Servers / spaces | ✅ | ❌ | ⚠️ Communities | ❌ | ⚠️ Channels | ✅ spaces, ADR-011 |
 | Channels within a server | ✅ | ❌ | ⚠️ | ❌ | ❌ | ✅ each its own room and tier |
 | Roles & granular permissions | ✅ | ❌ | ⚠️ admin only | ❌ | ⚠️ admin only | ⚠️ six bits + overrides; instance-held |
-| Voice channels (drop-in) | ✅ | ❌ | ❌ | ❌ | ⚠️ voice chats | 🎯 v2 |
+| Voice channels (drop-in) | ✅ | ❌ | ❌ | ❌ | ⚠️ voice chats | ⚠️ desktop, audio only, E2EE through an SFU |
 | Screen share | ✅ | ⚠️ in call | ⚠️ in call | ❌ | ✅ | 🎯 v2 |
 | Stage / broadcast | ✅ | ❌ | ❌ | ⚠️ Live | ✅ | 🎯 v3 |
 | Custom emoji / stickers | ✅ | ⚠️ stickers | ⚠️ stickers | ⚠️ | ✅ | ✅ desktop — per room, set distributed up front **inside the encrypted stream**, drawn from a local cache |
-| Soundboard | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ desktop — clips mixed into the caller's microphone; nothing announced |
+| Soundboard | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ desktop — clips on their own track, each listener can mute anyone's; the server carrying a call sees when one plays |
 | Profiles (bio, banner, status, nicknames) | ✅ server-side | ⚠️ name + avatar, encrypted | ⚠️ server-side | ✅ server-side | ✅ server-side | ✅ **end to end**, per room |
 | Bots & app platform | ✅ | ❌ | ⚠️ Business API | ❌ | ✅ | 🎯 v2 |
 | Server discovery | ✅ | ❌ | ❌ | ❌ | ✅ | 🎯 v2 |
 | Large public groups | ✅ | ⚠️ 1,000 | ⚠️ ~1,000 | ❌ | ✅ 200,000 | 🎯 T3 |
 
-**Voice channels and screen share are designed but unbuilt**, and the v2 marks above hide
-how large they are: see [`12-realtime-media.md`](12-realtime-media.md). Three things from
-that document change what the table implies. Calls need their own MLS group and an SFU, so
-this is the biggest single component the project has considered. It lands **after** the
-native clients, because a terminal cannot capture a microphone. And unlike Discord, Cairn
-will refuse a call rather than downgrade it to plaintext for a client that cannot do E2EE
-media — the badge is not allowed to lie.
+**Voice channels ship, audio only** ([ADR-012](adr/012-sfu-voice-channels.md),
+[`12-realtime-media.md`](12-realtime-media.md) §0a): an SFU in the instance, frames sealed end
+to end under keys from the room's MLS group. Screen share works in rung (mesh) calls, not
+through the SFU. Like Discord, a call may fall back to transport-only for a client that cannot
+do E2EE media — but it carries its own badge saying so, everyone in it is told, and the
+instance cannot trigger it.
 
 **Customisation is a differentiator, not a footnote.** Most of what Discord charges for
 under Nitro is artificial scarcity — a limit chosen in order to sell removing it — and on an

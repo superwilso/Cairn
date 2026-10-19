@@ -82,7 +82,22 @@ pub enum SignalKind {
     /// It goes through the room like every other signal: the instance learns that a message
     /// went from one member to the room, and not what it said.
     Decline,
+    /// "In this room's voice channel, my media is `payload`": [`VOICE_E2EE`] or
+    /// [`VOICE_TRANSPORT_ONLY`]. Not part of a rung call — `call` is [`VOICE_CHANNEL`].
+    ///
+    /// **This is how a voice channel falls back**, per `docs/12-realtime-media.md` §5, and it
+    /// rides the room's MLS encryption for a reason: the instance cannot forge it. A
+    /// downgrade the instance could trigger would be a downgrade the instance could use to
+    /// hear the call. See `docs/adr/012-sfu-voice-channels.md` §4.
+    VoiceMedia,
 }
+
+/// The `call` field of a [`SignalKind::VoiceMedia`] signal. A room has one voice channel.
+pub const VOICE_CHANNEL: &str = "voice";
+/// The device seals its frames end to end.
+pub const VOICE_E2EE: &str = "e2ee";
+/// The device's webview cannot transform frames, so it sends and needs plaintext media.
+pub const VOICE_TRANSPORT_ONLY: &str = "transport_only";
 
 /// Where the client should look for its NAT-traversal helpers.
 ///

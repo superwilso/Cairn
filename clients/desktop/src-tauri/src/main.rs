@@ -397,6 +397,43 @@ fn call_config(state: State<'_, AppState>) -> CmdResult<CallConfig> {
     with(&state, |s| s.call_config())
 }
 
+// ---- voice channels --------------------------------------------------------
+//
+// The room-attached call through the instance's SFU (docs/adr/012-sfu-voice-channels.md).
+// Whether it is end to end, and with which keys, is decided in `Session` — these only carry
+// the answers across.
+
+/// Join the open room's voice channel with this webview's SDP offer. `e2ee` is whether the
+/// webview can transform frames; `false` makes the call transport-only for everyone, and
+/// everyone is told.
+#[tauri::command]
+fn voice_join(
+    state: State<'_, AppState>,
+    offer: String,
+    e2ee: bool,
+) -> CmdResult<cairn_client_core::session::VoiceJoined> {
+    with(&state, |s| s.voice_join(&offer, e2ee))
+}
+
+#[tauri::command]
+fn voice_leave(state: State<'_, AppState>) -> CmdResult<()> {
+    with(&state, |s| s.voice_leave())
+}
+
+#[tauri::command]
+fn voice_state(
+    state: State<'_, AppState>,
+) -> CmdResult<cairn_client_core::session::VoiceStateView> {
+    with(&state, |s| s.voice_state())
+}
+
+/// The current epoch's media keys. The one place raw keys cross this line; the webview
+/// imports them as non-extractable and keeps no other copy.
+#[tauri::command]
+fn voice_keys(state: State<'_, AppState>) -> CmdResult<cairn_client_core::session::VoiceKeysView> {
+    with(&state, |s| s.voice_keys())
+}
+
 // ---- attachments -----------------------------------------------------------
 //
 // Async, and off the main thread: a 25 MiB upload over a home connection would otherwise
@@ -752,6 +789,10 @@ fn main() {
             signal,
             call_id,
             call_config,
+            voice_join,
+            voice_leave,
+            voice_state,
+            voice_keys,
             call_decline,
             send_file,
             fetch_attachment,

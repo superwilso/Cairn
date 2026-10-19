@@ -1,13 +1,14 @@
 # Build.
 #
-# Pinned to the MSRV floor rather than `latest`: 1.85 is a hard requirement (the crypto
-# tree needs edition2024) and CI checks it, so building the image on the same version is
-# what keeps "it works in Docker" and "CI is green" the same statement.
-FROM rust:1.85-bookworm AS build
+# Pinned rather than `latest`, to the workspace's MSRV floor (1.88: the SFU's `time`
+# dependency needs it for RUSTSEC-2026-0009; see crates/cairn-server/Cargo.toml).
+FROM rust:1.88-bookworm AS build
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# `[patch.crates-io]` in Cargo.toml points here; see vendor/str0m-rust-crypto/VENDORED.md.
+COPY vendor ./vendor
 
 # --locked so the image cannot silently resolve different dependency versions than the
 # ones `cargo audit` ran against in CI.

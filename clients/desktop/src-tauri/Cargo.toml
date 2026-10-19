@@ -2,7 +2,7 @@
 name = "cairn-desktop"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 description = "Cairn desktop client — a thin shell over cairn-client-core"
 license = "Apache-2.0"

@@ -393,7 +393,7 @@ test("calls in the real UI", { skip }, async (t) => {
             await b.waitForSelector(tileSel(ALICE) + ' .tile-badge.local[title="Muted for you"]');
 
             const saved = await b.evaluate(() => JSON.parse(localStorage.getItem("cairn.callvol.v1")));
-            assert.deepStrictEqual(saved["usr_a11ce000000040008000000000000001"], { volume: 160, muted: true });
+            assert.deepStrictEqual(saved["usr_a11ce000000040008000000000000001"], { volume: 160, muted: true, board: 100, boardMuted: false });
 
             // Back to 100%: the plain element path, which every webview plays reliably.
             await b.click("#volume-reset");

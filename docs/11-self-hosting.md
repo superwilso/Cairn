@@ -194,6 +194,34 @@ their IP address from the other people in a call. The setting says what it costs
 you — sees that address instead, and on an instance with no relay it means calls cannot
 connect.
 
+### 2a. Voice channels: the SFU (optional, off by default)
+
+Drop-in voice channels need a media server, and Cairn's is built in: set
+
+```
+CAIRN_SFU_BIND=0.0.0.0:3480            # a UDP port; open it in your firewall
+CAIRN_SFU_ADVERTISE=203.0.113.7:3480   # the public address clients send to (needed with 0.0.0.0)
+```
+
+and every room gets a voice channel. Without them there are none, and calls are the mesh only.
+[ADR-012](adr/012-sfu-voice-channels.md) is the design.
+
+**What it costs you.** All of a channel's audio crosses your connection: each speaker's
+stream goes in once and out to every other participant, so egress grows as N×(N−1) Opus
+streams — around 40 kbps each, so a full channel of 16 is roughly 10 Mbps out at worst, and
+an ordinary handful of people far less. A participant who has played a soundboard clip adds
+a second stream, nearly silent between clips. No video goes through it.
+
+**What it lets you see**, and your users are told the same: who is in which channel, from
+which IP address, and when; the size and timing of each person's packets, which shows who
+is speaking; and when each person plays a soundboard clip, which travels on a track of its own
+so listeners can mute clips apart from voices. In an end-to-end encrypted room you do **not** get the audio — frames are sealed
+on the device before they reach you — unless a participant's client cannot seal, in which case
+the call is badged transport-only for everyone and then you do.
+
+**What it does not do yet.** It is not behind TURN, so a client whose network blocks the UDP
+port cannot join a voice channel. Caddy does not proxy it; it is UDP straight to the instance.
+
 ## 3. Why TLS is not optional here
 
 The server terminates no TLS of its own, and `docker-compose.yml` deliberately gives it no
@@ -469,9 +497,10 @@ Honest list. Each of these is real and none is hypothetical.
   governs the local copy too, so an expired message is deleted from disk rather than merely
   hidden.
 - **Polling, not push.** The client fetches when you press enter.
-- **Calls are a peer-to-peer mesh of at most six.** Voice, video and screen sharing work in
-  the desktop client, with media going directly between participants, so they cost your
-  instance nothing — unless you run the optional TURN relay (§2), whose traffic is yours.
+- **Calls you ring are a peer-to-peer mesh of at most six.** Voice, video and screen sharing
+  work in the desktop client, with media going directly between participants, so they cost
+  your instance nothing — unless you run the optional TURN relay (§2), whose traffic is yours.
+  **Voice channels** go through the SFU if you configure one (§2a): audio only, 16 people.
   The designed media server ([`12-realtime-media.md`](12-realtime-media.md) §2–§4) is
   unbuilt; worth reading before you plan an instance around it, because its egress scales
   with the square of the participant count — five people on 720p video is roughly 30 Mbps

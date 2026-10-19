@@ -28,6 +28,16 @@
 // mid-call, and starting a screen share, then cost one function call and no new SDP — which
 // is also why they are instant rather than taking a second to re-handshake with everyone.
 //
+// ## The soundboard has its own audio line, negotiated up front like the video one
+//
+// Clips go out on a second audio track, not mixed into the microphone, so a listener can turn
+// one person's clips down or off without turning their voice down (callaudio.js). The line is
+// created by the offerer next to the empty video line and claimed by the answerer the same
+// way, so playing the first clip is a `replaceTrack`, not a renegotiation. Which incoming
+// audio track is the soundboard is read from the m-line order — the second audio m-line —
+// rather than from anything a peer says. The cost, in docs/13-customisation.md: whoever
+// carries the media (a TURN relay here, the SFU in a voice channel) sees when a clip plays.
+//
 // ## Mute state travels peer to peer, not through the instance
 //
 // Whether someone is muted or deafened rides a WebRTC data channel on each peer connection —
@@ -45,7 +55,7 @@ const CairnCall = (() => {
     let me = null;
     let local = null;          // MediaStream: the mic, and the camera when it is on
     let screen = null;         // MediaStream from getDisplayMedia, when sharing
-    const peers = new Map();   // user id -> { pc, pending, stream, audioSender, videoSender, channel }
+    const peers = new Map();   // user id -> { pc, pending, stream, board, audioSender, videoSender, boardSender, channel }
 
     // What the microphone is doing. `enabled` on the track is derived from all four, so no
     // combination of buttons and keys can leave it open by accident.
@@ -67,6 +77,7 @@ const CairnCall = (() => {
         onEnd: () => {},       // ()
         onPeerState: () => {}, // (userId, { muted, deafened }) — from their data channel
         onDecline: () => {},   // (userId) — somebody rung for this call said no
+        onBoard: () => {},     // (userId, MediaStream | null) — their soundboard track
     };
 
     const wanted = { mic: "", camera: "", speaker: "" };
@@ -130,7 +141,8 @@ const CairnCall = (() => {
 
         const pc = new RTCPeerConnection(rtcConfig());
         const entry = {
-            pc, pending: [], stream: new MediaStream(), audioSender: null, videoSender: null, channel: null,
+            pc, pending: [], stream: new MediaStream(), board: new MediaStream(),
+            audioSender: null, videoSender: null, boardSender: null, channel: null,
         };
         peers.set(user, entry);
 
@@ -152,6 +164,10 @@ const CairnCall = (() => {
                 ? pc.addTransceiver(video, { direction: "sendrecv" })
                 : pc.addTransceiver("video", { direction: "sendrecv" });
             entry.videoSender = tx.sender;
+            // After the video line, so the soundboard is always the second audio m-line.
+            const btx = pc.addTransceiver("audio", { direction: "sendrecv" });
+            entry.boardSender = btx.sender;
+            if (board) btx.sender.replaceTrack(board.track).catch(() => {});
         }
 
         openStateChannel(user, entry);
@@ -161,6 +177,12 @@ const CairnCall = (() => {
             send({ kind: "ice", to: user, payload: JSON.stringify(ev.candidate) });
         };
         pc.ontrack = (ev) => {
+            if (ev.track.kind === "audio" && ev.transceiver && ev.transceiver.mid != null &&
+                ev.transceiver.mid === boardMid(pc)) {
+                entry.board.addTrack(ev.track);
+                ui.onBoard(user, entry.board);
+                return;
+            }
             entry.stream.addTrack(ev.track);
             // A track that is muted is a camera that is off, not a camera that is missing.
             // Without these the tile shows a frozen last frame forever.
@@ -300,6 +322,7 @@ const CairnCall = (() => {
                 const entry = peerFor(from);
                 await entry.pc.setRemoteDescription(JSON.parse(signal.payload));
                 await adoptVideoLine(entry);
+                await adoptBoardLine(entry);
                 await flush(entry);
                 await entry.pc.setLocalDescription(await entry.pc.createAnswer());
                 await send({
@@ -348,6 +371,34 @@ const CairnCall = (() => {
         if (video) await tx.sender.replaceTrack(video);
     }
 
+    // The soundboard's line, claimed the same way as the video line.
+    async function adoptBoardLine(entry) {
+        if (entry.boardSender) return;
+        const mid = boardMid(entry.pc);
+        const tx = mid == null ? null : entry.pc.getTransceivers().find((t) => t.mid === mid);
+        if (!tx) return;
+        tx.direction = "sendrecv";
+        entry.boardSender = tx.sender;
+        if (board) await tx.sender.replaceTrack(board.track);
+    }
+
+    // The mid of the second audio m-line in the negotiated session, which is the soundboard
+    // by construction (see the top of this file). Null before there is one.
+    function boardMid(pc) {
+        const desc = pc.remoteDescription || pc.localDescription;
+        if (!desc || !desc.sdp) return null;
+        let audio = 0;
+        for (const section of desc.sdp.split(/\r?\nm=/).slice(1)) {
+            if (!section.startsWith("audio")) continue;
+            audio += 1;
+            if (audio === 2) {
+                const m = section.match(/\r?\na=mid:(\S+)/);
+                return m ? m[1] : null;
+            }
+        }
+        return null;
+    }
+
     async function flush(entry) {
         while (entry.pending.length) {
             try { await entry.pc.addIceCandidate(entry.pending.shift()); } catch (_) { /* stale */ }
@@ -360,6 +411,7 @@ const CairnCall = (() => {
         try { entry.pc.close(); } catch (_) {}
         peers.delete(user);
         ui.onPeer(user, null);
+        ui.onBoard(user, null);
     }
 
     // ---- lifecycle ---------------------------------------------------------
@@ -408,7 +460,7 @@ const CairnCall = (() => {
     }
 
     function stopTracks() {
-        closeMixer();
+        closeBoard();
         for (const s of [local, screen]) if (s) s.getTracks().forEach((t) => t.stop());
         local = null;
         screen = null;
@@ -511,12 +563,8 @@ const CairnCall = (() => {
         if (!local) return;
         const fresh = await navigator.mediaDevices.getUserMedia({ audio: micConstraint(), video: false });
         const track = fresh.getAudioTracks()[0];
-        // While the soundboard mixer is running the senders carry its output, not the mic;
-        // the new mic is fed into the mixer instead.
-        if (!remix(track)) {
-            for (const entry of peers.values()) {
-                if (entry.audioSender) await entry.audioSender.replaceTrack(track);
-            }
+        for (const entry of peers.values()) {
+            if (entry.audioSender) await entry.audioSender.replaceTrack(track);
         }
         local.getAudioTracks().forEach((t) => { t.stop(); local.removeTrack(t); });
         local.addTrack(track);
@@ -540,60 +588,47 @@ const CairnCall = (() => {
 
     // ---- soundboard hook ---------------------------------------------------
     //
-    // soundboard.js's only way in. A clip is **mixed into the outgoing microphone track**
-    // rather than announced with a "play X" message: an announcement would cross the instance
-    // (encrypted, but timed), while the mix is just more audio on a peer-to-peer track the
-    // instance never carries. The cost, stated in docs/13-customisation.md: a listener hears
-    // a clip as part of the sender's voice, so cannot turn it down separately.
+    // soundboard.js's only way in. A clip plays on this device's **soundboard line**, not in
+    // the microphone (see the top of this file), so each listener can turn it down apart from
+    // the voice. There is still no "play X" message: the clip is audio on a peer-to-peer track.
     //
-    // The mixer is built on first use and lives until the call ends. From then on every
-    // audio sender carries `mic + clips` from a MediaStreamAudioDestinationNode; muting still
-    // works, because a disabled mic track feeds the mixer silence.
-    let mixer = null;          // { ctx, dest, mic, track }
+    // The source is built on first use and lives until the call ends; from then on every
+    // peer's soundboard sender carries it, silent between clips.
+    let board = null;          // { ctx, dest, track }
 
     function outgoingAudio() {
-        return mixer ? mixer.track : (local && local.getAudioTracks()[0]) || null;
+        return (local && local.getAudioTracks()[0]) || null;
     }
 
-    // Point the mixer's mic input at `track`. False when there is no mixer.
-    function remix(track) {
-        if (!mixer) return false;
-        try { mixer.mic.disconnect(); } catch (_) {}
-        mixer.mic = mixer.ctx.createMediaStreamSource(new MediaStream([track]));
-        mixer.mic.connect(mixer.dest);
-        return true;
-    }
-
-    async function mixIntoMic(buffer, { gain = 1, maxSeconds = 5 } = {}) {
+    async function playClip(buffer, { gain = 1, maxSeconds = 5 } = {}) {
         if (!local || !callId) throw new Error("not in a call");
         const mic = local.getAudioTracks()[0];
         if (!mic || !mic.enabled) throw new Error("unmute to play a sound");
-        if (!mixer) {
+        if (!board) {
             const ctx = new AudioContext();
             const dest = ctx.createMediaStreamDestination();
-            mixer = { ctx, dest, mic: null, track: dest.stream.getAudioTracks()[0] };
-            remix(mic);
+            board = { ctx, dest, track: dest.stream.getAudioTracks()[0] };
             for (const entry of peers.values()) {
-                if (entry.audioSender) await entry.audioSender.replaceTrack(mixer.track);
+                if (entry.boardSender) await entry.boardSender.replaceTrack(board.track);
             }
         }
-        if (mixer.ctx.state === "suspended") await mixer.ctx.resume();
-        const clip = mixer.ctx.createBufferSource();
+        if (board.ctx.state === "suspended") await board.ctx.resume();
+        const clip = board.ctx.createBufferSource();
         clip.buffer = buffer;
-        const level = mixer.ctx.createGain();
+        const level = board.ctx.createGain();
         level.gain.value = Math.max(0, Math.min(1, gain));
-        clip.connect(level).connect(mixer.dest);
+        clip.connect(level).connect(board.dest);
         // Cut at the limit whatever the file claims: the one length check a sender cannot
         // talk around, since it runs here, on the device doing the playing.
         clip.start();
-        clip.stop(mixer.ctx.currentTime + Math.min(buffer.duration, maxSeconds));
+        clip.stop(board.ctx.currentTime + Math.min(buffer.duration, maxSeconds));
         return clip;
     }
 
-    function closeMixer() {
-        if (!mixer) return;
-        try { mixer.ctx.close(); } catch (_) {}
-        mixer = null;
+    function closeBoard() {
+        if (!board) return;
+        try { board.ctx.close(); } catch (_) {}
+        board = null;
     }
 
     return {
@@ -601,7 +636,7 @@ const CairnCall = (() => {
         setMuted, setDeafened, setPushToTalk, setTalking, setPrefs, setCameraOn,
         startScreenShare, stopScreenShare,
         useMicrophone, useCamera, useSpeaker, applySpeaker, canChooseSpeaker,
-        mixIntoMic,
+        playClip,
         get callId() { return callId; },
         get local() { return local; },
         get transmitting() { return !!local && local.getAudioTracks().some((t) => t.enabled); },

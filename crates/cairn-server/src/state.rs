@@ -176,6 +176,19 @@ pub enum ServerError {
     UnknownPermission,
     #[error("a space must admit at least one member")]
     BadCeiling,
+    /// The operator runs no SFU, so there are no voice channels on this instance.
+    #[error("this instance runs no SFU, so it has no voice channels")]
+    VoiceUnavailable,
+    /// The room's voice channel is at [`MAX_VOICE_PARTICIPANTS`].
+    #[error("this voice channel is full at {MAX_VOICE_PARTICIPANTS} people")]
+    VoiceChannelFull,
+    /// No such voice session, or not the caller's. One answer for both, so nobody learns
+    /// whether a session id they guessed or saw belongs to somebody else.
+    #[error("no such voice session")]
+    NoSuchVoiceSession,
+    /// The SFU could not take the connection: an unparseable offer, or the SFU has stopped.
+    #[error("the SFU refused the connection: {0}")]
+    SfuRefused(String),
 }
 
 /// How many unclaimed key packages one device may hold.
@@ -807,6 +820,14 @@ pub struct Instance {
     pub(crate) gif_limiter: Mutex<crate::gif_relay::GifRelayLimiter>,
     /// The operator's TURN relay, if any. Configuration, not state: not persisted.
     turn: Mutex<Option<TurnConfig>>,
+    /// Who is in which room's voice channel. Shared with the SFU's media thread, which asks
+    /// it before forwarding anything and drops a connection whose seat has gone — see
+    /// [`VoiceRegistry`]. Not persisted: a voice channel is live state, and after a restart
+    /// every media connection is gone anyway.
+    voice: SharedVoice,
+    /// The running SFU, if the operator configured one. Holds only the registry, never the
+    /// instance, so there is no cycle to keep either alive.
+    sfu: Mutex<Option<Arc<crate::sfu::Sfu>>>,
     franking_key: ServerFrankingKey,
     storage: Arc<dyn Storage>,
 }
@@ -847,6 +868,8 @@ impl Instance {
             gif_relay: Mutex::new(None),
             gif_limiter: Mutex::default(),
             turn: Mutex::new(None),
+            voice: Arc::new(Mutex::new(VoiceRegistry::default())),
+            sfu: Mutex::new(None),
             registration_limiter: Mutex::default(),
             franking_key,
             storage,
@@ -1164,6 +1187,15 @@ impl Instance {
 
         r.members.retain(|m| m.user != target);
         let updated = r.clone();
+        // Out of the voice channel in the same breath, under the rooms lock, so there is no
+        // moment at which the account is not a member and still holds a seat. The SFU asks
+        // the registry before every forward, so the media stops with the seat.
+        //
+        // **Found by probing.** The first version of voice channels kept the seat: a probe
+        // removed a member and printed the registry, and the removed account was still
+        // seated and still listed — the SFU would have gone on carrying a private room's
+        // audio to someone the room had ejected.
+        self.voice.lock().expect("voice mutex poisoned").evict(room, target);
         drop(rooms);
         self.write(&[Write::Room(room, updated)])
     }
@@ -2179,6 +2211,379 @@ mod turn {
         assert!(
             TurnConfig::new(&["TURNS:t.example:5349", "stun:t.example"], SECRET, Some(600)).is_ok()
         );
+    }
+}
+
+// ---- Voice channels --------------------------------------------------------
+//
+// A voice channel is a call attached to a room that people drop into and out of, rather
+// than one somebody rings. Its media goes through the instance's SFU (`crate::sfu`), so the
+// instance is in the media path for the first time — which is why the rules about who may be
+// in it live here, beside the room's membership, and not in the SFU or the HTTP handler.
+// See `docs/adr/012-sfu-voice-channels.md`.
+
+/// How many devices one room's voice channel holds.
+///
+/// A bandwidth number, not a cryptographic one: the SFU forwards every sender to every
+/// other participant, so its egress grows as N×(N−1) audio streams. Sixteen Opus streams
+/// is a few megabits a second at the instance — well within a modest server — and it is
+/// also the number of receive slots each client offers up front, so a client never has to
+/// renegotiate as people arrive.
+pub const MAX_VOICE_PARTICIPANTS: usize = 16;
+
+/// Which of a participant's two outgoing tracks a stream is: their microphone, or their
+/// soundboard. Separate so each listener can turn one person's clips down without turning
+/// their voice down — and, as the cost of that, so the SFU can see when a clip is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VoiceTrack {
+    Voice,
+    Board,
+}
+
+impl VoiceTrack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoiceTrack::Voice => "voice",
+            VoiceTrack::Board => "board",
+        }
+    }
+}
+
+/// An SFU connection's id. Random, and never a capability on its own: every operation on
+/// one is checked against the account that opened it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VoiceSessionId([u8; 16]);
+
+impl VoiceSessionId {
+    fn random() -> Self {
+        let mut b = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+        Self(b)
+    }
+}
+
+impl std::fmt::Display for VoiceSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl std::str::FromStr for VoiceSessionId {
+    type Err = ServerError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes = hex::decode(s).map_err(|_| ServerError::NoSuchVoiceSession)?;
+        Ok(Self(bytes.try_into().map_err(|_| ServerError::NoSuchVoiceSession)?))
+    }
+}
+
+/// One device in a voice channel, as the instance sees it — which is exactly what the
+/// roster shows every member of the room: who, which device, since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VoiceParticipant {
+    pub user: UserId,
+    pub device: DeviceId,
+    pub joined_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceSeat {
+    room: RoomId,
+    who: VoiceParticipant,
+}
+
+/// Who holds a seat in which voice channel.
+///
+/// **The SFU's only source of truth.** It forwards a packet only while the sending and the
+/// receiving connection both hold seats here, in the same room, and closes a connection
+/// whose seat has gone.
+#[derive(Debug, Default)]
+pub struct VoiceRegistry {
+    seats: HashMap<VoiceSessionId, VoiceSeat>,
+    /// Whether an SFU is running. Without one a seat would be a promise of media nobody
+    /// can deliver, so joining is refused instead.
+    enabled: bool,
+}
+
+/// The registry, shared between the instance and the SFU's media thread.
+pub type SharedVoice = Arc<Mutex<VoiceRegistry>>;
+
+impl VoiceRegistry {
+    /// The room a session is seated in, if it still holds a seat.
+    pub fn room_of(&self, session: VoiceSessionId) -> Option<RoomId> {
+        self.seats.get(&session).map(|s| s.room)
+    }
+
+    /// The seat's occupant, if it still holds one.
+    pub fn occupant(&self, session: VoiceSessionId) -> Option<VoiceParticipant> {
+        self.seats.get(&session).map(|s| s.who.clone())
+    }
+
+    /// Give up a seat because its connection died. The SFU calls this; it is a fact about
+    /// the network, not a decision, so it needs no actor.
+    pub fn vacate(&mut self, session: VoiceSessionId) {
+        self.seats.remove(&session);
+    }
+
+    fn evict(&mut self, room: RoomId, user: UserId) {
+        self.seats.retain(|_, s| !(s.room == room && s.who.user == user));
+    }
+}
+
+impl Instance {
+    /// The registry the SFU consults. Handed out once, when the SFU starts.
+    pub fn voice_registry(&self) -> SharedVoice {
+        Arc::clone(&self.voice)
+    }
+
+    /// Start the SFU and turn voice channels on. Operator action, at startup.
+    pub fn start_sfu(
+        &self,
+        config: crate::sfu::SfuConfig,
+    ) -> std::io::Result<Arc<crate::sfu::Sfu>> {
+        let sfu = crate::sfu::Sfu::start(config, self.voice_registry())?;
+        *self.sfu.lock().expect("sfu mutex poisoned") = Some(Arc::clone(&sfu));
+        self.set_voice_enabled(true);
+        Ok(sfu)
+    }
+
+    /// The running SFU, if any.
+    pub fn sfu(&self) -> Option<Arc<crate::sfu::Sfu>> {
+        self.sfu.lock().expect("sfu mutex poisoned").clone()
+    }
+
+    /// Turn voice channels on or off. Operator action, made when the SFU starts.
+    pub fn set_voice_enabled(&self, enabled: bool) {
+        let mut v = self.voice.lock().expect("voice mutex poisoned");
+        v.enabled = enabled;
+        if !enabled {
+            v.seats.clear();
+        }
+    }
+
+    /// Take a seat in `room`'s voice channel for `actor`'s `device`.
+    ///
+    /// The rules, in order, and the order is the point — the same as
+    /// [`Instance::turn_credentials`]: `actor` is a member of the room (a stranger learns
+    /// nothing, not even whether voice exists here); then whether an SFU runs at all; then
+    /// whether the channel has room. `device` must be `actor`'s — the HTTP layer passes the
+    /// device that signed the request, so this cannot fail for an honest caller, and is
+    /// checked anyway because a rule that depends on its caller being honest is not one.
+    ///
+    /// A device holds at most one seat anywhere: joining again, here or in another room,
+    /// gives up the old one. Otherwise a reconnect after a network change would leave a
+    /// ghost of the same device in the roster.
+    pub fn voice_join(
+        &self,
+        room: RoomId,
+        actor: UserId,
+        device: DeviceId,
+        now_ms: i64,
+    ) -> Result<VoiceSessionId, ServerError> {
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        if !rooms.get(&room).is_some_and(|r| r.has_member(actor)) {
+            return Err(ServerError::NotAMember);
+        }
+        let mut voice = self.voice.lock().expect("voice mutex poisoned");
+        if !voice.enabled {
+            return Err(ServerError::VoiceUnavailable);
+        }
+        let owns_device = self
+            .devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .get(&device)
+            .is_some_and(|d| d.user == actor);
+        if !owns_device {
+            return Err(ServerError::NotYourDevice);
+        }
+        voice.seats.retain(|_, s| s.who.device != device);
+        if voice.seats.values().filter(|s| s.room == room).count() >= MAX_VOICE_PARTICIPANTS {
+            return Err(ServerError::VoiceChannelFull);
+        }
+        let id = VoiceSessionId::random();
+        voice.seats.insert(
+            id,
+            VoiceSeat { room, who: VoiceParticipant { user: actor, device, joined_at_ms: now_ms } },
+        );
+        Ok(id)
+    }
+
+    /// Give up a seat. Only its own account may; anyone else gets the same answer as for a
+    /// session that does not exist.
+    pub fn voice_leave(&self, actor: UserId, session: VoiceSessionId) -> Result<(), ServerError> {
+        let mut voice = self.voice.lock().expect("voice mutex poisoned");
+        match voice.seats.get(&session) {
+            Some(seat) if seat.who.user == actor => {
+                voice.seats.remove(&session);
+                Ok(())
+            }
+            _ => Err(ServerError::NoSuchVoiceSession),
+        }
+    }
+
+    /// The room a seat is in, for its own account — so a client can ask the SFU about its
+    /// own connection and nobody else's.
+    pub fn voice_seat(
+        &self,
+        actor: UserId,
+        session: VoiceSessionId,
+    ) -> Result<RoomId, ServerError> {
+        let voice = self.voice.lock().expect("voice mutex poisoned");
+        match voice.seats.get(&session) {
+            Some(seat) if seat.who.user == actor => Ok(seat.room),
+            _ => Err(ServerError::NoSuchVoiceSession),
+        }
+    }
+
+    /// Who is in `room`'s voice channel, for a member of the room. Oldest first.
+    ///
+    /// Shown to every member — that is the feature, and `docs/12-realtime-media.md` §6 is
+    /// explicit that it is also continuous presence the instance holds by design.
+    pub fn voice_roster(
+        &self,
+        room: RoomId,
+        actor: UserId,
+    ) -> Result<Vec<VoiceParticipant>, ServerError> {
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        if !rooms.get(&room).is_some_and(|r| r.has_member(actor)) {
+            return Err(ServerError::NotAMember);
+        }
+        let voice = self.voice.lock().expect("voice mutex poisoned");
+        if !voice.enabled {
+            return Err(ServerError::VoiceUnavailable);
+        }
+        let mut list: Vec<VoiceParticipant> =
+            voice.seats.values().filter(|s| s.room == room).map(|s| s.who.clone()).collect();
+        list.sort_by_key(|p| p.joined_at_ms);
+        Ok(list)
+    }
+}
+
+#[cfg(test)]
+mod voice {
+    use super::tests::*;
+    use super::*;
+
+    fn private_shape() -> RoomShape {
+        RoomShape { is_direct: false, is_publicly_discoverable: false, member_ceiling: 50 }
+    }
+
+    fn voice_room(inst: &Instance) -> (RoomId, TestSender) {
+        inst.set_voice_enabled(true);
+        let owner = TestSender::registered(inst);
+        let (room, _) = inst.create_room(private_shape(), owner.user).unwrap();
+        (room, owner)
+    }
+
+    #[test]
+    fn a_non_member_cannot_take_a_seat_in_a_voice_channel() {
+        let inst = Instance::in_memory();
+        let (room, _) = voice_room(&inst);
+        let stranger = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.voice_join(room, stranger.user, stranger.device, 0),
+            Err(ServerError::NotAMember)
+        ));
+        assert!(matches!(inst.voice_roster(room, stranger.user), Err(ServerError::NotAMember)));
+    }
+
+    #[test]
+    fn a_stranger_cannot_tell_whether_voice_exists() {
+        // The order of the checks: with no SFU, a stranger gets the membership refusal, not
+        // "no voice here".
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        inst.set_voice_enabled(false);
+        let stranger = TestSender::registered(&inst);
+        assert!(matches!(
+            inst.voice_join(room, stranger.user, stranger.device, 0),
+            Err(ServerError::NotAMember)
+        ));
+        assert!(matches!(
+            inst.voice_join(room, owner.user, owner.device, 0),
+            Err(ServerError::VoiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn a_member_cannot_sit_in_the_voice_channel_as_someone_elses_device() {
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        let other = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, other.user).unwrap();
+        assert!(matches!(
+            inst.voice_join(room, owner.user, other.device, 0),
+            Err(ServerError::NotYourDevice)
+        ));
+    }
+
+    #[test]
+    fn a_member_removed_from_the_room_loses_their_voice_seat() {
+        // Was a probe, and it succeeded: the seat outlived the membership. See the comment
+        // in `remove_room_member`.
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        let member = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, member.user).unwrap();
+        let seat = inst.voice_join(room, member.user, member.device, 1).unwrap();
+        assert_eq!(inst.voice_registry().lock().unwrap().room_of(seat), Some(room));
+
+        inst.remove_room_member(room, owner.user, member.user).unwrap();
+        let seat_room = inst.voice_registry().lock().unwrap().room_of(seat);
+        assert_eq!(seat_room, None, "the removed member still holds a seat");
+        assert!(inst.voice_roster(room, owner.user).unwrap().is_empty());
+    }
+
+    #[test]
+    fn leaving_a_room_gives_up_the_voice_seat_too() {
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        let member = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, member.user).unwrap();
+        let seat = inst.voice_join(room, member.user, member.device, 1).unwrap();
+        inst.remove_room_member(room, member.user, member.user).unwrap();
+        assert_eq!(inst.voice_registry().lock().unwrap().room_of(seat), None);
+    }
+
+    #[test]
+    fn nobody_can_end_or_inspect_another_accounts_voice_session() {
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        let member = TestSender::registered(&inst);
+        inst.add_room_member(room, owner.user, member.user).unwrap();
+        let seat = inst.voice_join(room, member.user, member.device, 1).unwrap();
+        assert!(matches!(inst.voice_leave(owner.user, seat), Err(ServerError::NoSuchVoiceSession)));
+        assert!(matches!(inst.voice_seat(owner.user, seat), Err(ServerError::NoSuchVoiceSession)));
+        assert_eq!(inst.voice_roster(room, owner.user).unwrap().len(), 1);
+        inst.voice_leave(member.user, seat).unwrap();
+        assert!(inst.voice_roster(room, owner.user).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_device_holds_one_voice_seat_at_a_time() {
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        let (other_room, _) = inst.create_room(private_shape(), owner.user).unwrap();
+        let first = inst.voice_join(room, owner.user, owner.device, 1).unwrap();
+        let second = inst.voice_join(other_room, owner.user, owner.device, 2).unwrap();
+        let reg = inst.voice_registry();
+        assert_eq!(reg.lock().unwrap().room_of(first), None);
+        assert_eq!(reg.lock().unwrap().room_of(second), Some(other_room));
+    }
+
+    #[test]
+    fn a_voice_channel_is_full_at_its_ceiling() {
+        let inst = Instance::in_memory();
+        let (room, owner) = voice_room(&inst);
+        for _ in 0..MAX_VOICE_PARTICIPANTS {
+            let m = TestSender::registered(&inst);
+            inst.add_room_member(room, owner.user, m.user).unwrap();
+            inst.voice_join(room, m.user, m.device, 0).unwrap();
+        }
+        assert!(matches!(
+            inst.voice_join(room, owner.user, owner.device, 0),
+            Err(ServerError::VoiceChannelFull)
+        ));
     }
 }
 

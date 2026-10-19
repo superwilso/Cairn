@@ -13,7 +13,7 @@
 #   - RUSTFLAGS: -D warnings          (set globally in the workflow, applies to every job)
 #   - cargo test --all-targets        (not the same set as plain `cargo test`)
 #   - cargo run -p cairn-cli          (the vertical slice; a job of its own in CI)
-#   - cargo check under 1.85          (the MSRV floor)
+#   - cargo check under 1.88          (the MSRV floor)
 #   - cargo audit
 #
 # **One thing this can never check: the runner's system packages.** `cairn-desktop` links
@@ -86,6 +86,7 @@ run "vertical slice"       cargo run -p cairn-cli
 # ui/call.js, and every failure there looks like a network fault rather than a bug.
 if command -v node >/dev/null 2>&1; then
     run "desktop mesh tests" node --test clients/desktop/tests/mesh.test.js
+    run "voice frame format matches Rust" node --test clients/desktop/tests/mediaframe.test.js
 
     # And the same code against two real browsers, which is the only thing that catches an
     # SDP-level fault: a transceiver the answering side pre-created and the offer would not
@@ -155,6 +156,17 @@ if command -v node >/dev/null 2>&1; then
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/spaces.browser.test.js
+
+        # Voice channels: the panel against a stand-in, then sealed audio through the real
+        # SFU between real browsers (builds the `sfu_harness` example on first run).
+        run "desktop voice-channel panel in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/voicepanel.browser.test.js
+        run "desktop voice channel through the SFU" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/voicechannel.browser.test.js
     fi
 else
     printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'
@@ -176,15 +188,14 @@ PYCHECK
 
 if [ "$MODE" != "quick" ]; then
     # ---- msrv job ---------------------------------------------------------
-    # The floor is a hard requirement: the crypto tree needs edition2024, stabilised in
-    # exactly 1.85. A dependency bump that quietly raises it is the failure this catches.
-    if rustup toolchain list 2>/dev/null | grep -q '^1\.85'; then
-        # Excludes the desktop app deliberately: Tauri's tree needs rustc 1.88. The floor
-        # exists so the protocol and crypto *libraries* stay consumable at a known minimum;
-        # a desktop binary is not something anyone builds against. Same exclusion in CI.
-        run "msrv 1.85 check" cargo +1.85.0 check --workspace --exclude cairn-desktop
+    # The floor is a hard requirement: 1.88, since the SFU's tree needs `time` >= 0.3.47
+    # (RUSTSEC-2026-0009). A dependency bump that quietly raises it is the failure this catches.
+    if rustup toolchain list 2>/dev/null | grep -q '^1\.88'; then
+        # The desktop app is excluded only to match CI, whose runner lacks webview packages.
+        run "msrv 1.88 check" cargo +1.88.0 check --workspace --exclude cairn-desktop
+        run "msrv 1.88 check (server, no SFU)" cargo +1.88.0 check -p cairn-server --no-default-features
     else
-        printf '\n\033[33mSKIPPED msrv: rustup toolchain install 1.85.0\033[0m\n'
+        printf '\n\033[33mSKIPPED msrv: rustup toolchain install 1.88.0\033[0m\n'
     fi
 
     # ---- audit job --------------------------------------------------------

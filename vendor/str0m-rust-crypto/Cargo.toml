@@ -1,0 +1,29 @@
+# A patched copy of str0m-rust-crypto 0.6.0 (MIT OR Apache-2.0, Martin Algesten,
+# https://github.com/algesten/str0m), substituted for the published crate through
+# `[patch.crates-io]` in the workspace root. See VENDORED.md for why and what changed.
+[package]
+name = "str0m-rust-crypto"
+version = "0.6.0"
+authors = ["Martin Algesten <martin@algesten.se>"]
+description = "Pure Rust crypto backend for str0m WebRTC (Cairn's patched copy: no rcgen)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/algesten/str0m"
+readme = "README.md"
+edition = "2024"
+rust-version = "1.85.0"
+publish = false
+
+[dependencies]
+str0m-proto = { version = "0.7.0", default-features = false, features = ["dtls"] }
+# Upstream also enables "rcgen", which brings in aws-lc-rs (C) and makes dimpl prefer it over
+# RustCrypto. Certificate generation is done in dtls.rs instead.
+dimpl = { version = "0.7.1", default-features = false, features = ["rust-crypto"] }
+hmac = "0.12.1"
+aes-gcm = "0.10"
+aes = "0.8"
+ctr = "0.9"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+sha1 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
+x509-cert = { version = "0.2.5", default-features = false, features = ["builder"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

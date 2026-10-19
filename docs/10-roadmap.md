@@ -162,10 +162,9 @@ the reference. Four things a session should not have to rediscover:
   sequence commits under join/leave races, and media needs SFrame (RFC 9605) plus an SFU.
 - **It lands after the native clients**, not before. A terminal cannot capture a microphone.
   Sequencing: ADR-007 → attachments → native clients → this.
-- **No downgrade, unlike DAVE.** Discord falls back to a plaintext passthrough mode for
-  clients that cannot do E2EE media. Non-negotiable #1 forbids that here, so an E2EE-tier
-  call **refuses** such a client rather than degrading. The cost — "your friend must update"
-  instead of a warning banner — is accepted.
+- **~~No downgrade, unlike DAVE.~~ Superseded (owner, 2026-08):** a call may fall back to
+  transport-only for a client that cannot do E2EE media, carrying its own badge and announced
+  to everyone in it (`12-realtime-media.md` §5). The room's tier never changes.
 - **Calls are unreportable.** Transcript franking has no live-media equivalent, which is now
   stated in `04-safety-architecture.md` rather than discovered later.
 
@@ -237,7 +236,8 @@ Four calls made by the owner, so a session does not re-litigate them:
 - [x] **Self-hosting guide**, honest about what is not ready — `docs/11-self-hosting.md`,
       with a "What is not ready" section split into what bites a small deployment and what
       is structural.
-- [x] **Docker image and compose file.** Multi-stage build pinned to the MSRV floor,
+- [x] **Docker image and compose file.** Multi-stage build on a pinned toolchain (the MSRV
+      floor until the SFU needed 1.88),
       unprivileged user, `--locked`. The image could not be built in the authoring
       environment (no Docker daemon), but the Dockerfile's exact file set was verified to
       build with `--locked` from a clean copy.
@@ -404,13 +404,14 @@ Four calls made by the owner, so a session does not re-litigate them:
       sender from `cairn-crypto`), and sending changes into rooms that are not open.
 - [x] **Custom emoji, stickers and a soundboard the instance cannot read** — a room's set
       travels as one encrypted record, every member downloads all of it when it changes, and
-      drawing one makes no request (`13-customisation.md` §3a). Clips are mixed into the
-      caller's microphone, so playing one sends nothing.
+      drawing one makes no request (`13-customisation.md` §3a). Clips go out on their own
+      track, so each listener can turn one person's soundboard down or off, or everyone's —
+      at the cost that whoever carries the media (the SFU in a voice channel) sees when a clip
+      plays. Playing one sends no message.
 
       **Probed:** a plain member whose client believed it was the owner sent a set, and every
       other member ignored it. **Not done:** roles are the instance's word, so a malicious
-      instance can grant a member the right to change a set; listeners cannot turn down a
-      mixed clip apart from the voice it rides in; a user's personal emoji in DMs.
+      instance can grant a member the right to change a set; a user's personal emoji in DMs.
 - [x] **Spaces, channels and roles** ([ADR-011](adr/011-spaces-channels-roles.md)). A space
       holds channels, each an ordinary room with its own sealed, immutable tier; roles carry
       six permission bits under a strict rank rule, with per-channel read/send overrides.
@@ -427,6 +428,24 @@ Four calls made by the owner, so a session does not re-litigate them:
       **Stated rather than hidden:** roles are instance-held metadata the operator can see
       and fabricate; a kick stops the instance serving a member but does not take back an
       encrypted channel's keys until a member commits the removal (`remove_departed`).
+- [x] **Drop-in voice channels through an SFU**, per [ADR-012](adr/012-sfu-voice-channels.md):
+      an in-process SFU on `str0m` (pure-Rust crypto via a patched backend; its tree needs
+      rustc 1.88, so the workspace floor rose to 1.88), audio frames sealed end to
+      end in the webview under per-sender keys from the room's MLS group, the participant list
+      in the sidebar, and §5's fallback as an announcement the instance cannot forge. Calls you
+      ring stay on the mesh.
+
+      **Probed:** a non-member joining (refused), media crossing between rooms (none), the SFU
+      holding plaintext in an E2EE room (every frame sealed, checked on what the SFU actually
+      held), the clear audio-level header (not negotiated) — and **a removed member staying
+      connected, which succeeded**: the seat outlived the membership and the SFU kept
+      forwarding. Fixed; both halves are regression tests. Building it also found Chromium's
+      padding-only packets reaching the SFU as empty "frames", and a name clash with the
+      voice-note module that would have broken the page.
+
+      **Not done:** the per-call MLS group (so the channel's roster is the instance's word),
+      SFrame proper, video and screen share through the SFU, TURN in front of it, staying in a
+      voice channel while viewing another room, boosting a voice past 100% in voice channels.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.

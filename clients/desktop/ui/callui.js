@@ -499,6 +499,9 @@ const CairnCallUi = (() => {
         $("volume-range").value = p.volume;
         $("volume-out").textContent = p.volume + "%";
         $("volume-mute").checked = p.muted;
+        $("board-range").value = p.board;
+        $("board-out").textContent = p.board + "%";
+        $("board-mute").checked = p.boardMuted;
         pop.hidden = false;
         const r = anchor.getBoundingClientRect();
         const w = pop.offsetWidth || 240;
@@ -527,17 +530,31 @@ const CairnCallUi = (() => {
             CairnCallAudio.setLocalMute(popFor, $("volume-mute").checked);
             badge(popFor, peerStates.get(popFor) || {});
         });
+        // Their soundboard, apart from their voice: clips arrive on a track of their own.
+        $("board-range").addEventListener("input", () => {
+            if (!popFor) return;
+            CairnCallAudio.setBoardVolume(popFor, $("board-range").value);
+            $("board-out").textContent = $("board-range").value + "%";
+        });
+        $("board-mute").addEventListener("change", () => {
+            if (popFor) CairnCallAudio.setBoardMuted(popFor, $("board-mute").checked);
+        });
         $("volume-reset").addEventListener("click", () => {
             if (!popFor) return;
             CairnCallAudio.setVolume(popFor, 100);
             CairnCallAudio.setLocalMute(popFor, false);
+            CairnCallAudio.setBoardVolume(popFor, 100);
+            CairnCallAudio.setBoardMuted(popFor, false);
             range.value = 100;
             $("volume-out").textContent = "100%";
             $("volume-mute").checked = false;
+            $("board-range").value = 100;
+            $("board-out").textContent = "100%";
+            $("board-mute").checked = false;
             badge(popFor, peerStates.get(popFor) || {});
         });
         document.addEventListener("click", (ev) => {
-            if (popFor && !ev.target.closest("#volume-pop, .tile-menu")) closeVolume();
+            if (popFor && !ev.target.closest("#volume-pop, .tile-menu, .vc-menu")) closeVolume();
         });
         document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeVolume(); });
     }
@@ -549,7 +566,16 @@ const CairnCallUi = (() => {
         CairnCall.bind({
             onPeerState: (user, state) => peerState(user, state),
             onDecline: (from) => declined(from),
+            onBoard: (user, stream) => {
+                if (stream) CairnCallAudio.attachBoard(user, stream);
+                else CairnCallAudio.detachBoard(user);
+            },
         });
+        const allBoards = $("pref-sb-mute-all");
+        if (allBoards) {
+            allBoards.checked = CairnCallAudio.allBoardsMuted;
+            allBoards.addEventListener("change", () => CairnCallAudio.setAllBoardsMuted(allBoards.checked));
+        }
         CairnCallAudio.bind({ onSpeaking: (user, on) => speaking(user, on) });
         CairnCall.setPrefs(prefs);
         $("accept-voice").addEventListener("click", () => accept(false));
@@ -570,6 +596,8 @@ const CairnCallUi = (() => {
 
     return {
         init, ring, stopRinging, started, ended, peerConnection, tile, untile, syncPrefs,
+        // The voice channel's participant list opens the same per-person popover.
+        openVolume,
         get prefs() { return { ...prefs }; },
         get ringingFor() { return ringing ? ringing.from : null; },
     };

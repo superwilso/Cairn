@@ -42,7 +42,12 @@ const CairnCallAudio = (() => {
             const out = {};
             for (const [user, v] of Object.entries(raw || {})) {
                 if (!/^usr_[0-9a-zA-Z-]{1,64}$/.test(user) || !v || typeof v !== "object") continue;
-                out[user] = { volume: clampVolume(v.volume), muted: v.muted === true };
+                out[user] = {
+                    volume: clampVolume(v.volume),
+                    muted: v.muted === true,
+                    board: clampBoard(v.board),
+                    boardMuted: v.boardMuted === true,
+                };
             }
             return out;
         } catch (_) { return {}; }
@@ -54,7 +59,13 @@ const CairnCallAudio = (() => {
         const n = Number(v);
         return Number.isFinite(n) ? Math.min(200, Math.max(0, Math.round(n))) : 100;
     }
-    const prefsFor = (user) => saved[user] || { volume: 100, muted: false };
+    // A soundboard's level stops at 100%: it is there to turn clips down, not up.
+    function clampBoard(v) {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 100;
+    }
+    const prefsFor = (user) =>
+        ({ volume: 100, muted: false, board: 100, boardMuted: false, ...(saved[user] || {}) });
 
     function setVolume(user, pct) {
         saved[user] = { ...prefsFor(user), volume: clampVolume(pct) };
@@ -67,6 +78,116 @@ const CairnCallAudio = (() => {
         apply(user);
     }
 
+    // ---- soundboards, per listener ---------------------------------------------
+    //
+    // A participant's clips arrive on their own track (call.js, voicechannel.js), so each
+    // listener can turn one person's soundboard down, or off, or everyone's, without touching
+    // anyone's voice. Like the voice settings above, nothing here leaves this device. The cost
+    // of the separate track is stated in docs/13-customisation.md: whoever carries the media
+    // can see when a clip is playing.
+    const ALL_BOARDS_KEY = "cairn.soundboards.muted";
+    let allBoardsMuted = (() => {
+        try { return localStorage.getItem(ALL_BOARDS_KEY) === "1"; } catch (_) { return false; }
+    })();
+    const boards = new Map();   // user -> { stream, el, source, gain, out }
+    const boardListeners = [];
+
+    function boardsChanged(user) {
+        if (user) applyBoard(user); else for (const u of boards.keys()) applyBoard(u);
+        for (const fn of boardListeners) { try { fn(user || null); } catch (_) {} }
+    }
+    function setBoardVolume(user, pct) {
+        saved[user] = { ...prefsFor(user), board: clampBoard(pct) };
+        save();
+        boardsChanged(user);
+    }
+    function setBoardMuted(user, muted) {
+        saved[user] = { ...prefsFor(user), boardMuted: !!muted };
+        save();
+        boardsChanged(user);
+    }
+    function setAllBoardsMuted(on) {
+        allBoardsMuted = !!on;
+        try { localStorage.setItem(ALL_BOARDS_KEY, allBoardsMuted ? "1" : "0"); } catch (_) {}
+        boardsChanged(null);
+    }
+
+    // What this device plays, 0..1, for one person's voice and for their soundboard. Used
+    // here for the mesh, and by voicechannel.js for the SFU's receive slots.
+    function voiceLevel(user) {
+        const p = prefsFor(user);
+        return deafened || p.muted ? 0 : p.volume / 100;
+    }
+    function boardLevel(user) {
+        const p = prefsFor(user);
+        return deafened || allBoardsMuted || p.boardMuted ? 0 : p.board / 100;
+    }
+
+    // A participant's soundboard track. Played through the graph when it runs — source →
+    // gain → its own <audio> — so a mute is a gain of zero on exactly this track; otherwise
+    // through a plain element whose volume is set instead. The element is kept either way:
+    // Chromium only feeds a remote WebRTC track to WebAudio while an element consumes it.
+    function attachBoard(user, stream) {
+        let b = boards.get(user);
+        if (b && b.stream === stream) { applyBoard(user); return; }
+        if (b) detachBoard(user);
+        b = { stream, el: new Audio(), source: null, gain: null, out: null, dest: null };
+        b.el.autoplay = true;
+        b.el.srcObject = stream;
+        b.el.dataset.callBoard = user;
+        if (typeof CairnCall !== "undefined") CairnCall.applySpeaker(b.el);
+        b.el.play().catch(() => {});
+        boards.set(user, b);
+        const c = context();
+        if (c && stream.getAudioTracks().length) {
+            try {
+                b.source = c.createMediaStreamSource(stream);
+                b.gain = c.createGain();
+                b.dest = c.createMediaStreamDestination();
+                b.source.connect(b.gain);
+                b.gain.connect(b.dest);
+                b.out = new Audio();
+                b.out.autoplay = true;
+                b.out.srcObject = b.dest.stream;
+                if (typeof CairnCall !== "undefined") CairnCall.applySpeaker(b.out);
+                b.out.play().catch(() => {});
+            } catch (_) {
+                b.source = b.gain = b.out = b.dest = null;
+            }
+        }
+        applyBoard(user);
+    }
+
+    function detachBoard(user) {
+        const b = boards.get(user);
+        if (!b) return;
+        for (const n of [b.source, b.gain]) { try { n && n.disconnect(); } catch (_) {} }
+        for (const el of [b.el, b.out]) if (el) { el.srcObject = null; el.remove(); }
+        boards.delete(user);
+    }
+
+    function applyBoard(user) {
+        const b = boards.get(user);
+        if (!b) return;
+        const level = boardLevel(user);
+        if (running() && b.gain && b.out) {
+            b.gain.gain.value = level;
+            b.out.muted = false;
+            b.el.muted = true;
+        } else {
+            if (b.out) b.out.muted = true;
+            b.el.muted = level === 0;
+            b.el.volume = Math.min(1, level);
+        }
+    }
+
+    // What this device is playing for one person's soundboard, when it plays through the
+    // graph: the browser test measures it, so "muted" means silence and not a flag.
+    function boardOutput(user) {
+        const b = boards.get(user);
+        return b && running() && b.dest ? b.dest.stream : null;
+    }
+
     // ---- the graph -------------------------------------------------------------
 
     function context() {
@@ -76,7 +197,10 @@ const CairnCallAudio = (() => {
         try { ctx = new AC(); } catch (_) { return null; }
         // Nothing is connected to ctx.destination except the ring: voices leave through
         // their own <audio> elements, so each can be sent to the chosen output device.
-        ctx.onstatechange = () => { for (const user of voices.keys()) apply(user); };
+        ctx.onstatechange = () => {
+            for (const user of voices.keys()) apply(user);
+            for (const user of boards.keys()) applyBoard(user);
+        };
         return ctx;
     }
 
@@ -157,6 +281,7 @@ const CairnCallAudio = (() => {
     function setDeafened(on) {
         deafened = !!on;
         for (const user of voices.keys()) apply(user);
+        boardsChanged(null);
     }
 
     function applySpeakerAll() {
@@ -227,6 +352,7 @@ const CairnCallAudio = (() => {
 
     function reset() {
         for (const user of [...voices.keys()]) detach(user);
+        for (const user of [...boards.keys()]) detachBoard(user);
         detachLocal();
         speaking.clear();
         deafened = false;
@@ -279,6 +405,11 @@ const CairnCallAudio = (() => {
     return {
         attach, detach, attachLocal, setDeafened, setVolume, setLocalMute,
         prefsFor, applySpeakerAll, startRing, stopRing, resume, reset,
+        attachBoard, detachBoard, setBoardVolume, setBoardMuted, setAllBoardsMuted,
+        voiceLevel, boardLevel, boardOutput,
+        onBoardChange(fn) { boardListeners.push(fn); },
+        get allBoardsMuted() { return allBoardsMuted; },
+        get deafened() { return deafened; },
         bind(h) { if (h.onSpeaking) onSpeaking = h.onSpeaking; },
         get ringing() { return !!ring; },
         get running() { return running(); },

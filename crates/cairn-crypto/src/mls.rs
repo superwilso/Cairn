@@ -522,6 +522,23 @@ impl GroupHandle {
             .collect()
     }
 
+    /// The voice media key `sender_credential` seals its frames under in this epoch, for a
+    /// voice channel in `room`. See [`crate::media`] for what this key does and does not
+    /// protect against.
+    ///
+    /// Derivable by every member for every member — that is how a receiver opens a frame —
+    /// and by nobody outside the group, which is the whole point of putting it in front of
+    /// an SFU. Changes with every epoch, so a removal commit rotates it.
+    pub fn media_key(
+        &self,
+        room: &[u8],
+        sender_credential: &[u8],
+    ) -> Result<crate::media::MediaKey, MlsError> {
+        let context = crate::media::key_context(room, sender_credential);
+        let secret = self.group.export_secret(crate::media::MEDIA_KEY_LABEL, &context, 16)?;
+        crate::media::MediaKey::from_exported(secret.as_bytes())
+    }
+
     /// Number of members currently in the group.
     pub fn member_count(&self) -> usize {
         self.group.roster().members_iter().count()
@@ -1109,5 +1126,49 @@ mod tests {
             alice.fingerprint(),
             "the roster's view of this device must agree with its own"
         );
+    }
+
+    /// The four premises `docs/12-realtime-media.md` §2 probed before anything was built,
+    /// re-run against the production export now that a voice channel depends on them.
+    #[test]
+    fn voice_media_keys_agree_across_members_and_rotate_when_someone_is_removed() {
+        let alice = Session::new(b"alice").unwrap();
+        let bob = Session::new(b"bob").unwrap();
+        let mallory = Session::new(b"mallory").unwrap();
+        let room = b"room-1";
+
+        let mut ag = alice.create_group().unwrap();
+        let out = ag.add_member(bob.key_package().unwrap()).unwrap();
+        let mut bg = bob.join(&out.welcome.unwrap()).unwrap();
+
+        let k = |g: &GroupHandle, who: &[u8]| g.media_key(room, who).unwrap().as_bytes().to_vec();
+
+        // Every member derives the same key for a sender; distinct senders differ; so does
+        // the same sender in another room.
+        assert_eq!(k(&ag, b"alice"), k(&bg, b"alice"));
+        assert_ne!(k(&ag, b"alice"), k(&ag, b"bob"));
+        assert_ne!(
+            k(&ag, b"alice"),
+            ag.media_key(b"room-2", b"alice").unwrap().as_bytes().to_vec()
+        );
+
+        // Mallory joins: the epoch changes, and with it every key.
+        let before = k(&ag, b"alice");
+        let out = ag.add_member(mallory.key_package().unwrap()).unwrap();
+        let mg = mallory.join(&out.welcome.unwrap()).unwrap();
+        bg.process(out.commit).unwrap();
+        let with_mallory = k(&ag, b"alice");
+        assert_ne!(before, with_mallory, "an epoch change must rotate the key");
+        assert_eq!(k(&mg, b"alice"), with_mallory, "a new member derives the current key");
+
+        // Mallory is removed. Alice and Bob move on; Mallory is left holding epoch 2's key,
+        // which is the limitation the ADR states: removal stops *future* frames, not past.
+        let mallory_leaf =
+            ag.members().into_iter().find(|m| m.identity == b"mallory").unwrap().index;
+        let out = ag.remove_member(mallory_leaf).unwrap();
+        bg.process(out.commit).unwrap();
+        assert_eq!(k(&ag, b"alice"), k(&bg, b"alice"));
+        assert_ne!(k(&ag, b"alice"), with_mallory);
+        assert_eq!(k(&mg, b"alice"), with_mallory, "the removed member cannot follow");
     }
 }
