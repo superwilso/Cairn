@@ -18,5 +18,12 @@ pub mod address;
 pub mod backup;
 pub mod gif_relay;
 pub mod http;
+// The SFU needs rustc 1.88 (see sfu_disabled.rs). Without the feature the same interface
+// refuses to start, so nothing else in the crate is conditional.
+#[cfg(feature = "sfu")]
+pub mod sfu;
+#[cfg(not(feature = "sfu"))]
+#[path = "sfu_disabled.rs"]
+pub mod sfu;
 pub mod state;
 pub mod storage;

@@ -1,7 +1,8 @@
 # Voice, video, and screen sharing
 
-**Status:** Design, with a **smaller rung of it now shipped** — see §0. Everything from §2
-onward is still design: no SFU, no SFrame, no per-call MLS group.
+**Status:** Design, with **two rungs of it now shipped** — the mesh (§0) and drop-in voice
+channels through an SFU (§0a, [ADR-012](adr/012-sfu-voice-channels.md)). Still design: the
+per-call MLS group (§1–§3), SFrame proper, video through the SFU.
 
 Discord's voice channels are, along with its bot ecosystem, the reason communities stay on
 Discord. `08-feature-parity.md` §2 lists drop-in voice channels and screen share as v2
@@ -24,13 +25,13 @@ below; it is the rung underneath, and the distinction matters because a reader w
 document as a description of the product would credit the client with protections it does not
 have.
 
-| | Built (mesh) | Designed (§2–§4) |
-|---|---|---|
-| Topology | **Mesh**, capped at 6 | SFU |
-| Media encryption | **DTLS-SRTP**, hop-free — peer to peer | SFrame over an MLS-derived key |
-| Call keying | **None of its own** | A per-call MLS group, rotated on removal |
-| Signalling | **Inside the encrypted message body** | The same |
-| Media path | **Never touches the instance** | Through the SFU, which cannot read it |
+| | Built (mesh, a call you ring) | Built (voice channel, §0a) | Designed (§2–§4) |
+|---|---|---|---|
+| Topology | **Mesh**, capped at 6 | **SFU** in `cairn-server`, 16 per channel, audio only | SFU |
+| Media encryption | **DTLS-SRTP**, hop-free — peer to peer | DTLS-SRTP to the SFU **plus** frames sealed end to end (`cairn_crypto::media`) | SFrame over an MLS-derived key |
+| Call keying | **None of its own** | Per-sender keys from the **room's** MLS group exporter, rotated per epoch | A per-call MLS group, rotated on removal |
+| Signalling | **Inside the encrypted message body** | SDP offer to the instance over signed HTTP (it is the far end) | The same as the mesh |
+| Media path | **Never touches the instance** | Through the SFU, which forwards ciphertext | Through the SFU, which cannot read it |
 
 What the two share is the property that mattered most: the instance sees ciphertext. In the
 mesh it never sees the media at all, and the SDP handshake rides inside the encrypted body
@@ -46,7 +47,8 @@ What the mesh does not have:
 - **No SFrame and no call MLS group.** Media is protected by DTLS-SRTP between the two peers,
   which is end-to-end *because there is no middle*, not because of anything Cairn built.
   Adding an SFU is exactly what makes §4 necessary.
-- **No downgrade badge** (§5). Nothing can downgrade yet, because there is only one mode.
+- **No downgrade badge** (§5) in the mesh. Nothing there can downgrade, because there is
+  only one mode. Voice channels have one; see §0a.
 - **A TURN relay only if the operator runs one.** An instance configured with
   `CAIRN_TURN_URLS` and `CAIRN_TURN_SECRET` (`11-self-hosting.md` §2) hands short-lived
   coturn REST-auth credentials to authenticated members of the room a call is in; anyone
@@ -96,6 +98,67 @@ through the instance, the speaking ring, push-to-talk, and relay-only offering n
 the device's own. The third found a bug nothing else could: a transceiver the answering side
 pre-created that a remote offer will not reuse, which left every call reporting "connected"
 while carrying video in one direction only.
+
+---
+
+## 0a. Voice channels, as built
+
+A voice channel is a call attached to a room that people drop into and out of; nobody is
+rung. It is shown in the sidebar under the room list, with who is in it, and it goes
+through an SFU the instance runs (`CAIRN_SFU_BIND`, `11-self-hosting.md` §2a). The decision
+and its alternatives are [ADR-012](adr/012-sfu-voice-channels.md); this is the state of it.
+
+**The switchover rule.** A call somebody rings is a mesh call; a voice channel is an SFU
+call. Nothing moves a live call between them. An instance with no SFU shows no voice channel.
+
+**What protects the audio.** In an E2EE room each device seals every Opus frame in its
+webview — an `RTCRtpScriptTransform` worker, or Chromium's `createEncodedStreams` — with
+AES-128-GCM under a per-sender key `cairn-client-core` exports from the room's MLS group for
+the current epoch. The webview receives those keys from the `voice_keys` command as raw bytes
+once per epoch and imports them non-extractable; it never derives one, picks an epoch, or
+decides whether to encrypt. A receiver picks the key by the frame's trailer, so attribution is
+by key, not by the SFU's slot mapping. In an end-to-end call a frame that does not open is
+dropped — including plaintext the SFU might inject.
+
+**What the SFU sees**: who is connected, from which address, when; per-sender packet sizes
+and timing, which show who is speaking; the SDP offer; each frame's epoch and leaf. Not the
+`ssrc-audio-level` header — the SFU's answer leaves it out, so browsers do not send a loudness
+value in the clear.
+
+**The §5 fallback, as built.** A device whose webview cannot transform frames announces
+`transport_only` inside the room's encryption when it joins; every capable device announces
+`e2ee`. `Session::voice_state` makes the call transport-only exactly while a connected
+participant has *announced* transport-only, so **the instance cannot force a downgrade** —
+it cannot forge the announcement, and suppressing one only means the fallback device's
+plaintext is dropped. The call carries its own badge (*End-to-end* / *Transport only*) beside
+the room's unchanged tier badge; everyone in the call gets a notice in the panel and the
+timeline naming who caused it, and another when it returns to end to end. Anyone may set
+*Settings → Voice & video → Leave a voice channel that stops being end-to-end encrypted*.
+
+**Who may be in it** is `state.rs`'s rule: room members only, one seat per device, 16 per
+channel. The SFU asks the registry before every forward and closes any connection whose seat
+has gone, and removal from the room evicts the seat. **Found by probing:** as first written,
+removing a member left their seat — and the SFU's forwarding — in place.
+
+**Not done.** The per-call MLS group (§1–§3), so the roster of who is *in the channel* is the
+instance's word — the client marks any listed device the room's group does not contain, but
+cannot prove who is listening; removal is immediate at the SFU and only eventual in the
+cryptography (until the removal commit, old-epoch keys still open frames). SFrame (RFC 9605)
+itself — the format is SFrame-shaped, not SFrame. Video and screen share through the SFU. A
+TURN relay in front of the SFU's UDP port. A voice channel in a room you do not have open:
+switching rooms leaves it, because the client polls the open room only. Per-person volume
+and the speaking ring in voice channels (the mesh has both).
+
+**Tests.** `cairn-crypto` pins the frame format with a vector Node's WebCrypto produced, and
+re-runs §2's exporter premises as `voice_media_keys_agree_across_members_and_rotate_when_someone_is_removed`.
+`state.rs` and `crates/cairn-server/tests/voice_sfu.rs` attack the rules over real HTTP and
+real WebRTC (str0m clients): a non-member joining, media crossing between rooms, a removed
+member still connected, the clear audio-level header. `clients/desktop/tests/mediaframe.test.js`
+checks the JavaScript against the Rust vector, `voicepanel.browser.test.js` the panel and
+badges, and `voicechannel.browser.test.js` real Chromium pages through the real SFU with real
+sessions: audio arrives, every frame the SFU held is sealed and opens in Rust, the fallback is
+announced to everyone and leaves the SFU holding plaintext (the counterfactual), and a removed
+member is dropped.
 
 ---
 
@@ -347,8 +410,9 @@ conservative.
 
 ## 11. Which SFU
 
-Open, and it should stay open until §9's prerequisites are met — the landscape moves and a
-decision made now would be stale. The shape of the choice, though:
+**Decided for voice channels: an in-process SFU on `str0m`**, pure-Rust crypto backend — see
+[ADR-012](adr/012-sfu-voice-channels.md) for why, and for what it does not cover (video). The
+shape of the choice as it was framed before, kept because the tension has not gone away:
 
 Building an SFU is out of scope; it is a specialist component and the mature ones represent
 years of work on congestion control alone. The mature open-source options are **LiveKit**
@@ -374,8 +438,9 @@ more infrastructure.
    badge-disagreement worry below is resolved by the asymmetry — the difference is always in
    the safer direction and the user chose it. See `02-encryption-tiers.md` §6.4.
 
-   §5's rule is unaffected and still binding: a call that *is* E2EE never degrades to
-   plaintext mid-session for a client that cannot keep up. It refuses.
+   §5's rule governs what happens when a participant cannot do E2EE media: the call may
+   fall back to transport-only, with its own badge, announced to everyone. (This paragraph
+   used to say such a call refuses; that predates §5's owner decision, and contradicted it.)
 
    Original framing, kept so it is not re-litigated: This document assumes
    inherit — §5 depends on it, and it is what keeps the badge honest. It resolves the open

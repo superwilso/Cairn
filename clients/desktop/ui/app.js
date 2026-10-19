@@ -190,6 +190,7 @@ async function selectRoom(room) {
     // Per room: whether a relay exists is the instance's answer, and whether this is a DM
     // decides what a declined call does.
     await describeRelay();
+    await CairnVoicePanel.roomChanged();
     startPolling();
 }
 
@@ -558,6 +559,12 @@ CairnCallUi.init({
 async function startCall(video) {
     if (inCall || !openRoom) return;
     fail($("error"), null);
+    // One microphone, one call. A ringing call is a mesh call and a voice channel is an SFU
+    // call (docs/adr/012-sfu-voice-channels.md, "the switchover rule"); they do not mix.
+    if (CairnVoicePanel.active) {
+        fail($("error"), "Leave the voice channel first.");
+        return;
+    }
     CairnCallUi.stopRinging();
     try {
         const { local, config } = await CairnCall.join({ video, myUser });
@@ -832,6 +839,7 @@ async function tick() {
         if (CairnTimer.handle(ev)) continue;
         if (CairnProfile.handle(ev)) continue;
         if (CairnEmoji.handle(ev)) continue;
+        if (CairnVoicePanel.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
@@ -851,6 +859,7 @@ async function tick() {
             CairnEmoji.reset();
             closeSafety();
             if (inCall) await hangUp();
+            CairnVoicePanel.roomClosed();
             clearInterval(pollTimer);
             openRoom = null;
             await refreshRooms();
@@ -885,6 +894,12 @@ CairnMessages.init({
 CairnProfile.init({
     invoke, openSafety: (user) => openSafety(user), roomOpen: () => !!openRoom,
     onError: (e) => fail($("error"), e),
+});
+CairnVoicePanel.init({
+    notice: (text) => addNotice(text),
+    onError: (e) => fail($("error"), e),
+    inCall: () => inCall,
+    short,
 });
 CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
 

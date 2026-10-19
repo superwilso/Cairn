@@ -59,8 +59,12 @@ pub use custom::{
     UploadedCustom,
 };
 mod profiles;
+mod voice;
 pub use crate::profile::{ImageSlot, ImageView, ProfileView, StatusView};
 pub use profiles::{profile_limits, PendingProfileImage, ProfileEdit, ProfileLimits};
+pub use voice::{
+    VoiceJoined, VoiceKeyView, VoiceKeysView, VoiceParticipantView, VoiceProtection, VoiceStateView,
+};
 
 use crate::profile::{Label, ProfileError, ProfileStore, ProfileStoreError};
 use std::collections::HashMap;
@@ -263,6 +267,14 @@ pub enum Event {
         from: String,
         signal: CallSignal,
     },
+    /// A device in the open room said, under the room's encryption, what its voice-channel
+    /// media is. Only sent when it changed what this device knew. A frontend re-reads
+    /// `voice_state` and, if the protection moved, tells its user — §5's announcement.
+    VoiceMedia {
+        user: String,
+        device: String,
+        e2ee: bool,
+    },
     /// Somebody's profile arrived, or the room's membership changed. Every profile in the
     /// room, not the one that changed: a new name can make two *other* members ambiguous, so
     /// a frontend redraws every label rather than keeping its own copy of that rule.
@@ -344,6 +356,10 @@ pub struct Session {
     /// people to press the button independently and hope their minted ids reconciled —
     /// there was no way to be told a call had started at all.
     ringing: Option<Ringing>,
+    /// This device's seat in a voice channel, if it holds one. See `session::voice`.
+    voice: Option<voice::Seat>,
+    /// What each device in the open room has announced about its voice media.
+    voice_modes: voice::Modes,
     /// Attachments seen in the open room, with the keys that open them. Never handed to a
     /// frontend; see `attachments.rs` for why a frontend can only fetch what is in here.
     attachments: attachments::Known,
@@ -419,6 +435,8 @@ impl Session {
             call: None,
             negotiated: false,
             ringing: None,
+            voice: None,
+            voice_modes: HashMap::new(),
             attachments: attachments::Known::new(),
             timer_recheck_ms: TIMER_RECHECK_MS,
             gifs: None,
@@ -545,6 +563,10 @@ impl Session {
         self.call = None;
         self.negotiated = false;
         self.ringing = None;
+        // A voice channel too: this device only polls the open room, so it would stop
+        // hearing announcements — including a fallback — from the channel it left behind.
+        let _ = self.voice_leave();
+        self.voice_modes.clear();
         let record = self.index.get(&room);
         let seal = match record {
             Some(record) => RoomSeal::new(RoomShape {
@@ -798,6 +820,28 @@ impl Session {
                     if let Some(signal) = received.signal {
                         let me = self.client.user().to_string();
                         let from = message.envelope.sender.to_string();
+                        // A voice channel's media announcement is not part of a rung call.
+                        // Recorded per device, from the envelope `receive` has already
+                        // checked against the roster — never from anything the instance
+                        // says on its own. Own announcements are skipped by device, not by
+                        // account: another of this user's devices is someone else's media.
+                        if signal.kind == SignalKind::VoiceMedia {
+                            let (user, device) =
+                                (message.envelope.sender, message.envelope.sender_device);
+                            if device != self.client.device() {
+                                self.open = Some(open);
+                                let news = self.voice_media_heard(user, device, &signal.payload);
+                                open = self.open.take().expect("just put back");
+                                if news {
+                                    events.push(Event::VoiceMedia {
+                                        user: user.to_string(),
+                                        device: device.to_string(),
+                                        e2ee: signal.payload == crate::call::VOICE_E2EE,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         // Own signals come back through the room; applying one to yourself
                         // would have a peer negotiating with itself.
                         if from != me && signal.is_for(&me) {

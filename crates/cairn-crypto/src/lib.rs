@@ -20,6 +20,7 @@
 
 pub mod attachment;
 pub mod franking;
+pub mod media;
 pub mod mls;
 pub mod store;
 pub mod verification;

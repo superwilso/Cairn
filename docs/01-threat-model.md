@@ -155,7 +155,19 @@ protects against, which is a smaller set than a reader would otherwise assume.
 
 **A call may be transport-only inside an E2EE room.** The refusal-rather-than-downgrade rule
 was dropped (`12-realtime-media.md` §5). A call now carries its own badge and announces a
-fallback to every participant. Room messages are unaffected.
+fallback to every participant. Room messages are unaffected. In a voice channel the fallback
+is triggered only by a participant's announcement inside the room's encryption, so the
+instance cannot cause one ([ADR-012](adr/012-sfu-voice-channels.md) §4).
+
+**Voice channels put the instance in the media path.** They run through an SFU the instance
+operates. In an E2EE room the audio is sealed end to end and the SFU forwards ciphertext, but
+it necessarily sees **who is connected, from which IP address, from when to when, and the
+size and timing of each person's packets — which shows who is speaking and when**, plus the
+SDP offer and each frame's key epoch and sender leaf. The roster of who is in a channel is
+the instance's word; a device not in the room's encrypted group is marked, but nothing proves
+who is listening. A member removed from the room is dropped by the SFU at once, but until the
+removal commit is processed the keys they hold still open frames sealed under them. Calls
+somebody rings are still the peer-to-peer mesh, which the instance never carries.
 
 ## 4. The malicious server operator (A4)
 

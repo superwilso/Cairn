@@ -13,6 +13,7 @@
 <link rel="stylesheet" href="linkcards.css">
 <link rel="stylesheet" href="settings.css">
 <link rel="stylesheet" href="calls.css">
+<link rel="stylesheet" href="voicechannel.css">
 <link rel="stylesheet" href="emoji.css">
 <link rel="stylesheet" href="soundboard.css">
 <!-- In <head> on purpose: applies the saved theme before first paint. -->
@@ -147,6 +148,19 @@
     </div>
     <h2 class="section">Rooms</h2>
     <ul id="rooms"></ul>
+    <!-- The open room's voice channel: a call people drop into, through the instance's SFU.
+         Hidden when the instance runs none. Its badge is the call's, not the room's. -->
+    <section id="voice-channel" class="vc" hidden aria-label="Voice channel">
+      <h2 class="section">Voice <span id="vc-badge" class="badge"></span></h2>
+      <ul id="vc-people"></ul>
+      <p id="vc-note" class="note" role="status"></p>
+      <div class="vc-controls">
+        <button id="vc-join" class="primary">Join voice</button>
+        <button id="vc-mute" hidden aria-pressed="false">Mute</button>
+        <button id="vc-deafen" hidden aria-pressed="false">Deafen</button>
+        <button id="vc-leave" class="danger" hidden>Leave</button>
+      </div>
+    </section>
   </aside>
 
   <main>
@@ -359,6 +373,7 @@
   <fieldset class="sites">
     <legend>Calls</legend>
     <label class="toggle"><input type="checkbox" id="pref-ring"> Ring sound for incoming calls</label>
+    <label class="toggle"><input type="checkbox" id="pref-vc-leave"> Leave a voice channel that stops being end-to-end encrypted</label>
     <label class="toggle"><input type="checkbox" id="pref-relay-only"> Always use the relay (hide my IP address from other participants)</label>
     <p id="relay-only-note" class="note"></p>
     <p id="relay-note" class="note"></p>
@@ -376,6 +391,9 @@
 </div>
 
 <script src="call.js"></script>
+<script src="mediaframe.js"></script>
+<script src="voicechannel.js"></script>
+<script src="voicepanel.js"></script>
 <script src="callaudio.js"></script>
 <script src="callui.js"></script>
 <script src="attachments.js"></script>

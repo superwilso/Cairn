@@ -8,6 +8,9 @@ members = [
     "crates/cairn-cli",
     "clients/desktop/src-tauri",
 ]
+# Patched copies of published crates, substituted by `[patch.crates-io]` below. Not members:
+# they are upstream's code. vendor/*/VENDORED.md says why each exists.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -49,6 +52,11 @@ hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+[patch.crates-io]
+# The SFU's WebRTC crypto backend without rcgen, which kept rustc 1.85 out of reach and
+# brought a C library with it. See vendor/str0m-rust-crypto/VENDORED.md.
+str0m-rust-crypto = { path = "vendor/str0m-rust-crypto" }
 
 [profile.release]
 opt-level = 3

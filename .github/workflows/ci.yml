@@ -88,6 +88,8 @@ jobs:
           EOF
 
       - run: node --test clients/desktop/tests/mesh.test.js
+      # The voice-frame format, JavaScript against the Rust vector in cairn-crypto's media.rs.
+      - run: node --test clients/desktop/tests/mediaframe.test.js
 
       - name: Install Chromium for the browser test
         run: npm install --no-save playwright && npx playwright install --with-deps chromium
@@ -159,6 +161,24 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/soundboard.browser.test.js
+      - name: The voice-channel panel in a browser
+        # The call's own badge, and a fallback that changes it without touching the room's.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/voicepanel.browser.test.js
+
+      # The voice channel against the real SFU: the test builds a harness (`cairn-server`'s
+      # `sfu_harness` example, `test-tap` feature) holding real sessions in a real MLS group,
+      # so this job needs Rust. Only cairn-server and its dependencies are built — not the
+      # desktop crate, so no webview packages are needed here.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Sealed audio through the SFU between real browsers
+        # Audio flows, every frame the SFU held was sealed and opens in Rust, the fallback is
+        # announced to everyone, and a removed member is dropped.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/voicechannel.browser.test.js
 
   lint:
     name: fmt + clippy
@@ -208,4 +228,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --exclude cairn-desktop
+      - run: cargo check --workspace --exclude cairn-desktop --exclude cairn-server
+      # The server without its SFU: str0m's tree needs `time` >= 0.3.47 (RUSTSEC-2026-0009),
+      # which needs rustc 1.88. Everything else in the server is held to the floor.
+      - run: cargo check -p cairn-server --no-default-features

@@ -86,6 +86,7 @@ run "vertical slice"       cargo run -p cairn-cli
 # ui/call.js, and every failure there looks like a network fault rather than a bug.
 if command -v node >/dev/null 2>&1; then
     run "desktop mesh tests" node --test clients/desktop/tests/mesh.test.js
+    run "voice frame format matches Rust" node --test clients/desktop/tests/mediaframe.test.js
 
     # And the same code against two real browsers, which is the only thing that catches an
     # SDP-level fault: a transceiver the answering side pre-created and the offer would not
@@ -149,6 +150,17 @@ if command -v node >/dev/null 2>&1; then
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/soundboard.browser.test.js
+
+        # Voice channels: the panel against a stand-in, then sealed audio through the real
+        # SFU between real browsers (builds the `sfu_harness` example on first run).
+        run "desktop voice-channel panel in a browser" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/voicepanel.browser.test.js
+        run "desktop voice channel through the SFU" \
+            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/voicechannel.browser.test.js
     fi
 else
     printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'
@@ -176,7 +188,10 @@ if [ "$MODE" != "quick" ]; then
         # Excludes the desktop app deliberately: Tauri's tree needs rustc 1.88. The floor
         # exists so the protocol and crypto *libraries* stay consumable at a known minimum;
         # a desktop binary is not something anyone builds against. Same exclusion in CI.
-        run "msrv 1.85 check" cargo +1.85.0 check --workspace --exclude cairn-desktop
+        run "msrv 1.85 check" cargo +1.85.0 check --workspace --exclude cairn-desktop --exclude cairn-server
+        # The server without its SFU: str0m's tree needs `time` >= 0.3.47 (RUSTSEC-2026-0009),
+        # which needs rustc 1.88. Everything else in the server is held to the floor.
+        run "msrv 1.85 check (server, no SFU)" cargo +1.85.0 check -p cairn-server --no-default-features
     else
         printf '\n\033[33mSKIPPED msrv: rustup toolchain install 1.85.0\033[0m\n'
     fi

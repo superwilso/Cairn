@@ -38,6 +38,27 @@ zeroize.workspace = true
 hmac.workspace = true
 sha1 = "0.10"
 base64 = "0.22"
+# The voice-channel SFU (`sfu.rs`, docs/adr/012-sfu-voice-channels.md). Sans-IO WebRTC:
+# ICE, DTLS, SRTP and RTCP are the library's; the forwarding decisions are ours. Pure-Rust
+# crypto backend, through the patched copy in vendor/str0m-rust-crypto: the published one also
+# compiles in aws-lc-rs, and dimpl then prefers it (see VENDORED.md). MIT/Apache-2.0.
+#
+# **Needs rustc 1.88**, above the workspace floor: str0m, str0m-proto and dimpl all depend on
+# `time`, which needs 1.88 from 0.3.47, the release that fixed RUSTSEC-2026-0009. Hence the
+# `sfu` feature: on by default, off in the MSRV check, which still covers the rest of the crate.
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"], optional = true }
+
+[features]
+default = ["sfu"]
+# Voice channels' media server. Without it the instance runs no SFU and offers no voice channels.
+sfu = ["dep:str0m"]
+# Lets a test harness read the frames the SFU forwarded, to prove they are sealed. Never on
+# in a build anyone runs: production has no way to record media.
+test-tap = ["sfu"]
+
+[[example]]
+name = "sfu_harness"
+required-features = ["test-tap"]
 
 [dev-dependencies]
 cairn-client-core.workspace = true

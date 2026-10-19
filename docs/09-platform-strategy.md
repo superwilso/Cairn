@@ -73,6 +73,11 @@ builds and passes its tests on all three desktop platforms today, before any UI 
 the crypto dependency tree pulls in crates requiring `edition2024`, which stabilized in
 exactly that release. CI enforces it.
 
+Two things sit above it, and CI says so rather than hiding them: the desktop app (Tauri's
+tree needs 1.88) and the server's voice-channel SFU, its default-on `sfu` feature (str0m's
+tree depends on `time`, which needs 1.88 from the release fixing RUSTSEC-2026-0009). The
+MSRV job checks the libraries, the CLI, and the server without the SFU.
+
 CI (`.github/workflows/ci.yml`) builds and tests on Linux, Windows, and macOS so the
 cross-platform claim is continuously checked rather than assumed.
 

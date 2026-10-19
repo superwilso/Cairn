@@ -159,6 +159,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The voice-channel SFU. Optional: without it there are no voice channels, and calls are
+    // the peer-to-peer mesh only. With it the instance is in the media path for the first
+    // time — docs/adr/012-sfu-voice-channels.md says exactly what that lets it see.
+    if let Ok(bind) = std::env::var("CAIRN_SFU_BIND") {
+        let bind: SocketAddr = bind
+            .trim()
+            .parse()
+            .map_err(|_| "CAIRN_SFU_BIND must be an address such as 0.0.0.0:3480")?;
+        let advertise: SocketAddr = match std::env::var("CAIRN_SFU_ADVERTISE") {
+            Ok(a) if !a.trim().is_empty() => a
+                .trim()
+                .parse()
+                .map_err(|_| "CAIRN_SFU_ADVERTISE must be the public ip:port clients send to")?,
+            _ => bind,
+        };
+        let sfu = instance
+            .start_sfu(cairn_server::sfu::SfuConfig { bind, advertise })
+            .map_err(|e| format!("starting the SFU: {e}"))?;
+        tracing::info!(local = %sfu.local_addr(), %advertise, "voice channels on: SFU listening (UDP)");
+    } else {
+        tracing::info!(
+            "no SFU configured (CAIRN_SFU_BIND): no voice channels; calls are mesh only"
+        );
+    }
+
     // Read before anything is served: a proxy list that half-parsed would quietly trust
     // the wrong hosts, so a typo stops the instance instead.
     let proxies = match std::env::var("CAIRN_TRUSTED_PROXIES") {

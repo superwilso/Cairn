@@ -87,6 +87,8 @@ pub fn router_behind(instance: SharedInstance, proxies: TrustedProxies) -> Route
         .route("/v1/blobs/{blob}", get(download_blob))
         .route("/v1/rooms/{room}/ttl", post(set_room_ttl))
         .route("/v1/rooms/{room}/turn", post(turn_credentials))
+        .route("/v1/rooms/{room}/voice", post(voice_join).get(voice_roster))
+        .route("/v1/rooms/{room}/voice/{session}", delete(voice_leave))
         .route("/v1/rooms/{room}/invites", post(create_room_invite))
         .route("/v1/invites/redeem", post(redeem_room_invite))
         .route("/v1/usernames", post(claim_username))
@@ -172,6 +174,13 @@ impl IntoResponse for ServerError {
             ServerError::GifConfigInvalid(_) | ServerError::TurnConfigInvalid(_) => {
                 StatusCode::BAD_REQUEST
             }
+            // 404 as for GIFs: nothing here to use, and a member's client asks the roster
+            // first and hides the channel.
+            ServerError::VoiceUnavailable | ServerError::NoSuchVoiceSession => {
+                StatusCode::NOT_FOUND
+            }
+            ServerError::VoiceChannelFull => StatusCode::CONFLICT,
+            ServerError::SfuRefused(_) => StatusCode::BAD_REQUEST,
         };
         (status, Json(ErrorBody { error: self.to_string() })).into_response()
     }
@@ -299,6 +308,23 @@ fn signed_actor(
         &signature,
         now_ms(),
     )
+}
+
+/// As [`signed_actor`], also returning the device that signed — which, once the signature
+/// has verified, is as authenticated as the account. A voice seat is per device.
+fn signed_actor_device(
+    instance: &SharedInstance,
+    headers: &HeaderMap,
+    action: &str,
+    resource: Option<cairn_proto::ResourceRef>,
+) -> Result<(cairn_proto::UserId, cairn_proto::DeviceId), ServerError> {
+    let user = signed_actor(instance, headers, action, resource)?;
+    let device = headers
+        .get("x-cairn-device")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<uuid::Uuid>().ok())
+        .ok_or(ServerError::BadRequestAuth)?;
+    Ok((user, cairn_proto::DeviceId::from_uuid(device)))
 }
 
 #[derive(Deserialize)]
@@ -535,6 +561,140 @@ async fn turn_credentials(
         },
         None => TurnResponse { ice_servers: Vec::new(), ttl_secs: 0 },
     }))
+}
+
+#[derive(Deserialize)]
+struct VoiceJoinRequest {
+    /// The client's SDP offer: one sendonly audio track and up to
+    /// [`crate::sfu::RECEIVE_SLOTS`] recvonly ones.
+    offer: String,
+}
+
+#[derive(Serialize)]
+struct VoiceJoinResponse {
+    session: String,
+    answer: String,
+}
+
+/// Take a seat in the room's voice channel and connect to the SFU.
+///
+/// The seat comes first, from `state.rs`'s rules; only then is the offer handed to the SFU.
+/// If the SFU refuses the offer the seat is given back, so a failed join leaves nothing in
+/// the roster.
+async fn voice_join(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<VoiceJoinRequest>,
+) -> Result<Json<VoiceJoinResponse>, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let (actor, device) =
+        signed_actor_device(&instance, &headers, "voice_join", Some(room.into()))?;
+    let session = instance.voice_join(room, actor, device, now_ms())?;
+    let Some(sfu) = instance.sfu() else {
+        let _ = instance.voice_leave(actor, session);
+        return Err(ServerError::VoiceUnavailable);
+    };
+    let offer = req.offer;
+    let opened = tokio::task::spawn_blocking(move || sfu.open(session, room, &offer))
+        .await
+        .map_err(|e| ServerError::SfuRefused(e.to_string()))?;
+    match opened {
+        Ok(answer) => Ok(Json(VoiceJoinResponse { session: session.to_string(), answer })),
+        Err(e) => {
+            let _ = instance.voice_leave(actor, session);
+            Err(ServerError::SfuRefused(e))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct VoiceRosterQuery {
+    /// The caller's own session, to learn which receive slot carries whom.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Serialize)]
+struct VoiceRosterResponse {
+    participants: Vec<VoiceParticipantResponse>,
+    /// The SFU's claim about the caller's own receive slots. Empty unless `session` was the
+    /// caller's. An E2EE client attributes audio by the key a frame opens under instead.
+    slots: Vec<VoiceSlotResponse>,
+}
+
+#[derive(Serialize)]
+struct VoiceParticipantResponse {
+    user: String,
+    device: String,
+    joined_at_ms: i64,
+}
+
+#[derive(Serialize)]
+struct VoiceSlotResponse {
+    mid: String,
+    user: String,
+    device: String,
+}
+
+/// Who is in the room's voice channel. Rules in [`crate::state::Instance::voice_roster`].
+async fn voice_roster(
+    State(instance): State<SharedInstance>,
+    Path(room): Path<uuid::Uuid>,
+    Query(query): Query<VoiceRosterQuery>,
+    headers: HeaderMap,
+) -> Result<Json<VoiceRosterResponse>, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "voice_roster", Some(room.into()))?;
+    let participants = instance.voice_roster(room, actor)?;
+    let mut slots = Vec::new();
+    if let Some(session) = query.session.as_deref().and_then(|s| s.parse().ok()) {
+        if instance.voice_seat(actor, session).ok() == Some(room) {
+            if let Some(sfu) = instance.sfu() {
+                let assigned = tokio::task::spawn_blocking(move || sfu.slots(session))
+                    .await
+                    .unwrap_or_default();
+                let registry = instance.voice_registry();
+                let registry = registry.lock().expect("voice mutex poisoned");
+                for (mid, source) in assigned {
+                    if let Some(who) = registry.occupant(source) {
+                        slots.push(VoiceSlotResponse {
+                            mid,
+                            user: who.user.to_string(),
+                            device: who.device.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(Json(VoiceRosterResponse {
+        participants: participants
+            .into_iter()
+            .map(|p| VoiceParticipantResponse {
+                user: p.user.to_string(),
+                device: p.device.to_string(),
+                joined_at_ms: p.joined_at_ms,
+            })
+            .collect(),
+        slots,
+    }))
+}
+
+/// Leave the voice channel. Only the session's own account may.
+async fn voice_leave(
+    State(instance): State<SharedInstance>,
+    Path((room, session)): Path<(uuid::Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ServerError> {
+    let room = RoomId::from_uuid(room);
+    let actor = signed_actor(&instance, &headers, "voice_leave", Some(room.into()))?;
+    let session = session.parse()?;
+    instance.voice_leave(actor, session)?;
+    if let Some(sfu) = instance.sfu() {
+        sfu.close(session);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

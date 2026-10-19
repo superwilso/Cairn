@@ -184,6 +184,10 @@ impl Conversation {
         self
     }
 
+    pub fn group(&self) -> Option<&GroupHandle> {
+        self.group.as_ref()
+    }
+
     pub fn group_mut(&mut self) -> Option<&mut GroupHandle> {
         self.group.as_mut()
     }

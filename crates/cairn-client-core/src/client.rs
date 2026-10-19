@@ -135,6 +135,35 @@ struct TurnResponse {
 }
 
 #[derive(Deserialize)]
+struct VoiceJoinResponse {
+    session: String,
+    answer: String,
+}
+
+/// The instance's account of a voice channel. Everything in it is the instance's word.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceRoster {
+    pub participants: Vec<VoiceRosterEntry>,
+    #[serde(default)]
+    pub slots: Vec<VoiceSlot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceRosterEntry {
+    pub user: String,
+    pub device: String,
+    pub joined_at_ms: i64,
+}
+
+/// Which receive slot the SFU says carries whom.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceSlot {
+    pub mid: String,
+    pub user: String,
+    pub device: String,
+}
+
+#[derive(Deserialize)]
 struct GifCapabilityResponse {
     providers: Vec<GifProviderGrant>,
 }
@@ -453,6 +482,56 @@ impl<T: Transport> Client<T> {
         )?;
         let parsed: TurnResponse = serde_json::from_slice(&response.body)?;
         Ok(parsed.ice_servers)
+    }
+
+    /// Take a seat in `room`'s voice channel and hand the SFU this device's SDP offer.
+    /// Returns the session id and the SFU's answer.
+    ///
+    /// The offer necessarily reaches the instance in the clear — the SFU *is* the far end
+    /// of the connection — so, unlike mesh signalling, it is not carried inside the
+    /// encrypted body. `docs/adr/012-sfu-voice-channels.md` lists what that reveals.
+    pub fn voice_join(&self, room: RoomId, offer: &str) -> Result<(String, String), ClientError> {
+        let body = serde_json::json!({ "offer": offer }).to_string();
+        let response = self.call(
+            "POST",
+            &format!("/v1/rooms/{}/voice", room.as_uuid()),
+            &self.auth("voice_join", Some(room.into()))?,
+            Some(&body),
+        )?;
+        let parsed: VoiceJoinResponse = serde_json::from_slice(&response.body)?;
+        Ok((parsed.session, parsed.answer))
+    }
+
+    /// Who is in `room`'s voice channel; with `session`, also which of this device's receive
+    /// slots the SFU says carries whom. `None` when the instance runs no SFU.
+    pub fn voice_roster(
+        &self,
+        room: RoomId,
+        session: Option<&str>,
+    ) -> Result<Option<VoiceRoster>, ClientError> {
+        let query = session.map(|s| format!("?session={s}")).unwrap_or_default();
+        let result = self.call(
+            "GET",
+            &format!("/v1/rooms/{}/voice{query}", room.as_uuid()),
+            &self.auth("voice_roster", Some(room.into()))?,
+            None,
+        );
+        match result {
+            Ok(response) => Ok(Some(serde_json::from_slice(&response.body)?)),
+            Err(ClientError::Transport(TransportError::Status { status: 404, .. })) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Give up this device's seat in `room`'s voice channel.
+    pub fn voice_leave(&self, room: RoomId, session: &str) -> Result<(), ClientError> {
+        self.call(
+            "DELETE",
+            &format!("/v1/rooms/{}/voice/{session}", room.as_uuid()),
+            &self.auth("voice_leave", Some(room.into()))?,
+            None,
+        )?;
+        Ok(())
     }
 
     /// Which GIF providers this instance relays, with the key and hosts for each. Empty when
