@@ -65,3 +65,19 @@ test("in a transport-only call plaintext is passed, and sealed frames still open
     const sealed = await run("receive", { mode: () => "transport", keyFor: () => key }, Uint8Array.from(Buffer.from(SEALED, "hex")).buffer);
     assert.strictEqual(Buffer.from(sealed[0].data).toString(), "hello opus");
 });
+
+// A codec frame is arbitrary bytes, so about one plaintext frame in 256 ends in the version
+// byte and is long enough to look sealed. In a fallback call it must still be played; found
+// when the SFU browser test counted one such frame as "sealed" on a CI runner.
+test("in a transport-only call plaintext that merely looks sealed is still played", async () => {
+    const lookalike = Buffer.alloc(60, 0x5a);
+    lookalike[lookalike.length - 1] = CairnFrame.VERSION;
+    assert.ok(CairnFrame.peek(lookalike), "the lookalike does parse as a sealed frame");
+    const key = await CairnFrame.importKey(KEY);
+    for (const keyFor of [() => null, () => key]) {
+        const out = await run("receive", { mode: () => "transport", keyFor }, Uint8Array.from(lookalike).buffer);
+        assert.strictEqual(out.length, 1, "a plaintext frame in a fallback call is not dropped");
+    }
+    const e2ee = await run("receive", { mode: () => "e2ee", keyFor: () => key }, Uint8Array.from(lookalike).buffer);
+    assert.strictEqual(e2ee.length, 0, "in an end-to-end call a frame that does not open is still dropped");
+});

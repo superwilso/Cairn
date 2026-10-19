@@ -321,7 +321,11 @@ test("a voice channel carries sealed audio through the SFU", { timeout: 180_000 
         const plainTap = await harness.call({ op: "tap" });
         console.log("what the SFU held during the fallback:", JSON.stringify(plainTap));
         assert.ok(plainTap.alice.frames > 10);
-        assert.strictEqual(plainTap.alice.sealed, 0, "in a transport-only call the SFU holds unsealed frames — and the test can see it");
+        // "sealed" only means "ends in the version byte", which about one Opus frame in 256 does
+        // by chance — a CI run saw exactly one. Opening is the real test: nothing alice sends
+        // during the fallback opens under her key, and lookalikes stay rare.
+        assert.strictEqual(plainTap.alice.opened, 0, "in a transport-only call the SFU holds frames that do not open — and the test can see it");
+        assert.ok(plainTap.alice.sealed * 20 < plainTap.alice.frames, "only chance lookalikes resemble sealed frames: " + plainTap.alice.sealed);
 
         await carol.evaluate(() => CairnVoiceChannel.leave());
         await until("back to end to end", async () => {

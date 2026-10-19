@@ -163,6 +163,9 @@ if command -v node >/dev/null 2>&1; then
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/voicepanel.browser.test.js
+        # Built first, as in CI: otherwise the build counts against the test's timeout.
+        run "build the SFU harness" \
+            cargo build -q -p cairn-server --example sfu_harness --features test-tap
         run "desktop voice channel through the SFU" \
             env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \

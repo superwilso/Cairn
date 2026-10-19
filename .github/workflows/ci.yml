@@ -179,6 +179,10 @@ jobs:
       # desktop crate, so no webview packages are needed here.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Built as its own step: the test would otherwise compile it inside its 180 s timeout,
+      # and on a cold cache that alone took most of it.
+      - name: Build the SFU harness
+        run: cargo build -p cairn-server --example sfu_harness --features test-tap
       - name: Sealed audio through the SFU between real browsers
         # Audio flows, every frame the SFU held was sealed and opens in Rust, the fallback is
         # announced to everyone, and a removed member is dropped.

@@ -109,8 +109,12 @@ const CairnFrame = (() => {
                     return;
                 }
             }
-            // A fallback call carries plaintext from whoever cannot seal.
-            if (ctx.mode() !== "e2ee" && !id) { ctx.count("passed"); controller.enqueue(frame); return; }
+            // A fallback call carries plaintext from whoever cannot seal. Anything that did not
+            // open is played as plaintext there, including a codec frame that merely ends in
+            // the version byte (about one in 256) — dropping those was an audible glitch, and
+            // accepting plaintext is what transport-only already means. In an end-to-end call
+            // it is dropped, as before.
+            if (ctx.mode() !== "e2ee") { ctx.count("passed"); controller.enqueue(frame); return; }
             ctx.count("dropped");
         };
     }
