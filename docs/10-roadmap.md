@@ -240,7 +240,10 @@ Four calls made by the owner, so a session does not re-litigate them:
       floor until the SFU needed 1.88),
       unprivileged user, `--locked`. The image could not be built in the authoring
       environment (no Docker daemon), but the Dockerfile's exact file set was verified to
-      build with `--locked` from a clean copy.
+      build with `--locked` from a clean copy. That check went stale: making the desktop
+      client a workspace member left the image without a manifest cargo needs, so the build
+      failed before compiling anything until the Dockerfile copied it. It has to be redone
+      whenever the workspace's member list changes.
 - [x] **TLS guidance.** Caddy in the compose file terminates TLS and obtains certificates;
       `cairn` has **no published port**, so the plaintext server is unreachable from
       outside the Docker network. §3 of the guide explains why this is not optional: MLS

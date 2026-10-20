@@ -9,6 +9,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # `[patch.crates-io]` in Cargo.toml points here; see vendor/str0m-rust-crypto/VENDORED.md.
 COPY vendor ./vendor
+# The desktop client is a workspace member, so cargo refuses to load the workspace without
+# its manifest, even to build only the server. The manifest is all it needs: an empty target
+# satisfies cargo's discovery, `cairn-desktop` is never compiled here, and the client's own
+# source stays out of the image (and out of its cache key).
+COPY clients/desktop/src-tauri/Cargo.toml ./clients/desktop/src-tauri/
+RUN mkdir -p clients/desktop/src-tauri/src && touch clients/desktop/src-tauri/src/main.rs
 
 # --locked so the image cannot silently resolve different dependency versions than the
 # ones `cargo audit` ran against in CI.
