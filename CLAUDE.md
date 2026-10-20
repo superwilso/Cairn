@@ -96,8 +96,9 @@ cargo run -p cairn-desktop                          # desktop client (needs libw
 cargo run -p cairn-crypto --example group_scaling --release
 ```
 
-CI additionally builds and tests on Windows and macOS, checks MSRV (**1.85** — a hard floor,
-the crypto tree needs `edition2024`), and runs `cargo audit`.
+CI additionally builds and tests on Windows and macOS, checks MSRV (**1.88** — a hard floor;
+it was 1.85 for `edition2024` until the SFU's `time` dependency needed 1.88 for
+RUSTSEC-2026-0009), and runs `cargo audit`.
 
 **Verify over HTTP, not only in unit tests.** Both room bugs looked fine in unit tests
 written against the same wrong mental model. Start the server and make the actual request.

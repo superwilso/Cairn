@@ -815,7 +815,7 @@ main.dropping #timeline { outline: 2px dashed var(--accent); outline-offset: -8p
 .tiles {
   display: grid;
   /* Capped, so one person on camera is a portrait on the wall, not a wall. */
-  grid-template-columns: repeat(auto-fit, minmax(190px, 360px));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 300px));
   justify-content: center;
   gap: 10px;
   padding: 14px 20px;
@@ -888,31 +888,6 @@ main.dropping #timeline { outline: 2px dashed var(--accent); outline-offset: -8p
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-thumb:hover { background: var(--dim); background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
-
-/* ---- the ring ---------------------------------------------------------- */
-
-.ringing {
-  display: flex; align-items: center; gap: 10px;
-  margin: 12px 16px 0;
-  padding: 11px 14px;
-  border-radius: var(--radius);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-line);
-  font-size: 13px;
-}
-.ringing[hidden] { display: none; }
-.ringing .grow { flex: 1; }
-.ringing .pip {
-  width: 9px; height: 9px; flex: none;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: ring 1.6s ease-out infinite;
-}
-@keyframes ring {
-  0%   { box-shadow: 0 0 0 0 var(--accent-line); }
-  70%  { box-shadow: 0 0 0 11px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
-}
 
 /* ---- sheets (safety numbers, settings) ---------------------------------- */
 
@@ -1343,7 +1318,7 @@ html[data-motion="reduce"] *::after {
   }
   #safety-changed strong { color: #ff8a80 !important; }
 
-  #waiting {
+  #waiting, #departed {
     visibility: visible !important;
     opacity: 1 !important;
     filter: none !important;

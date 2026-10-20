@@ -129,6 +129,61 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     instance.set_gif_relay(Some(gifs));
 
+    // A TURN relay for calls (coturn with `use-auth-secret`). Optional: without one, calls
+    // are STUN-only and the client says so. The URLs without the secret, or the reverse,
+    // is a mistake rather than a choice, so it stops the instance instead of half-working.
+    let turn_urls = std::env::var("CAIRN_TURN_URLS").ok().filter(|v| !v.trim().is_empty());
+    let turn_secret = std::env::var("CAIRN_TURN_SECRET").ok().filter(|v| !v.trim().is_empty());
+    match (turn_urls, turn_secret) {
+        (Some(urls), Some(secret)) => {
+            let ttl = match std::env::var("CAIRN_TURN_TTL_SECS") {
+                Ok(v) if !v.trim().is_empty() => Some(
+                    v.trim()
+                        .parse::<u64>()
+                        .map_err(|_| "CAIRN_TURN_TTL_SECS must be a number of seconds")?,
+                ),
+                _ => None,
+            };
+            let urls: Vec<&str> = urls.split(',').collect();
+            let config = state::TurnConfig::new(&urls, secret.trim(), ttl)?;
+            tracing::info!(urls = ?config.urls(), ttl_secs = config.ttl_secs(), "issuing TURN relay credentials to room members");
+            instance.set_turn(Some(config));
+        }
+        (None, None) => {
+            tracing::info!(
+                "no TURN relay configured: calls are STUN-only and the client will say so"
+            )
+        }
+        _ => {
+            return Err("CAIRN_TURN_URLS and CAIRN_TURN_SECRET must be set together".into());
+        }
+    }
+
+    // The voice-channel SFU. Optional: without it there are no voice channels, and calls are
+    // the peer-to-peer mesh only. With it the instance is in the media path for the first
+    // time — docs/adr/012-sfu-voice-channels.md says exactly what that lets it see.
+    if let Ok(bind) = std::env::var("CAIRN_SFU_BIND") {
+        let bind: SocketAddr = bind
+            .trim()
+            .parse()
+            .map_err(|_| "CAIRN_SFU_BIND must be an address such as 0.0.0.0:3480")?;
+        let advertise: SocketAddr = match std::env::var("CAIRN_SFU_ADVERTISE") {
+            Ok(a) if !a.trim().is_empty() => a
+                .trim()
+                .parse()
+                .map_err(|_| "CAIRN_SFU_ADVERTISE must be the public ip:port clients send to")?,
+            _ => bind,
+        };
+        let sfu = instance
+            .start_sfu(cairn_server::sfu::SfuConfig { bind, advertise })
+            .map_err(|e| format!("starting the SFU: {e}"))?;
+        tracing::info!(local = %sfu.local_addr(), %advertise, "voice channels on: SFU listening (UDP)");
+    } else {
+        tracing::info!(
+            "no SFU configured (CAIRN_SFU_BIND): no voice channels; calls are mesh only"
+        );
+    }
+
     // Read before anything is served: a proxy list that half-parsed would quietly trust
     // the wrong hosts, so a typo stops the instance instead.
     let proxies = match std::env::var("CAIRN_TRUSTED_PROXIES") {

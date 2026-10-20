@@ -88,6 +88,8 @@ jobs:
           EOF
 
       - run: node --test clients/desktop/tests/mesh.test.js
+      # The voice-frame format, JavaScript against the Rust vector in cairn-crypto's media.rs.
+      - run: node --test clients/desktop/tests/mediaframe.test.js
 
       - name: Install Chromium for the browser test
         run: npm install --no-save playwright && npx playwright install --with-deps chromium
@@ -98,6 +100,13 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/call.browser.test.js
+
+      - name: Calls as people use them, between two browsers
+        # Ring, accept, decline, mute and deafen reaching the other side, the speaking ring,
+        # per-person volume, push-to-talk, and relay-only offering no address of its own.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/calls.browser.test.js
 
       - name: The safety-number panel in a browser
         # The numbers are computed and checked in Rust; this proves the page hands back the
@@ -141,6 +150,45 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/settings.browser.test.js
+      - name: Custom emoji, stickers and the picker in a browser
+        # A room's images are read from the local cache by id, once each, before any
+        # message uses them -- never fetched at render time (docs/13-customisation.md s3).
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/emoji.browser.test.js
+      - name: A soundboard clip crosses a real call
+        # Mixed into the microphone track and measured at the listener; no signal sent.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/soundboard.browser.test.js
+      - name: Spaces in a browser
+        # The rail, channels and people draw the instance's permission flags and decide none
+        # of them; the rules are attacked in cargo (ADR-011).
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/spaces.browser.test.js
+      - name: The voice-channel panel in a browser
+        # The call's own badge, and a fallback that changes it without touching the room's.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/voicepanel.browser.test.js
+
+      # The voice channel against the real SFU: the test builds a harness (`cairn-server`'s
+      # `sfu_harness` example, `test-tap` feature) holding real sessions in a real MLS group,
+      # so this job needs Rust. Only cairn-server and its dependencies are built — not the
+      # desktop crate, so no webview packages are needed here.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built as its own step: the test would otherwise compile it inside its 180 s timeout,
+      # and on a cold cache that alone took most of it.
+      - name: Build the SFU harness
+        run: cargo build -p cairn-server --example sfu_harness --features test-tap
+      - name: Sealed audio through the SFU between real browsers
+        # Audio flows, every frame the SFU held was sealed and opens in Rust, the fallback is
+        # announced to everyone, and a removed member is dropped.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/voicechannel.browser.test.js
 
   lint:
     name: fmt + clippy
@@ -176,18 +224,20 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
-  # 1.85 is a hard floor, not a preference: the crypto dependency tree pulls in crates
-  # that require edition2024, which stabilized in exactly that release.
+  # 1.88 is a hard floor. It was 1.85 (edition2024, which the crypto tree needs) until the
+  # voice-channel SFU: str0m's tree depends on `time` >= 0.3.47, the fix for
+  # RUSTSEC-2026-0009, which needs 1.88. The owner chose one floor for the whole workspace
+  # over carving the SFU out of it.
   #
-  # `cairn-desktop` is excluded. Tauri's dependency tree requires rustc 1.88, and raising the
-  # floor to suit it would push the cost onto everyone consuming the protocol and crypto
-  # crates. The floor exists for *those* — a desktop application is shipped as a binary we
-  # build ourselves, and nobody compiles against it. The libraries still hold the line.
+  # `cairn-desktop` is excluded only because this runner lacks the webview's system packages;
+  # it declares the same floor.
   msrv:
     name: minimum supported rust version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --exclude cairn-desktop
+      # The server builds without its SFU too, for an operator who wants no voice channels.
+      - run: cargo check -p cairn-server --no-default-features

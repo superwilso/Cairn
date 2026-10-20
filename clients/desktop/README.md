@@ -14,17 +14,21 @@ ui/settings.css     the appearance panel
 ui/fonts/           bundled woff2 fonts, each family with its OFL licence as published
 ui/textures/        contour-line, grain and cairn SVGs, used as CSS masks
 ui/app.js           the DOM — rooms, timeline, members, safety numbers, call controls
-ui/call.js          WebRTC: peer connections, devices, screen share
+ui/call.js          WebRTC: peer connections, devices, screen share, mute state between peers
+ui/callaudio.js     what a call sounds like here: per-person volume, deafen, speaking, the ring
+ui/callui.js        ringing, accept/decline, mute/deafen, push-to-talk, Voice & video settings
 ui/timer.js         the disappearing-message control and its notices
 ui/messages.js      drawing a message; replying and reacting to it
 ui/profile.js       avatars, names, the profile card and editor (+ profile.css)
+ui/spaces.js        the space rail, a space's channels and people (+ spaces.css); draws the
+                    instance's permission flags and decides none of them (ADR-011)
 src-tauri/          the shell — Tauri commands, each a one-line delegation to Rust
 ```
 
 Everything the UI can do goes through `cairn_client_core::session::Session`. **The FFI line
 falls between Rust and JavaScript**: `src-tauri` is below it, `ui/` is above it, and the UI
-only ever receives plain data. It never constructs an envelope, decides a tier, or touches a
-key — the rule [ADR-006](../../docs/adr/006-platform-architecture.md) drew for five native
+only ever receives plain data. It never constructs an envelope, decides a tier, decides a
+permission, or touches a key — the rule [ADR-006](../../docs/adr/006-platform-architecture.md) drew for five native
 clients and [ADR-008](../../docs/adr/008-client-architecture.md) kept when it replaced them
 with one.
 
@@ -178,14 +182,30 @@ ICE candidates and your IP addresses; carrying it beside the ciphertext would ha
 that to an instance that only needs to relay a blob. `crates/cairn-server/tests/group_chat_session.rs`
 has a test that reads what the instance actually stored and asserts the SDP is not in it.
 
+**Being rung.** A call started in the open room puts up an incoming-call screen with the
+caller's avatar and name — Accept voice, Accept video, Decline — and a ring generated with
+WebAudio (Settings → Voice & video turns it off). After 45 seconds it becomes a missed call
+with a Call back button. Decline is an encrypted `decline` signal addressed to the caller,
+whose DM call then ends. **Only the open room rings**: the client polls that room alone.
+
+**In a call.** Mute, deafen (which also mutes, as everywhere else), and push-to-talk on a key
+of your choice — **only while the Cairn window is focused**, which the settings and the call
+bar both say; leaving the window closes the microphone. Mute and deafen state goes to the
+others over a WebRTC data channel, peer to peer, not through the instance. A ring lights round
+whoever is speaking. Each participant has a volume (0–200%) and "mute for me", kept on this
+device and never told to them. Noise suppression, echo cancellation and automatic gain are
+switches in Settings → Voice & video, where the device pickers now live too.
+
 Two things the UI states rather than hides, because both are real:
 
-- **No TURN relay is configured**, so calls fall back to STUN alone and will fail to connect
-  across some home networks. The client says so when a connection fails instead of leaving
-  someone to blame their broadband.
+- **Without a TURN relay**, calls fall back to STUN alone and will fail to connect across
+  some home networks. An operator can run one (`docs/11-self-hosting.md` §2); when there is
+  none, the client says so when a connection fails instead of leaving someone to blame their
+  broadband.
 - **A mesh call shows every participant every other participant's IP address.** That is what
-  peer-to-peer media means. A relay is the only thing that changes it, and a relay costs an
-  operator bandwidth.
+  peer-to-peer media means. *Always use the relay* (Settings → Voice & video) changes it, on
+  an instance with a relay: the others see the relay's address, and the relay's operator sees
+  yours. Without a relay that setting refuses to start a call, because none could connect.
 
 ### Known gap: microphone permission on Linux
 

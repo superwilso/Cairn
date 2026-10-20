@@ -19,11 +19,13 @@
 
 use std::sync::Mutex;
 
-use cairn_client_core::call::{self, CallSignal, IceServer};
+use cairn_client_core::call::{CallConfig, CallSignal};
+use cairn_client_core::custom::Kind as CustomKind;
 use cairn_client_core::gifs::{GifProviderView, GifView};
 use cairn_client_core::session::{
-    Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView, ProfileEdit, ProfileLimits,
-    ProfileView, ReactionView, RoomSummary, Session,
+    CustomLimits, CustomSetView, Event, ImageSlot, LinkPreviewSettings, MemberView, MessageView,
+    ProfileEdit, ProfileLimits, ProfileView, ReactionView, RoomSummary, Session, SpaceDisplay,
+    SpaceListing,
 };
 use cairn_client_core::verify::SafetyView;
 use tauri::State;
@@ -243,6 +245,119 @@ fn redeem_invite(state: State<'_, AppState>, token: String) -> CmdResult<String>
     with(&state, |s| s.redeem_invite(&token))
 }
 
+// ---- spaces ----------------------------------------------------------------------------
+//
+// One-line delegations, like everything else here. Every permission the UI shows arrives in
+// `space`'s answer, decided by the instance; nothing below or above this line computes one.
+
+#[tauri::command]
+fn spaces(state: State<'_, AppState>) -> CmdResult<Vec<SpaceListing>> {
+    with(&state, |s| s.spaces())
+}
+
+#[tauri::command]
+fn space(state: State<'_, AppState>, space: String) -> CmdResult<SpaceDisplay> {
+    with(&state, |s| s.space(&space))
+}
+
+#[tauri::command]
+fn create_space(state: State<'_, AppState>, name: String) -> CmdResult<String> {
+    with(&state, |s| s.create_space(&name, None))
+}
+
+#[tauri::command]
+fn create_channel(state: State<'_, AppState>, space: String, name: String) -> CmdResult<String> {
+    with(&state, |s| s.create_channel(&space, &name))
+}
+
+#[tauri::command]
+fn rename_channel(
+    state: State<'_, AppState>,
+    space: String,
+    channel: String,
+    name: String,
+) -> CmdResult<()> {
+    with(&state, |s| s.rename_channel(&space, &channel, &name))
+}
+
+#[tauri::command]
+fn delete_channel(state: State<'_, AppState>, space: String, channel: String) -> CmdResult<()> {
+    with(&state, |s| s.delete_channel(&space, &channel))
+}
+
+#[tauri::command]
+fn set_channel_override(
+    state: State<'_, AppState>,
+    space: String,
+    channel: String,
+    role: Option<String>,
+    allow: Vec<String>,
+    deny: Vec<String>,
+) -> CmdResult<()> {
+    with(&state, |s| s.set_channel_override(&space, &channel, role.as_deref(), &allow, &deny))
+}
+
+#[tauri::command]
+fn create_role(
+    state: State<'_, AppState>,
+    space: String,
+    name: String,
+    grants: Vec<String>,
+    position: u32,
+) -> CmdResult<String> {
+    with(&state, |s| s.create_role(&space, &name, &grants, position))
+}
+
+#[tauri::command]
+fn assign_role(
+    state: State<'_, AppState>,
+    space: String,
+    user: String,
+    role: String,
+) -> CmdResult<()> {
+    with(&state, |s| s.assign_role(&space, &user, &role))
+}
+
+#[tauri::command]
+fn unassign_role(
+    state: State<'_, AppState>,
+    space: String,
+    user: String,
+    role: String,
+) -> CmdResult<()> {
+    with(&state, |s| s.unassign_role(&space, &user, &role))
+}
+
+#[tauri::command]
+fn kick(state: State<'_, AppState>, space: String, user: String) -> CmdResult<()> {
+    with(&state, |s| s.kick(&space, &user))
+}
+
+#[tauri::command]
+fn leave_space(state: State<'_, AppState>, space: String) -> CmdResult<()> {
+    with(&state, |s| s.leave_space(&space))
+}
+
+#[tauri::command]
+fn create_space_invite(
+    state: State<'_, AppState>,
+    space: String,
+    uses: u32,
+    hours: i64,
+) -> CmdResult<String> {
+    with(&state, |s| s.create_space_invite(&space, uses, hours))
+}
+
+#[tauri::command]
+fn redeem_space_invite(state: State<'_, AppState>, token: String) -> CmdResult<String> {
+    with(&state, |s| s.redeem_space_invite(&token))
+}
+
+#[tauri::command]
+fn remove_departed(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    with(&state, |s| s.remove_departed())
+}
+
 #[tauri::command]
 fn call_join(state: State<'_, AppState>) -> CmdResult<String> {
     with(&state, |s| s.call_join())
@@ -265,29 +380,58 @@ fn call_id(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(session.call_id())
 }
 
-/// What the WebRTC layer needs before it can build a peer connection.
+/// Decline the call this device is being rung for. The caller sees "declined".
+#[tauri::command]
+fn call_decline(state: State<'_, AppState>) -> CmdResult<()> {
+    with(&state, |s| s.call_decline())
+}
+
+/// What the WebRTC layer needs before it can build a peer connection, for the open room.
 ///
-/// Sent as data rather than baked into the JavaScript so a self-hosted instance can point
-/// calls at its own STUN/TURN later without a frontend change — and so the honest caveat
-/// travels with the config instead of living in a comment nobody reads.
-#[derive(serde::Serialize)]
-struct CallConfig {
-    ice_servers: Vec<IceServer>,
-    /// False on STUN alone. The UI says so: without a relay a minority of users behind
-    /// symmetric NATs will find calls simply do not connect, and "it is your network" is
-    /// not something a client should leave them to work out themselves.
-    has_relay: bool,
-    max_participants: usize,
+/// Sent as data rather than baked into the JavaScript so a self-hosted instance points
+/// calls at its own STUN/TURN without a frontend change — and so the honest caveat travels
+/// with the config instead of living in a comment nobody reads. Relay credentials in it are
+/// fresh each time and expire; see `Session::call_config`.
+#[tauri::command]
+fn call_config(state: State<'_, AppState>) -> CmdResult<CallConfig> {
+    with(&state, |s| s.call_config())
+}
+
+// ---- voice channels --------------------------------------------------------
+//
+// The room-attached call through the instance's SFU (docs/adr/012-sfu-voice-channels.md).
+// Whether it is end to end, and with which keys, is decided in `Session` — these only carry
+// the answers across.
+
+/// Join the open room's voice channel with this webview's SDP offer. `e2ee` is whether the
+/// webview can transform frames; `false` makes the call transport-only for everyone, and
+/// everyone is told.
+#[tauri::command]
+fn voice_join(
+    state: State<'_, AppState>,
+    offer: String,
+    e2ee: bool,
+) -> CmdResult<cairn_client_core::session::VoiceJoined> {
+    with(&state, |s| s.voice_join(&offer, e2ee))
 }
 
 #[tauri::command]
-fn call_config() -> CallConfig {
-    let ice_servers = call::default_ice_servers();
-    CallConfig {
-        has_relay: call::has_relay(&ice_servers),
-        ice_servers,
-        max_participants: call::MAX_MESH_PARTICIPANTS,
-    }
+fn voice_leave(state: State<'_, AppState>) -> CmdResult<()> {
+    with(&state, |s| s.voice_leave())
+}
+
+#[tauri::command]
+fn voice_state(
+    state: State<'_, AppState>,
+) -> CmdResult<cairn_client_core::session::VoiceStateView> {
+    with(&state, |s| s.voice_state())
+}
+
+/// The current epoch's media keys. The one place raw keys cross this line; the webview
+/// imports them as non-extractable and keeps no other copy.
+#[tauri::command]
+fn voice_keys(state: State<'_, AppState>) -> CmdResult<cairn_client_core::session::VoiceKeysView> {
+    with(&state, |s| s.voice_keys())
 }
 
 // ---- attachments -----------------------------------------------------------
@@ -541,6 +685,86 @@ async fn fetch_profile_image(
     .await
 }
 
+// ---- custom emoji, stickers, soundboard -------------------------------------
+//
+// The set, who may change it, and every fetch are `cairn_client_core::session::custom`. The
+// UI gets a view with ids and asks for bytes by id; `custom_asset` reads this device's cache
+// and never the network, which is the property the whole design exists for.
+
+#[tauri::command]
+fn custom_set(state: State<'_, AppState>) -> CmdResult<CustomSetView> {
+    with(&state, |s| s.custom_set())
+}
+
+#[tauri::command]
+fn custom_limits() -> CustomLimits {
+    cairn_client_core::session::custom_limits()
+}
+
+/// Download every asset of the open room's set this device lacks — all of them, at once,
+/// off the main thread and with the session unlocked. Returns how many were cached.
+#[tauri::command]
+async fn custom_sync(app: tauri::AppHandle) -> CmdResult<usize> {
+    off_main(move || {
+        let sync = with_app(&app, |s| s.prepare_custom_sync())?;
+        Ok(sync.run())
+    })
+    .await
+}
+
+/// One item's bytes, from the local cache only.
+#[tauri::command]
+fn custom_asset(state: State<'_, AppState>, id: String) -> CmdResult<tauri::ipc::Response> {
+    with(&state, |s| s.custom_asset(&id)).map(tauri::ipc::Response::new)
+}
+
+#[derive(serde::Deserialize)]
+struct CustomMeta {
+    kind: CustomKind,
+    name: String,
+}
+
+/// Add an emoji, sticker or sound. Raw bytes as the IPC body, kind and name in a header —
+/// the shape of `send_file`. The type is sniffed from the bytes in Rust, not taken from here.
+#[tauri::command]
+async fn custom_add(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<CustomSetView> {
+    let meta: CustomMeta = request
+        .headers()
+        .get("x-cairn-custom")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .ok_or("the item's kind and name are missing")?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(value) => <Vec<u8> as serde::Deserialize>::deserialize(value)
+            .map_err(|_| "expected the file's bytes")?,
+    };
+    off_main(move || {
+        let pending = with_app(&app, |s| s.prepare_custom_upload(meta.kind, &meta.name, &bytes))?;
+        drop(bytes);
+        let uploaded = pending.upload().map_err(|e| e.to_string())?;
+        with_app(&app, |s| s.commit_custom(uploaded))
+    })
+    .await
+}
+
+#[tauri::command]
+fn custom_remove(
+    state: State<'_, AppState>,
+    kind: CustomKind,
+    name: String,
+) -> CmdResult<CustomSetView> {
+    with(&state, |s| s.remove_custom(kind, &name))
+}
+
+#[tauri::command]
+fn send_sticker(state: State<'_, AppState>, name: String) -> CmdResult<MessageView> {
+    with(&state, |s| s.send_sticker(&name))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -565,6 +789,11 @@ fn main() {
             signal,
             call_id,
             call_config,
+            voice_join,
+            voice_leave,
+            voice_state,
+            voice_keys,
+            call_decline,
             send_file,
             fetch_attachment,
             save_attachment,
@@ -589,6 +818,28 @@ fn main() {
             set_link_previews,
             instagram_proxy_disclosure,
             open_link,
+            custom_set,
+            custom_limits,
+            custom_sync,
+            custom_asset,
+            custom_add,
+            custom_remove,
+            send_sticker,
+            spaces,
+            space,
+            create_space,
+            create_channel,
+            rename_channel,
+            delete_channel,
+            set_channel_override,
+            create_role,
+            assign_role,
+            unassign_role,
+            kick,
+            leave_space,
+            create_space_invite,
+            redeem_space_invite,
+            remove_departed,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start the Cairn desktop client");

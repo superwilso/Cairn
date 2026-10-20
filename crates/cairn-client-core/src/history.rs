@@ -89,6 +89,10 @@ pub struct Entry {
     /// unreadable history would look exactly like a conversation that never happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<crate::embed::Card>,
+    /// The room sticker this message was, by name. The image is drawn from the room's set on
+    /// this device; the transcript keeps only the name, which is also the message's body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticker: Option<String>,
 }
 
 /// Per-room transcripts under a client's state directory.
@@ -212,6 +216,7 @@ mod tests {
             reply_to: None,
             reaction: None,
             card: None,
+            sticker: None,
         }
     }
 

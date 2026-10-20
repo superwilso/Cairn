@@ -389,6 +389,7 @@ pub enum ResourceRef {
     User(crate::UserId),
     Device(crate::DeviceId),
     Blob(crate::BlobId),
+    Space(crate::SpaceId),
 }
 
 impl ResourceRef {
@@ -399,6 +400,7 @@ impl ResourceRef {
             ResourceRef::User(_) => "user",
             ResourceRef::Device(_) => "device",
             ResourceRef::Blob(_) => "blob",
+            ResourceRef::Space(_) => "space",
         }
     }
 
@@ -408,6 +410,7 @@ impl ResourceRef {
             ResourceRef::User(id) => id.as_uuid(),
             ResourceRef::Device(id) => id.as_uuid(),
             ResourceRef::Blob(id) => id.as_uuid(),
+            ResourceRef::Space(id) => id.as_uuid(),
         }
     }
 }
@@ -427,6 +430,12 @@ impl From<crate::UserId> for ResourceRef {
 impl From<crate::DeviceId> for ResourceRef {
     fn from(id: crate::DeviceId) -> Self {
         ResourceRef::Device(id)
+    }
+}
+
+impl From<crate::SpaceId> for ResourceRef {
+    fn from(id: crate::SpaceId) -> Self {
+        ResourceRef::Space(id)
     }
 }
 

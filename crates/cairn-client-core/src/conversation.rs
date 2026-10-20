@@ -184,6 +184,10 @@ impl Conversation {
         self
     }
 
+    pub fn group(&self) -> Option<&GroupHandle> {
+        self.group.as_ref()
+    }
+
     pub fn group_mut(&mut self) -> Option<&mut GroupHandle> {
         self.group.as_mut()
     }
@@ -329,13 +333,47 @@ impl Conversation {
         self.send_with(b"", Extras { profile: Some(profile), ..Extras::default() }, now_ms)
     }
 
+    /// Publish a room's custom emoji, stickers and sounds — the whole set.
+    ///
+    /// Like a profile, the body is empty and the record rides beside it inside the encrypted
+    /// body, so it is not reportable through franking. Whether the sender may change the set
+    /// is decided by each recipient on receipt (`crate::custom`): the record carries no field
+    /// naming its author, and the envelope's sender is checked against the roster.
+    pub fn send_custom_set(
+        &mut self,
+        set: crate::custom::CustomSet,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        self.send_with(b"", Extras { custom_set: Some(set), ..Extras::default() }, now_ms)
+    }
+
+    /// Send one of the room's stickers. A reference by name: the image is already on every
+    /// member's device, so nothing is uploaded and nothing is fetched to show it.
+    ///
+    /// The body is `:name:`, which is franked like any text — so a sticker *is* reportable,
+    /// as the name it was sent under — and is what a client without the set, or one that
+    /// predates stickers, shows instead.
+    pub fn send_sticker(
+        &mut self,
+        name: &str,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        let body = format!(":{name}:");
+        self.send_with(
+            body.as_bytes(),
+            Extras { sticker: Some(name.to_owned()), ..Extras::default() },
+            now_ms,
+        )
+    }
+
     fn send_with(
         &mut self,
         plaintext: &[u8],
         extras: Extras,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        let Extras { card, attachment, signal, reply_to, reaction, profile } = extras;
+        let Extras { card, attachment, signal, reply_to, reaction, profile, custom_set, sticker } =
+            extras;
         let tier = self.seal.tier();
         if !tier.is_e2ee() {
             return Err(ConversationError::NotEncrypted);
@@ -357,6 +395,8 @@ impl Conversation {
             reply_to,
             reaction,
             profile,
+            custom_set,
+            sticker,
         };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
@@ -452,6 +492,8 @@ impl Conversation {
                 reply_to: None,
                 reaction: None,
                 profile: None,
+                custom_set: None,
+                sticker: None,
             })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
@@ -495,6 +537,17 @@ impl Conversation {
                 if inner.profile.as_ref().is_some_and(|p| p.validate().is_err()) {
                     return Ok(TimelineEvent::Nothing);
                 }
+                // And a custom set: counts, sizes, names and types, whole or not at all.
+                // *Who* may send one is not knowable here — roles are the instance's — and
+                // is checked by the session against the room's member list.
+                if inner.custom_set.as_ref().is_some_and(|c| c.validate().is_err()) {
+                    return Ok(TimelineEvent::Nothing);
+                }
+                // A sticker names one by a valid name and says so in its franked body; any
+                // other combination is an ordinary message whose text is still the sender's.
+                let sticker = inner.sticker.filter(|name| {
+                    crate::custom::valid_name(name) && inner.body == format!(":{name}:").as_bytes()
+                });
 
                 Ok(TimelineEvent::Message(ReceivedMessage {
                     body: inner.body,
@@ -512,6 +565,8 @@ impl Conversation {
                     reply_to: inner.reply_to.filter(MessageRef::is_valid).map(Box::new),
                     reaction: inner.reaction.map(Box::new),
                     profile: inner.profile.map(Box::new),
+                    custom_set: inner.custom_set.map(Box::new),
+                    sticker,
                 }))
             }
         }
@@ -646,6 +701,14 @@ struct InnerBody {
     /// sent. See `docs/adr/010-encrypted-profiles.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<crate::profile::Profile>,
+    /// A room's custom emoji, stickers and sounds, with the keys to their images. Inside the
+    /// encrypted body so the instance never learns a name or sees an image; see
+    /// `crate::custom` for why the whole set travels at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_set: Option<crate::custom::CustomSet>,
+    /// The name of the room sticker this message is. See [`Conversation::send_sticker`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sticker: Option<String>,
 }
 
 /// The optional parts of an outgoing message. Bundled so `send_with` does not grow a
@@ -658,6 +721,8 @@ struct Extras {
     reply_to: Option<MessageRef>,
     reaction: Option<Reaction>,
     profile: Option<crate::profile::Profile>,
+    custom_set: Option<crate::custom::CustomSet>,
+    sticker: Option<String>,
 }
 
 /// Names one earlier message in a room: who sent it, and its franking commitment.
@@ -701,9 +766,19 @@ impl Reaction {
     /// Short, no ASCII (which rules out words, not emoji), and no control characters or
     /// whitespace. Not a full emoji grammar — the point is that a chip under someone's
     /// message cannot carry text, not that every sequence is a well-formed glyph.
+    ///
+    /// The one ASCII form allowed is a room's custom emoji, `:name:` with a name that
+    /// passes [`crate::custom::valid_name`]. A client draws one only when the name is in the
+    /// room's set; otherwise it shows a placeholder, so a chip still cannot be a sentence.
     pub fn is_valid(&self) -> bool {
-        self.target.is_valid() && self.emoji.as_deref().is_none_or(is_emoji_like)
+        self.target.is_valid()
+            && self.emoji.as_deref().is_none_or(|e| is_emoji_like(e) || is_custom_emoji(e))
     }
+}
+
+/// `:name:`, a reference to a room's custom emoji.
+pub fn is_custom_emoji(s: &str) -> bool {
+    s.strip_prefix(':').and_then(|s| s.strip_suffix(':')).is_some_and(crate::custom::valid_name)
 }
 
 pub(crate) fn is_emoji_like(s: &str) -> bool {
@@ -798,6 +873,12 @@ pub struct ReceivedMessage {
     /// [`crate::profile::Profile::validate`]. Whose profile it is comes from the envelope,
     /// never from here.
     pub profile: Option<Box<crate::profile::Profile>>,
+    /// A room's custom set rather than text. Already checked with
+    /// [`crate::custom::CustomSet::validate`]; **not** checked for whether its sender may
+    /// change the set, which needs the room's roles — the session does that.
+    pub custom_set: Option<Box<crate::custom::CustomSet>>,
+    /// The room sticker this message is, by name; the body is `:name:`.
+    pub sticker: Option<String>,
 }
 
 /// Franking material a recipient retains so a message can be reported later.
@@ -1166,6 +1247,83 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_emoji_reaction_is_a_name_and_never_a_sentence() {
+        // `:name:` is the one ASCII reaction allowed, and only with a name a set could hold.
+        let (mut alice, mut bob) = linked_pair();
+        let target = MessageRef { sender: UserId::new(), id: "ab".repeat(32) };
+        for emoji in [
+            ":you are a fraud:",
+            ":Party:",
+            ":a:",
+            "party_parrot",
+            &format!(":{}:", "x".repeat(33)),
+        ] {
+            let reaction = Reaction { target: target.clone(), emoji: Some(emoji.to_owned()) };
+            let sent = alice.send_reaction(reaction, 1_000).unwrap();
+            let got = bob.receive(&sent.envelope).unwrap();
+            assert!(matches!(got, TimelineEvent::Nothing), "{emoji:?} must not arrive");
+        }
+        let good = Reaction { target, emoji: Some(":party_parrot:".to_owned()) };
+        let sent = alice.send_reaction(good.clone(), 1_000).unwrap();
+        let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
+        assert_eq!(got.reaction.as_deref(), Some(&good));
+    }
+
+    #[test]
+    fn a_sticker_is_its_franked_name_or_it_is_ordinary_text() {
+        let (mut alice, mut bob) = linked_pair();
+        let sent = alice.send_sticker("wave", 1).unwrap();
+        let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
+        assert_eq!(got.sticker.as_deref(), Some("wave"));
+        assert_eq!(got.body, b":wave:", "the body is what is franked and what old clients show");
+
+        // A hostile client claiming a sticker over different text gets its text shown as
+        // text — the sticker cannot stand in front of words the franking does not cover.
+        let forged = alice
+            .send_with(
+                b"something else entirely",
+                Extras { sticker: Some("wave".into()), ..Extras::default() },
+                2,
+            )
+            .unwrap();
+        let got = bob.receive(&forged.envelope).unwrap().message().unwrap();
+        assert_eq!(got.sticker, None);
+        assert_eq!(got.body, b"something else entirely");
+    }
+
+    #[test]
+    fn a_custom_set_that_breaks_the_limits_is_dropped_on_receipt() {
+        use crate::custom::{CustomSet, Item, Kind};
+        let (mut alice, mut bob) = linked_pair();
+        let (key, _) = cairn_crypto::attachment::seal(b"x");
+        let item = |name: &str, mime: &str, size: usize| Item {
+            kind: Kind::Emoji,
+            name: name.into(),
+            asset: Attachment {
+                blob: BlobId::new(),
+                key: key.clone(),
+                name: name.into(),
+                size,
+                mime: Some(mime.into()),
+            },
+        };
+        for bad in [
+            item("Bad Name", "image/png", 10),
+            item("svg", "image/svg+xml", 10),
+            item("huge", "image/png", crate::custom::MAX_EMOJI_BYTES + 1),
+        ] {
+            let set = CustomSet { items: vec![item("ok", "image/png", 10), bad] };
+            let sent = alice.send_custom_set(set, 1).unwrap();
+            assert!(matches!(bob.receive(&sent.envelope).unwrap(), TimelineEvent::Nothing));
+        }
+        let sent = alice
+            .send_custom_set(CustomSet { items: vec![item("ok", "image/png", 10)] }, 1)
+            .unwrap();
+        let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
+        assert_eq!(got.custom_set.unwrap().items[0].name, "ok");
+    }
+
+    #[test]
     fn a_malformed_reply_reference_leaves_an_ordinary_message() {
         let (mut alice, mut bob) = linked_pair();
         let bad = MessageRef { sender: UserId::new(), id: "AB".repeat(32) };
@@ -1333,6 +1491,8 @@ mod attachment_tests {
             reply_to: None,
             reaction: None,
             profile: None,
+            custom_set: None,
+            sticker: None,
         };
 
         let encoded = serde_json::to_vec(&inner).unwrap();

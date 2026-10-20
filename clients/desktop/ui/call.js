@@ -27,6 +27,25 @@
 // video transceiver from the start and `replaceTrack` fills it later. Turning a camera on
 // mid-call, and starting a screen share, then cost one function call and no new SDP — which
 // is also why they are instant rather than taking a second to re-handshake with everyone.
+//
+// ## The soundboard has its own audio line, negotiated up front like the video one
+//
+// Clips go out on a second audio track, not mixed into the microphone, so a listener can turn
+// one person's clips down or off without turning their voice down (callaudio.js). The line is
+// created by the offerer next to the empty video line and claimed by the answerer the same
+// way, so playing the first clip is a `replaceTrack`, not a renegotiation. Which incoming
+// audio track is the soundboard is read from the m-line order — the second audio m-line —
+// rather than from anything a peer says. The cost, in docs/13-customisation.md: whoever
+// carries the media (a TURN relay here, the SFU in a voice channel) sees when a clip plays.
+//
+// ## Mute state travels peer to peer, not through the instance
+//
+// Whether someone is muted or deafened rides a WebRTC data channel on each peer connection —
+// DTLS, end to end between the two devices, like the media. Sending it as a signal would
+// have worked too, and would have handed the instance a timestamped log of every time each
+// participant muted or unmuted. The channel is created on both sides as `negotiated` with a
+// fixed id, so neither side waits for the other to announce it. What arrives on it is
+// attributed to the connection it came in on, never to anything it claims about itself.
 
 /* eslint-env browser */
 
@@ -36,7 +55,19 @@ const CairnCall = (() => {
     let me = null;
     let local = null;          // MediaStream: the mic, and the camera when it is on
     let screen = null;         // MediaStream from getDisplayMedia, when sharing
-    const peers = new Map();   // user id -> { pc, pending, stream, audioSender, videoSender }
+    const peers = new Map();   // user id -> { pc, pending, stream, board, audioSender, videoSender, boardSender, channel }
+
+    // What the microphone is doing. `enabled` on the track is derived from all four, so no
+    // combination of buttons and keys can leave it open by accident.
+    const mic = { muted: false, deafened: false, ptt: false, held: false };
+
+    // Capture and routing choices from Settings → Voice & video.
+    const prefs = {
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true,
+        relayOnly: false,
+    };
 
     // The UI hands these in so this file has no opinions about the DOM.
     let ui = {
@@ -44,12 +75,17 @@ const CairnCall = (() => {
         onState: () => {},     // (userId, connectionState)
         onNotice: () => {},    // (text)
         onEnd: () => {},       // ()
+        onPeerState: () => {}, // (userId, { muted, deafened }) — from their data channel
+        onDecline: () => {},   // (userId) — somebody rung for this call said no
+        onBoard: () => {},     // (userId, MediaStream | null) — their soundboard track
     };
 
     const wanted = { mic: "", camera: "", speaker: "" };
 
+    // Fetched afresh rather than cached: relay credentials in it expire, and it describes
+    // the open room, which changes.
     async function loadConfig() {
-        if (!config) config = await window.__TAURI__.core.invoke("call_config");
+        config = await window.__TAURI__.core.invoke("call_config");
         return config;
     }
 
@@ -67,7 +103,16 @@ const CairnCall = (() => {
         };
     }
 
-    const micConstraint = () => (wanted.mic ? { deviceId: { exact: wanted.mic } } : true);
+    // The three processing switches are browser features, applied before anything is
+    // encoded. Off is for people with a good microphone who want it to sound like itself —
+    // and echo cancellation off with speakers rather than headphones will feed the room back
+    // to itself, which the settings copy says.
+    const micConstraint = () => ({
+        ...(wanted.mic ? { deviceId: { exact: wanted.mic } } : {}),
+        noiseSuppression: prefs.noiseSuppression,
+        echoCancellation: prefs.echoCancellation,
+        autoGainControl: prefs.autoGainControl,
+    });
     const camConstraint = () => ({
         ...(wanted.camera ? { deviceId: { exact: wanted.camera } } : {}),
         width: { ideal: 1280 },
@@ -94,11 +139,14 @@ const CairnCall = (() => {
         const existing = peers.get(user);
         if (existing) return existing;
 
-        const pc = new RTCPeerConnection({ iceServers: (config && config.ice_servers) || [] });
-        const entry = { pc, pending: [], stream: new MediaStream(), audioSender: null, videoSender: null };
+        const pc = new RTCPeerConnection(rtcConfig());
+        const entry = {
+            pc, pending: [], stream: new MediaStream(), board: new MediaStream(),
+            audioSender: null, videoSender: null, boardSender: null, channel: null,
+        };
         peers.set(user, entry);
 
-        const audio = local && local.getAudioTracks()[0];
+        const audio = outgoingAudio();
         if (audio) entry.audioSender = pc.addTrack(audio, local);
 
         // The empty video line described at the top of this file — but **only on the side
@@ -116,13 +164,25 @@ const CairnCall = (() => {
                 ? pc.addTransceiver(video, { direction: "sendrecv" })
                 : pc.addTransceiver("video", { direction: "sendrecv" });
             entry.videoSender = tx.sender;
+            // After the video line, so the soundboard is always the second audio m-line.
+            const btx = pc.addTransceiver("audio", { direction: "sendrecv" });
+            entry.boardSender = btx.sender;
+            if (board) btx.sender.replaceTrack(board.track).catch(() => {});
         }
+
+        openStateChannel(user, entry);
 
         pc.onicecandidate = (ev) => {
             if (!ev.candidate) return;
             send({ kind: "ice", to: user, payload: JSON.stringify(ev.candidate) });
         };
         pc.ontrack = (ev) => {
+            if (ev.track.kind === "audio" && ev.transceiver && ev.transceiver.mid != null &&
+                ev.transceiver.mid === boardMid(pc)) {
+                entry.board.addTrack(ev.track);
+                ui.onBoard(user, entry.board);
+                return;
+            }
             entry.stream.addTrack(ev.track);
             // A track that is muted is a camera that is off, not a camera that is missing.
             // Without these the tile shows a frozen last frame forever.
@@ -144,6 +204,58 @@ const CairnCall = (() => {
             }
         };
         return entry;
+    }
+
+    // "Always use the relay" is `iceTransportPolicy: "relay"`: the browser gathers relay
+    // candidates only, so no host or server-reflexive address — the two that reveal where
+    // this device is — is ever offered to a peer. Without a relay configured that means no
+    // candidates at all, which is why `join` refuses rather than letting the call hang.
+    function rtcConfig() {
+        return {
+            iceServers: (config && config.ice_servers) || [],
+            iceTransportPolicy: prefs.relayOnly ? "relay" : "all",
+        };
+    }
+
+    // ---- mute state, peer to peer -----------------------------------------
+
+    function openStateChannel(user, entry) {
+        if (typeof entry.pc.createDataChannel !== "function") return;
+        let channel;
+        try {
+            channel = entry.pc.createDataChannel("cairn-state", { negotiated: true, id: 0, ordered: true });
+        } catch (_) { return; }
+        entry.channel = channel;
+        channel.onopen = () => sendState(entry);
+        channel.onmessage = (ev) => {
+            // A peer's own client wrote this, so it is checked rather than trusted: two
+            // booleans, nothing else, and never a claim about *who* is muted — that is the
+            // connection's to say.
+            const raw = String(ev.data);
+            if (raw.length > 256) return;
+            let state;
+            try { state = JSON.parse(raw); } catch (_) { return; }
+            if (!state || typeof state !== "object") return;
+            ui.onPeerState(user, { muted: state.muted === true, deafened: state.deafened === true });
+        };
+    }
+
+    const ownState = () => ({ muted: mic.muted || mic.deafened, deafened: mic.deafened });
+
+    function sendState(entry) {
+        const ch = entry.channel;
+        if (!ch || ch.readyState !== "open") return;
+        try { ch.send(JSON.stringify(ownState())); } catch (_) { /* closing */ }
+    }
+
+    function broadcastState() {
+        for (const entry of peers.values()) sendState(entry);
+    }
+
+    // The one place the microphone is opened or closed.
+    function applyMic() {
+        const open = !mic.muted && !mic.deafened && (!mic.ptt || mic.held);
+        if (local) local.getAudioTracks().forEach((t) => { t.enabled = open; });
     }
 
     async function offerTo(user) {
@@ -201,10 +313,16 @@ const CairnCall = (() => {
                 return;
             }
 
+            if (signal.kind === "decline") {
+                ui.onDecline(from);
+                return;
+            }
+
             if (signal.kind === "offer") {
                 const entry = peerFor(from);
                 await entry.pc.setRemoteDescription(JSON.parse(signal.payload));
                 await adoptVideoLine(entry);
+                await adoptBoardLine(entry);
                 await flush(entry);
                 await entry.pc.setLocalDescription(await entry.pc.createAnswer());
                 await send({
@@ -253,6 +371,34 @@ const CairnCall = (() => {
         if (video) await tx.sender.replaceTrack(video);
     }
 
+    // The soundboard's line, claimed the same way as the video line.
+    async function adoptBoardLine(entry) {
+        if (entry.boardSender) return;
+        const mid = boardMid(entry.pc);
+        const tx = mid == null ? null : entry.pc.getTransceivers().find((t) => t.mid === mid);
+        if (!tx) return;
+        tx.direction = "sendrecv";
+        entry.boardSender = tx.sender;
+        if (board) await tx.sender.replaceTrack(board.track);
+    }
+
+    // The mid of the second audio m-line in the negotiated session, which is the soundboard
+    // by construction (see the top of this file). Null before there is one.
+    function boardMid(pc) {
+        const desc = pc.remoteDescription || pc.localDescription;
+        if (!desc || !desc.sdp) return null;
+        let audio = 0;
+        for (const section of desc.sdp.split(/\r?\nm=/).slice(1)) {
+            if (!section.startsWith("audio")) continue;
+            audio += 1;
+            if (audio === 2) {
+                const m = section.match(/\r?\na=mid:(\S+)/);
+                return m ? m[1] : null;
+            }
+        }
+        return null;
+    }
+
     async function flush(entry) {
         while (entry.pending.length) {
             try { await entry.pc.addIceCandidate(entry.pending.shift()); } catch (_) { /* stale */ }
@@ -265,12 +411,21 @@ const CairnCall = (() => {
         try { entry.pc.close(); } catch (_) {}
         peers.delete(user);
         ui.onPeer(user, null);
+        ui.onBoard(user, null);
     }
 
     // ---- lifecycle ---------------------------------------------------------
 
     async function join({ video, myUser }) {
         await loadConfig();
+        // Refused before the microphone opens. With relay-only on and no relay, the browser
+        // gathers no candidate at all, and the call would sit at "connecting" for ever.
+        if (prefs.relayOnly && !config.has_relay) {
+            throw new Error(
+                "“Always use the relay” is on, but this instance runs no relay, so a call " +
+                "cannot connect. Turn it off in Settings → Voice & video to call directly."
+            );
+        }
         me = myUser;
         local = await navigator.mediaDevices.getUserMedia({
             audio: micConstraint(),
@@ -284,6 +439,7 @@ const CairnCall = (() => {
             stopTracks();
             throw e;
         }
+        applyMic();
         return { callId, local, config };
     }
 
@@ -297,7 +453,14 @@ const CairnCall = (() => {
         ui.onEnd();
     }
 
+    function resetMic() {
+        mic.muted = false;
+        mic.deafened = false;
+        mic.held = false;
+    }
+
     function stopTracks() {
+        closeBoard();
         for (const s of [local, screen]) if (s) s.getTracks().forEach((t) => t.stop());
         local = null;
         screen = null;
@@ -306,10 +469,46 @@ const CairnCall = (() => {
     // ---- in-call controls --------------------------------------------------
 
     // Muting is `enabled = false`, not stopping the track: stopping it would tear down the
-    // negotiated media line and need a renegotiation to come back. The remote sees the
-    // track go muted, which is what a mute indicator should be driven by.
+    // negotiated media line and need a renegotiation to come back. A disabled track sends
+    // silence, which a remote cannot tell from a quiet room — so the state also goes to every
+    // peer over the data channel, which is what their mute indicator shows.
     function setMuted(muted) {
-        if (local) local.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+        mic.muted = !!muted;
+        applyMic();
+        broadcastState();
+    }
+
+    // Deafened is muted as well, as in every product people know it from: hearing nobody
+    // while still transmitting is a hot mic nobody meant to leave on. Silencing what this
+    // device *plays* is callaudio.js's; this side closes the microphone and tells peers.
+    function setDeafened(deafened) {
+        mic.deafened = !!deafened;
+        applyMic();
+        broadcastState();
+    }
+
+    // Push-to-talk gates the microphone on a held key. Not signalled to peers: the speaking
+    // ring already shows when someone talks.
+    function setPushToTalk(on) {
+        mic.ptt = !!on;
+        mic.held = false;
+        applyMic();
+    }
+
+    function setTalking(held) {
+        mic.held = !!held;
+        applyMic();
+    }
+
+    // New values apply to the next call; a running one recaptures the microphone so the
+    // processing switches take effect at once. The relay choice cannot be changed under a
+    // live connection without restarting ICE, so it waits for the next call, and says so.
+    async function setPrefs(next) {
+        const before = { ...prefs };
+        for (const k of Object.keys(prefs)) if (k in next) prefs[k] = !!next[k];
+        const processing = ["noiseSuppression", "echoCancellation", "autoGainControl"];
+        if (local && processing.some((k) => before[k] !== prefs[k])) await useMicrophone(wanted.mic);
+        return { relayChangedMidCall: !!callId && before.relayOnly !== prefs.relayOnly };
     }
 
     // Every peer's video sender at once. `replaceTrack(null)` genuinely stops sending
@@ -369,6 +568,7 @@ const CairnCall = (() => {
         }
         local.getAudioTracks().forEach((t) => { t.stop(); local.removeTrack(t); });
         local.addTrack(track);
+        applyMic();
     }
 
     async function useCamera(deviceId) {
@@ -386,12 +586,62 @@ const CairnCall = (() => {
 
     const shortId = (id) => String(id).replace(/^usr_/, "").slice(0, 8);
 
+    // ---- soundboard hook ---------------------------------------------------
+    //
+    // soundboard.js's only way in. A clip plays on this device's **soundboard line**, not in
+    // the microphone (see the top of this file), so each listener can turn it down apart from
+    // the voice. There is still no "play X" message: the clip is audio on a peer-to-peer track.
+    //
+    // The source is built on first use and lives until the call ends; from then on every
+    // peer's soundboard sender carries it, silent between clips.
+    let board = null;          // { ctx, dest, track }
+
+    function outgoingAudio() {
+        return (local && local.getAudioTracks()[0]) || null;
+    }
+
+    async function playClip(buffer, { gain = 1, maxSeconds = 5 } = {}) {
+        if (!local || !callId) throw new Error("not in a call");
+        const mic = local.getAudioTracks()[0];
+        if (!mic || !mic.enabled) throw new Error("unmute to play a sound");
+        if (!board) {
+            const ctx = new AudioContext();
+            const dest = ctx.createMediaStreamDestination();
+            board = { ctx, dest, track: dest.stream.getAudioTracks()[0] };
+            for (const entry of peers.values()) {
+                if (entry.boardSender) await entry.boardSender.replaceTrack(board.track);
+            }
+        }
+        if (board.ctx.state === "suspended") await board.ctx.resume();
+        const clip = board.ctx.createBufferSource();
+        clip.buffer = buffer;
+        const level = board.ctx.createGain();
+        level.gain.value = Math.max(0, Math.min(1, gain));
+        clip.connect(level).connect(board.dest);
+        // Cut at the limit whatever the file claims: the one length check a sender cannot
+        // talk around, since it runs here, on the device doing the playing.
+        clip.start();
+        clip.stop(board.ctx.currentTime + Math.min(buffer.duration, maxSeconds));
+        return clip;
+    }
+
+    function closeBoard() {
+        if (!board) return;
+        try { board.ctx.close(); } catch (_) {}
+        board = null;
+    }
+
     return {
-        loadConfig, devices, join, leave, handle,
-        setMuted, setCameraOn,
+        loadConfig, devices, join, leave, handle, resetMic,
+        setMuted, setDeafened, setPushToTalk, setTalking, setPrefs, setCameraOn,
         startScreenShare, stopScreenShare,
         useMicrophone, useCamera, useSpeaker, applySpeaker, canChooseSpeaker,
+        playClip,
         get callId() { return callId; },
+        get local() { return local; },
+        get transmitting() { return !!local && local.getAudioTracks().some((t) => t.enabled); },
+        get prefs() { return { ...prefs }; },
+        get config() { return config; },
         get peerCount() { return peers.size; },
         bind(handlers) { ui = { ...ui, ...handlers }; },
     };

@@ -155,7 +155,20 @@ protects against, which is a smaller set than a reader would otherwise assume.
 
 **A call may be transport-only inside an E2EE room.** The refusal-rather-than-downgrade rule
 was dropped (`12-realtime-media.md` §5). A call now carries its own badge and announces a
-fallback to every participant. Room messages are unaffected.
+fallback to every participant. Room messages are unaffected. In a voice channel the fallback
+is triggered only by a participant's announcement inside the room's encryption, so the
+instance cannot cause one ([ADR-012](adr/012-sfu-voice-channels.md) §4).
+
+**Voice channels put the instance in the media path.** They run through an SFU the instance
+operates. In an E2EE room the audio is sealed end to end and the SFU forwards ciphertext, but
+it necessarily sees **who is connected, from which IP address, from when to when, and the
+size and timing of each person's packets — which shows who is speaking and when, and when
+each person plays a soundboard clip (clips travel on a track of their own)**, plus the
+SDP offer and each frame's key epoch and sender leaf. The roster of who is in a channel is
+the instance's word; a device not in the room's encrypted group is marked, but nothing proves
+who is listening. A member removed from the room is dropped by the SFU at once, but until the
+removal commit is processed the keys they hold still open frames sealed under them. Calls
+somebody rings are still the peer-to-peer mesh, which the instance never carries.
 
 ## 4. The malicious server operator (A4)
 
@@ -180,6 +193,15 @@ holds.
 - **Deny service, drop, delay, or reorder messages.** Fully available to the server, and
   not preventable. Detectable via transcript integrity.
 - **Harvest all metadata.** See §3.1.
+- **Fabricate roles and moderators.** A space's roles, who holds them, and every permission
+  they confer are held and enforced by the instance on its own say-so
+  ([ADR-011](adr/011-spaces-channels-roles.md)). A malicious instance can make anyone a
+  moderator or an owner, invent roles, report a fabricated hierarchy to every client, and
+  honour or refuse any request regardless of the rules; no client can detect it. What it
+  cannot do with a fabricated role is read an end-to-end encrypted channel: the MLS group
+  gains a member only when an existing member's client commits the Add, as an explicit
+  action. **This stays true by the owner's decision until the M5 external review**, where
+  carrying roles inside the MLS group is on the agenda (`10-roadmap.md`).
 - **Serve backdoored client code** to web clients. This is why native and
   reproducibly-built clients matter, and why a web client's guarantees are weaker. Say so
   in the UI.
@@ -264,6 +286,20 @@ none could never be moderated again.
 What this class still permits: a removed account can be re-added by any moderator, and
 there is no instance-wide ban. Removal is a room-scoped action, not a platform one, until
 policy lists exist.
+
+**Spaces** ([ADR-011](adr/011-spaces-channels-roles.md)) put channels — each a room with its
+own sealed tier — under roles with permission bits and per-channel overrides. Against *other
+users* the rules are enforced by the instance in one access check, and were attacked before
+being trusted: a non-member reading a channel, a member creating a channel or handing out a
+role without the permission, escalation to or past one's own rank, a kicked member keeping
+access, and a channel's tier being changed. All were refused, in-process and over HTTP. A kick
+also bars rejoining by invite until lifted, because without the bar any live link undid it.
+
+Two limits, stated rather than implied. **Roles are instance-held metadata**, so against the
+instance itself (§4) they are worth nothing. And **a kick removes access, not keys**: a kicked
+device still holds each encrypted channel's group state until a member commits its removal
+(`remove_departed`, an explicit action), so until then the kick holds against everyone except
+the instance, which is the only party holding the ciphertext.
 
 ## 5. The malicious group member (A6)
 

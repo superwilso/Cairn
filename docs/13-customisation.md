@@ -1,8 +1,9 @@
 # Customisation, and why most of Nitro is free here
 
 **Status:** Design. **Profiles are built** (§1a, [ADR-010](adr/010-encrypted-profiles.md)),
-and §4's themes and §5's protection are built in the desktop client
-(`clients/desktop/ui/settings.js`); custom emoji, plugins and the rest are not.
+**custom emoji, stickers and the soundboard are built** (§3a) and §4's themes and §5's
+protection are built in the desktop client (`clients/desktop/ui/settings.js`); a user's
+personal emoji, plugins and the rest are not.
 
 The question this answers: can Cairn match Discord's customisation, and give away what Nitro
 charges for? Mostly yes — and the reason is not generosity. **Most of Nitro is artificial
@@ -119,6 +120,93 @@ Consequences worth stating before anyone builds it:
   since DMs are the tier where the claim is strongest.
 - Attachments are the prerequisite either way, so this sits behind
   [ADR-007](adr/007-server-storage.md)'s successor work.
+
+## 3a. As built: room emoji, stickers and soundboard
+
+The fix above, implemented (`cairn_client_core::custom`, `session/custom.rs`; desktop
+`emoji.js`, `customise.js`, `soundboard.js`).
+
+- **A room's set is one record inside the MLS-encrypted stream**, like a profile. Each image
+  or clip is an encrypted attachment in the room's blob store under its own single-use key,
+  the key inside the record. The instance stores ciphertext and relays ciphertext; it never
+  sees a name, a type or an image (`the_instance_stores_no_emoji_name_or_image_in_plaintext`).
+- **Fetched whole, when it changes.** A device that accepts a new set downloads every asset
+  it lacks at once, used or not. Drawing a custom emoji, a reaction, a sticker or the picker
+  reads the local cache by the id the set gave it; that path has no network call in it
+  (`drawing_a_custom_emoji_makes_no_request`, through a request-counting proxy; the browser
+  test counts one read per image however many messages use it). An emoji not yet downloaded
+  is shown as its `:name:`, never fetched on demand.
+- **Messages refer by name.** `:party_parrot:` in text is ordinary text, encrypted like the
+  rest. A reaction may be `:name:` — the only ASCII reaction allowed — and one outside the
+  room's set is drawn as a placeholder, not words. A sticker is a message whose franked body
+  is `:name:`, so it stays reportable and older clients show the name.
+- **Limits** — every member downloads all of it, so: 100 emoji at 256 KiB, 40 stickers at
+  512 KiB, 24 sounds at 512 KiB and five seconds, 16 MiB for the whole set. PNG, GIF and WebP
+  images; Ogg/Opus, MP3 and WAV clips. Names are `[a-z0-9_]`, 2–32 characters, so a name
+  cannot be a lookalike. Types are sniffed from the bytes, before upload and again after
+  every download. Clip length is measured by Rust for WAV and Ogg and by the uploading UI for
+  MP3, and every client stops a clip at five seconds whatever the file says.
+- **Who may change it.** Only an account the **instance's member list** names as `owner` or
+  `moderator`; every recipient checks the envelope's sender (already verified against the
+  group's roster) against that list, because the instance cannot read the set to refuse it.
+  Roles are read when a room opens and then every ten seconds, never because a set arrived —
+  a request triggered by a set would mark which message was one. A set from a sender not yet
+  known to be permitted is held until the next read of roles and then applied or dropped,
+  so a set a plain member sent cannot come into force later on an unrelated promotion. The
+  probe: a member whose client was told (by a lying proxy) that it was the owner sent a set;
+  every other member ignored it (`a_plain_members_set_is_ignored_by_everyone_else`, which
+  fails with the check removed).
+- **A new member gets the set** from any owner or moderator device that holds it, re-sent
+  after the commit that added them — the uploaded blobs are reused, not uploaded again.
+
+What this costs, plainly:
+
+- **Roles are the instance's word.** They are instance state, not part of the encrypted
+  group, so **a malicious instance (A4) can let a member of its choosing change a room's
+  set**, by listing them as a moderator. It cannot write a set itself, read one, or learn a
+  name. Binding roles into the group is a `cairn-crypto` change, left for the owner.
+- **A demotion takes up to ten seconds** to reach a device with the room open, during which
+  a set from the demoted account is still accepted.
+- **The instance learns that the set changed** — a message, uploads, and every member
+  downloading those blobs shortly after. Not what changed, and nothing when one is used.
+- **A room with no owner or moderator online** cannot give a new member its set until one
+  opens the room. Members cannot pass it on, because the record names no author they could
+  vouch for.
+- **A user's personal emoji in a DM** (the third consequence above) is not built.
+
+### The soundboard
+
+A clip goes out on **its own audio track**, separate from the microphone, and plays locally
+at the same level. In a rung call that is a second audio line per peer, negotiated up front
+beside the empty video line (`CairnCall.playClip`); in a voice channel it is a second track
+to the SFU (`CairnVoiceChannel.playClip`), sealed end to end like the voice and marked as a
+clip by a flag *inside* the seal. There is no "play X" message. Muting still mutes, and a
+muted participant cannot play a clip. (Decided by the owner over the earlier design, which
+mixed clips into the microphone.)
+
+**What each listener controls, on their own device only:** a per-person soundboard volume and
+"mute their soundboard" in the same popover as that person's voice volume, and **"Mute
+everyone's soundboard clips"** in Settings → Voice & video. None of it is sent anywhere; the
+person is not told. The slider in the soundboard panel is the sender's: how loud their clips
+go out. A listener knows which incoming track is a soundboard from the call's own structure —
+the second audio line in the mesh, the sealed flag in an end-to-end voice channel — so in an
+E2EE voice channel the SFU cannot pass a voice off as a clip or the reverse.
+
+**What this costs: whoever carries the media can tell when a clip is playing.** The clip's
+track is silent between clips and carries audio while one plays, so its packet activity and
+timing show each moment someone presses a soundboard button — and for how long. In a voice
+channel that is **the instance's SFU**, for every participant; in a rung call it is only
+the other participants' devices, plus the operator's TURN relay when a call goes through
+one. What they cannot tell, in an end-to-end call, is *which* clip: the audio is sealed like
+the voice. Under the earlier mixed design the instance learned nothing it did not already
+see from the voice.
+
+Tested between two real browsers (`soundboard.browser.test.js`): the clip arrives on the
+soundboard track and not in the voice; muting the sender's soundboard silences what the
+listener's device plays for it while the sender's voice keeps arriving; "mute everyone's"
+does the same; no signal is sent. And through the real SFU (`voicechannel.browser.test.js`):
+every soundboard frame the SFU held was sealed, opens under the sender's key in Rust, and
+carries the clip flag; muting it leaves the voice slot playing.
 
 ## 4. Themes yes, plugins are a different question
 

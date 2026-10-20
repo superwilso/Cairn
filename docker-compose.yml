@@ -32,6 +32,13 @@ services:
       # ("GIF search") before uncommenting.
       # CAIRN_KLIPY_API_KEY: ${CAIRN_KLIPY_API_KEY:-}
       # CAIRN_GIPHY_API_KEY: ${CAIRN_GIPHY_API_KEY:-}
+      # A TURN relay for calls, off unless both are set (see the commented `coturn` service
+      # below and docs/11-self-hosting.md, "A TURN relay for calls"). Relayed media crosses
+      # *your* connection, and the relay sees the IP address of everyone it relays. The
+      # instance hands short-lived credentials only to members of the room a call is in.
+      # CAIRN_TURN_URLS: stun:${CAIRN_DOMAIN}:3478,turn:${CAIRN_DOMAIN}:3478
+      # CAIRN_TURN_SECRET: ${CAIRN_TURN_SECRET:?set CAIRN_TURN_SECRET in .env, e.g. openssl rand -hex 32}
+      # CAIRN_TURN_TTL_SECS: "14400"
       RUST_LOG: ${RUST_LOG:-info}
     networks:
       - internal
@@ -62,6 +69,33 @@ services:
         ipv4_address: 172.30.0.2
     depends_on:
       - cairn
+
+  # The optional TURN relay. Uncomment together with the CAIRN_TURN_* lines above.
+  #
+  # Host networking, because a relay allocates a UDP port per call leg and publishing a
+  # range of them through Docker's proxy is slow and fragile. That makes this the one
+  # service on the host's network, so the denied-peer-ip lines matter: without them a
+  # member could relay traffic into your LAN or to this machine's own services.
+  #
+  # coturn:
+  #   image: coturn/coturn:4.6
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   command:
+  #     - --use-auth-secret
+  #     - --static-auth-secret=${CAIRN_TURN_SECRET}
+  #     - --realm=${CAIRN_DOMAIN}
+  #     - --listening-port=3478
+  #     - --min-port=49160
+  #     - --max-port=49200
+  #     - --no-cli
+  #     - --no-multicast-peers
+  #     - --denied-peer-ip=10.0.0.0-10.255.255.255
+  #     - --denied-peer-ip=172.16.0.0-172.31.255.255
+  #     - --denied-peer-ip=192.168.0.0-192.168.255.255
+  #     - --denied-peer-ip=127.0.0.0-127.255.255.255
+  #     - --user-quota=12
+  #     - --total-quota=1200
 
 networks:
   internal:

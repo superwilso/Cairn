@@ -26,3 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+# Voice media frames (`media`). AES-GCM rather than ChaCha20 because the frames are sealed by
+# WebCrypto in the webview, which has no ChaCha20. Already in the lock file, under
+# `mls-rs-crypto-rustcrypto`.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }

@@ -76,7 +76,28 @@ pub enum SignalKind {
     Answer,
     /// A single ICE candidate. There are many per connection and they arrive over time.
     Ice,
+    /// "I am not answering." Sent by someone who was rung and said no, addressed to whoever
+    /// rang them, so a caller in a DM sees "declined" instead of ringing into silence.
+    ///
+    /// It goes through the room like every other signal: the instance learns that a message
+    /// went from one member to the room, and not what it said.
+    Decline,
+    /// "In this room's voice channel, my media is `payload`": [`VOICE_E2EE`] or
+    /// [`VOICE_TRANSPORT_ONLY`]. Not part of a rung call — `call` is [`VOICE_CHANNEL`].
+    ///
+    /// **This is how a voice channel falls back**, per `docs/12-realtime-media.md` §5, and it
+    /// rides the room's MLS encryption for a reason: the instance cannot forge it. A
+    /// downgrade the instance could trigger would be a downgrade the instance could use to
+    /// hear the call. See `docs/adr/012-sfu-voice-channels.md` §4.
+    VoiceMedia,
 }
+
+/// The `call` field of a [`SignalKind::VoiceMedia`] signal. A room has one voice channel.
+pub const VOICE_CHANNEL: &str = "voice";
+/// The device seals its frames end to end.
+pub const VOICE_E2EE: &str = "e2ee";
+/// The device's webview cannot transform frames, so it sends and needs plaintext media.
+pub const VOICE_TRANSPORT_ONLY: &str = "transport_only";
 
 /// Where the client should look for its NAT-traversal helpers.
 ///
@@ -100,13 +121,63 @@ pub enum SignalKind {
 /// the media flows directly between them. That is inherent to peer-to-peer media, not a
 /// property of this default: routing through a TURN relay is the only thing that hides it,
 /// and that costs an operator bandwidth. See `docs/12-realtime-media.md` §6.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IceServer {
     pub urls: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+}
+
+// The credential is a relay password: short-lived, but usable by whoever holds it until it
+// expires, so it stays out of logs.
+impl std::fmt::Debug for IceServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IceServer")
+            .field("urls", &self.urls)
+            .field("username", &self.username)
+            .field("credential", &self.credential.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Everything the WebRTC layer needs before it builds a peer connection, for one call.
+///
+/// Sent to the frontend as data so the servers, and the honest caveats, come from here
+/// rather than being baked into JavaScript.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CallConfig {
+    pub ice_servers: Vec<IceServer>,
+    /// False on STUN alone. The UI says so: without a relay a minority of users behind
+    /// symmetric NATs will find calls simply do not connect, and "it is your network" is
+    /// not something a client should leave them to work out themselves. It also decides
+    /// whether "always use the relay" can connect anything at all.
+    pub has_relay: bool,
+    pub max_participants: usize,
+    /// Whether the open room is a two-person direct conversation. A declined or unanswered
+    /// call there ends, the way a phone call does; in a group it stays open for whoever
+    /// joins next.
+    pub direct: bool,
+}
+
+/// The servers a call uses, given what the instance offered.
+///
+/// The instance's own servers come first. The public STUN default is added **only if the
+/// instance offered no STUN of its own**: an operator who runs coturn and lists its `stun:`
+/// URL has calls that never touch a third party, which is the point of self-hosting it. An
+/// operator who listed only `turn:` still gets direct connections where they work, at the
+/// cost of the disclosure [`default_ice_servers`] describes.
+pub fn ice_servers_with(instance: Vec<IceServer>) -> Vec<IceServer> {
+    let has_stun = instance.iter().flat_map(|s| &s.urls).any(|u| {
+        let u = u.to_ascii_lowercase();
+        u.starts_with("stun:") || u.starts_with("stuns:")
+    });
+    let mut servers = instance;
+    if !has_stun {
+        servers.extend(default_ice_servers());
+    }
+    servers
 }
 
 /// The ICE servers a call should use.
@@ -209,6 +280,45 @@ mod tests {
             credential: Some("p".into()),
         }];
         assert!(has_relay(&with_turn), "scheme matching must not be case-sensitive");
+    }
+
+    #[test]
+    fn an_instance_with_its_own_stun_never_sends_a_call_to_the_public_default() {
+        let own = vec![IceServer {
+            urls: vec!["stun:turn.example:3478".into(), "turn:turn.example:3478".into()],
+            username: Some("1:usr_x".into()),
+            credential: Some("c".into()),
+        }];
+        let servers = ice_servers_with(own.clone());
+        assert_eq!(servers, own, "the operator's own STUN replaces the third-party one");
+        assert!(has_relay(&servers));
+
+        // Counterfactual: a relay listed without STUN keeps the default, so direct paths
+        // are still found where they exist.
+        let relay_only = vec![IceServer { urls: vec!["turn:t.example".into()], ..own[0].clone() }];
+        let servers = ice_servers_with(relay_only);
+        assert!(servers.iter().any(|s| s.urls.iter().any(|u| u.contains("l.google.com"))));
+
+        // And no instance servers at all is exactly the default.
+        assert_eq!(ice_servers_with(Vec::new()), default_ice_servers());
+    }
+
+    #[test]
+    fn a_relay_password_is_not_printed() {
+        let server = IceServer {
+            urls: vec!["turn:t.example".into()],
+            username: Some("1:usr_x".into()),
+            credential: Some("hunter2-relay".into()),
+        };
+        assert!(!format!("{server:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn a_decline_round_trips_through_json() {
+        let decline = signal(SignalKind::Decline, Some("usr_caller"));
+        let encoded = serde_json::to_string(&decline).unwrap();
+        assert!(encoded.contains(r#""decline""#), "{encoded}");
+        assert_eq!(serde_json::from_str::<CallSignal>(&encoded).unwrap(), decline);
     }
 
     #[test]

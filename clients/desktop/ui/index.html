@@ -12,6 +12,11 @@
 <link rel="stylesheet" href="profile.css">
 <link rel="stylesheet" href="linkcards.css">
 <link rel="stylesheet" href="settings.css">
+<link rel="stylesheet" href="calls.css">
+<link rel="stylesheet" href="voicechannel.css">
+<link rel="stylesheet" href="emoji.css">
+<link rel="stylesheet" href="soundboard.css">
+<link rel="stylesheet" href="spaces.css">
 <!-- In <head> on purpose: applies the saved theme before first paint. -->
 <script src="settings.js"></script>
 </head>
@@ -70,6 +75,21 @@
     <symbol id="i-reply" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M9.5 6.5 4 12l5.5 5.5M4.5 12H14a6 6 0 0 1 6 6v.5"/>
     </symbol>
+    <symbol id="i-headphones" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3.5" y="14" width="4.5" height="6.5" rx="1.6"/><rect x="16" y="14" width="4.5" height="6.5" rx="1.6"/>
+    </symbol>
+    <symbol id="i-deaf" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M4 15v-3a8 8 0 0 1 13.4-5.9M20 12v3"/><rect x="3.5" y="14" width="4.5" height="6.5" rx="1.6"/><path d="M16 17.5v1.4c0 .9.7 1.6 1.6 1.6h1.3c.9 0 1.6-.7 1.6-1.6V16M3 3l18 18"/>
+    </symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>
+    </symbol>
+    <symbol id="i-volume-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/>
+    </symbol>
+    <symbol id="i-sound" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 9.5h3l5-4v13l-5-4H4zM16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/>
+    </symbol>
     <symbol id="i-call" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <path d="M4.5 4.5h3l1.5 4-2 1.5a12 12 0 0 0 5.5 5.5l1.5-2 4 1.5v3a2 2 0 0 1-2.2 2A15.5 15.5 0 0 1 2.5 6.7 2 2 0 0 1 4.5 4.5Z"/>
     </symbol>
@@ -104,6 +124,18 @@
 </div>
 
 <div id="app" hidden>
+  <!-- Spaces. Home is DMs and groups; each waymark below it is a space. What a space lets
+       you do is the instance's decision, handed over by Rust — spaces.js only draws it. -->
+  <nav id="space-rail" aria-label="Spaces">
+    <button id="rail-home" class="rail-btn active" title="Direct messages and groups" aria-label="Home">
+      <svg aria-hidden="true"><use href="#i-cairn"/></svg>
+    </button>
+    <span class="rail-sep" aria-hidden="true"></span>
+    <ul id="space-list"></ul>
+    <button id="new-space" class="rail-btn add" title="Create a space" aria-label="Create a space">+</button>
+    <button id="join-space" class="rail-btn add" title="Join a space with an invite" aria-label="Join a space">&#8618;</button>
+  </nav>
+
   <aside>
     <div class="mast">
       <svg class="stones" aria-hidden="true"><use href="#i-cairn"/></svg>
@@ -119,16 +151,59 @@
            say so rather than imply a protection that is not there. -->
       <span id="transport" class="badge"></span>
     </div>
-    <div class="actions">
-      <button id="new-group">New group</button>
-      <button id="new-direct">New DM</button>
+    <form id="space-create" class="rail-form" hidden>
+      <input id="space-create-name" placeholder="Space name" spellcheck="false" autocomplete="off" maxlength="100">
+      <button type="submit" class="primary">Create</button>
+    </form>
+    <form id="space-join" class="rail-form" hidden>
+      <input id="space-join-token" placeholder="space invite token" spellcheck="false" autocomplete="off">
+      <button type="submit">Join</button>
+    </form>
+
+    <div id="home-pane">
+      <div class="actions">
+        <button id="new-group">New group</button>
+        <button id="new-direct">New DM</button>
+      </div>
+      <div class="actions">
+        <input id="invite-token" placeholder="invite token" spellcheck="false" autocomplete="off">
+        <button id="join">Join</button>
+      </div>
+      <h2 class="section">Rooms</h2>
+      <ul id="rooms"></ul>
     </div>
-    <div class="actions">
-      <input id="invite-token" placeholder="invite token" spellcheck="false" autocomplete="off">
-      <button id="join">Join</button>
+
+    <div id="space-pane" hidden>
+      <div class="space-head">
+        <span id="space-name"></span>
+        <button id="space-leave" class="ghost" title="Leave this space">Leave</button>
+      </div>
+      <!-- Filled from Rust: what the instance can see of a space is a threat-model claim. -->
+      <p id="space-note"></p>
+      <div class="actions">
+        <button id="new-channel">New channel</button>
+        <button id="space-invite">Invite</button>
+      </div>
+      <form id="channel-create" class="rail-form" hidden>
+        <input id="channel-create-name" placeholder="channel name" spellcheck="false" autocomplete="off" maxlength="100">
+        <button type="submit" class="primary">Create</button>
+      </form>
+      <h2 class="section">Channels</h2>
+      <ul id="channels"></ul>
     </div>
-    <h2 class="section">Rooms</h2>
-    <ul id="rooms"></ul>
+    <!-- The open room's voice channel: a call people drop into, through the instance's SFU.
+         Hidden when the instance runs none. Its badge is the call's, not the room's. -->
+    <section id="voice-channel" class="vc" hidden aria-label="Voice channel">
+      <h2 class="section">Voice <span id="vc-badge" class="badge"></span></h2>
+      <ul id="vc-people"></ul>
+      <p id="vc-note" class="note" role="status"></p>
+      <div class="vc-controls">
+        <button id="vc-join" class="primary">Join voice</button>
+        <button id="vc-mute" hidden aria-pressed="false">Mute</button>
+        <button id="vc-deafen" hidden aria-pressed="false">Deafen</button>
+        <button id="vc-leave" class="danger" hidden>Leave</button>
+      </div>
+    </section>
   </aside>
 
   <main>
@@ -144,6 +219,9 @@
         <select id="room-timer" aria-label="Disappearing messages"></select>
       </label>
       <button id="invite" class="ghost">Invite</button>
+      <!-- The room's emoji, stickers and sounds. Anyone can look; customise.js draws the
+           controls only for an owner or moderator, and every member's device checks. -->
+      <button id="customise-btn" class="ghost" title="Custom emoji, stickers and sounds">Customise</button>
       <button id="start-voice" class="icon" title="Voice call">
         <svg width="15" height="15"><use href="#i-call"/></svg> Voice
       </button>
@@ -158,25 +236,37 @@
 
     <!-- The ring. Somebody started a call in this room and this device has not joined it.
          Without this the only way in was for both people to press the button independently
-         and hope, which is not a call — it is a coincidence. -->
-    <div id="ringing" class="ringing" hidden>
-      <span class="pip"></span>
-      <span id="ringing-text" class="grow"></span>
-      <button id="accept-voice" class="icon">
-        <svg width="15" height="15"><use href="#i-call"/></svg> Join
-      </button>
-      <button id="accept-video" class="icon primary">
-        <svg width="15" height="15"><use href="#i-cam"/></svg> Join with video
-      </button>
-      <button id="decline" class="ghost">Dismiss</button>
+         and hope, which is not a call — it is a coincidence. Drawn by callui.js. -->
+    <div id="ringing" class="incoming" hidden role="alertdialog" aria-modal="true" aria-labelledby="ringing-name" aria-describedby="ringing-text">
+      <div class="incoming-card">
+        <span class="incoming-kicker">Incoming call</span>
+        <div class="incoming-face"><span id="ringing-avatar"></span></div>
+        <p id="ringing-name" class="incoming-name"></p>
+        <p id="ringing-text" class="incoming-text"></p>
+        <div class="incoming-actions">
+          <button id="decline" class="icon danger" title="Decline">
+            <svg width="16" height="16"><use href="#i-hangup"/></svg> Decline
+          </button>
+          <button id="accept-voice" class="icon" title="Accept with your microphone only">
+            <svg width="16" height="16"><use href="#i-call"/></svg> Voice
+          </button>
+          <button id="accept-video" class="icon primary" title="Accept with your camera on">
+            <svg width="16" height="16"><use href="#i-cam"/></svg> Video
+          </button>
+        </div>
+        <p id="ringing-note" class="incoming-note"></p>
+      </div>
     </div>
 
     <!-- Appears only during a call. Media is peer-to-peer: it never reaches the instance. -->
     <section id="stage" hidden>
       <div id="tiles" class="tiles"></div>
       <div class="callbar">
-        <button id="mute" class="icon" title="Mute (M)">
+        <button id="mute" class="icon" title="Mute (Ctrl+Shift+M)" aria-pressed="false">
           <svg width="15" height="15"><use href="#i-mic"/></svg> <span id="mute-text">Mute</span>
+        </button>
+        <button id="deafen" class="icon" title="Deafen: hear nobody, and mute (Ctrl+Shift+D)" aria-pressed="false">
+          <svg width="15" height="15"><use href="#i-headphones"/></svg> <span id="deafen-text">Deafen</span>
         </button>
         <button id="camera" class="icon" title="Camera">
           <svg width="15" height="15"><use href="#i-cam"/></svg> <span id="camera-text">Camera on</span>
@@ -184,7 +274,12 @@
         <button id="share" class="icon" title="Share a screen or window">
           <svg width="15" height="15"><use href="#i-screen"/></svg> <span id="share-text">Share screen</span>
         </button>
+        <button id="call-settings" class="icon ghost" title="Voice &amp; video settings" aria-label="Voice and video settings">
+          <svg width="15" height="15"><use href="#i-gear"/></svg>
+        </button>
+        <span id="ptt-hint" class="ptt-hint" hidden></span>
         <span class="grow"></span>
+        <span id="call-status" class="call-status" role="status"></span>
         <span id="elapsed" class="elapsed">00:00</span>
         <button id="hangup" class="icon danger" title="Leave the call">
           <svg width="15" height="15"><use href="#i-hangup"/></svg> Leave
@@ -198,6 +293,14 @@
     <div id="waiting" class="waiting" hidden>
       <span id="waiting-text"></span>
       <button id="admit" class="primary">Admit them</button>
+    </div>
+
+    <!-- The other half of a removal. The instance has stopped serving these accounts this
+         room, but their devices still hold its keys until a member commits their removal
+         from the encrypted group. Never automatic, for the same reason admitting is not. -->
+    <div id="departed" class="waiting" hidden>
+      <span id="departed-text"></span>
+      <button id="evict" class="primary">Remove from the group</button>
     </div>
 
     <ul id="timeline"></ul>
@@ -220,6 +323,9 @@
       <input id="file-input" type="file" multiple hidden>
       <button id="gif" type="button" class="icon" title="Send a GIF" aria-label="Send a GIF">GIF</button>
       <input id="text" placeholder="Message" autocomplete="off" spellcheck="false">
+      <button id="emoji" type="button" class="icon" title="Emoji and stickers" aria-label="Emoji and stickers">
+        <svg width="15" height="15"><use href="#i-react"/></svg>
+      </button>
       <button id="voice" type="button" class="icon" title="Hold to record a voice note, or click to start" aria-label="Record a voice note" aria-pressed="false">
         <svg width="15" height="15"><use href="#i-mic"/></svg>
       </button>
@@ -230,21 +336,12 @@
   </main>
 
   <section class="people">
+    <div id="space-people" hidden>
+      <h2 class="section">In this space</h2>
+      <ul id="space-members"></ul>
+    </div>
     <h2 class="section">Members</h2>
     <ul id="member-list"></ul>
-
-    <div class="devices">
-      <h2 class="section" style="margin-left: 0">Devices</h2>
-      <label for="dev-mic">Microphone</label>
-      <select id="dev-mic"></select>
-      <label for="dev-cam">Camera</label>
-      <select id="dev-cam"></select>
-      <label for="dev-out">Output</label>
-      <select id="dev-out"></select>
-      <p id="device-note" class="note">Device names appear after the first call.</p>
-      <p id="relay-note" class="note"></p>
-    </div>
-
   </section>
 </div>
 
@@ -294,16 +391,81 @@
       <label class="toggle"><input type="checkbox" id="pref-ig-proxy"> Use a proxy for Instagram</label>
       <p id="ig-proxy-note" class="note"></p>
     </div>
+<!-- Voice & video. Parked like the link-preview block above: settings.js moves it into the
+     panel, and app.js and callui.js bind these nodes on load, so moving them keeps the
+     bindings — and the device pickers keep the ids call.js and app.js already use. -->
+<div class="prefs voice-prefs" id="prefs-voice" hidden>
+  <div class="devices">
+    <div class="dev"><label for="dev-mic">Microphone</label><select id="dev-mic"></select></div>
+    <div class="dev"><label for="dev-cam">Camera</label><select id="dev-cam"></select></div>
+    <div class="dev"><label for="dev-out">Output</label><select id="dev-out"></select></div>
+    <p id="device-note" class="note">Device names appear after the first call.</p>
+  </div>
+
+  <fieldset class="sites">
+    <legend>Input mode</legend>
+    <label class="toggle"><input type="radio" name="pref-mode" value="vad" id="pref-mode-vad"> Voice activity — your microphone is open whenever you are not muted</label>
+    <label class="toggle"><input type="radio" name="pref-mode" value="ptt" id="pref-mode-ptt"> Push-to-talk — open only while you hold a key</label>
+    <div id="pref-ptt-row" class="ptt-row">
+      <span>Key</span>
+      <button type="button" id="pref-ptt-key" class="mono"></button>
+    </div>
+    <p class="note">Push-to-talk works only while the Cairn window is focused. Switch to another
+      app and your microphone stays closed until you come back — Cairn does not watch your
+      keyboard outside its own window.</p>
+  </fieldset>
+
+  <fieldset class="sites">
+    <legend>Microphone processing</legend>
+    <label class="toggle"><input type="checkbox" id="pref-ns"> Noise suppression</label>
+    <label class="toggle"><input type="checkbox" id="pref-ec"> Echo cancellation</label>
+    <label class="toggle"><input type="checkbox" id="pref-agc"> Automatic gain</label>
+    <p class="note">Done by the webview before anything is sent. Turn them off for a good
+      microphone that should sound like itself; without echo cancellation, use headphones or
+      the others will hear themselves.</p>
+  </fieldset>
+
+  <fieldset class="sites">
+    <legend>Calls</legend>
+    <label class="toggle"><input type="checkbox" id="pref-ring"> Ring sound for incoming calls</label>
+    <label class="toggle"><input type="checkbox" id="pref-sb-mute-all"> Mute everyone's soundboard clips (on this device only)</label>
+    <label class="toggle"><input type="checkbox" id="pref-vc-leave"> Leave a voice channel that stops being end-to-end encrypted</label>
+    <label class="toggle"><input type="checkbox" id="pref-relay-only"> Always use the relay (hide my IP address from other participants)</label>
+    <p id="relay-only-note" class="note"></p>
+    <p id="relay-note" class="note"></p>
+  </fieldset>
+</div>
 <div id="settings" class="sheet" hidden></div>
 
+<!-- One participant's volume, on this device only. Nobody else learns you turned them down. -->
+<div id="volume-pop" class="volume-pop" hidden role="dialog" aria-label="Participant volume">
+  <p class="volume-head"><span id="volume-who" class="grow"></span><output id="volume-out" class="mono">100%</output></p>
+  <input id="volume-range" type="range" min="0" max="200" step="5" value="100" aria-label="Volume">
+  <label class="toggle"><input type="checkbox" id="volume-mute"> Mute for me</label>
+  <p class="volume-head volume-sub"><span class="grow">Their soundboard</span><output id="board-out" class="mono">100%</output></p>
+  <input id="board-range" type="range" min="0" max="100" step="5" value="100" aria-label="Soundboard volume">
+  <label class="toggle"><input type="checkbox" id="board-mute"> Mute their soundboard</label>
+  <p class="note">Only on this device. They are not told.</p>
+  <button type="button" id="volume-reset" class="ghost">Reset</button>
+</div>
+
 <script src="call.js"></script>
+<script src="mediaframe.js"></script>
+<script src="voicechannel.js"></script>
+<script src="voicepanel.js"></script>
+<script src="callaudio.js"></script>
+<script src="callui.js"></script>
 <script src="attachments.js"></script>
 <script src="voice.js"></script>
 <script src="gifs.js"></script>
 <script src="timer.js"></script>
 <script src="linkcards.js"></script>
+<script src="emoji.js"></script>
+<script src="customise.js"></script>
+<script src="soundboard.js"></script>
 <script src="messages.js"></script>
 <script src="profile.js"></script>
+<script src="spaces.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

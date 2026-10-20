@@ -133,6 +133,95 @@ restricts outbound traffic, the instance needs `api.klipy.com`, `static.klipy.co
 (`crates/cairn-server/src/gif_relay.rs`) and is not configurable, because a configurable list
 is how a relay ends up reaching `localhost`.
 
+### A TURN relay for calls (optional, off by default)
+
+Calls carry media **directly between participants** ([`12-realtime-media.md`](12-realtime-media.md)
+§0); the instance never sees it. That costs you nothing, and it has two consequences members
+will notice: a call between two people behind some home routers (symmetric NAT, carrier-grade
+NAT) does not connect at all, and **every participant learns every other participant's IP
+address**. A TURN relay fixes both, and the price is yours: relayed media crosses your
+connection — a 1:1 video call is roughly 2–3 Mbps each way while it lasts.
+
+Cairn does not include a relay. Run [coturn](https://github.com/coturn/coturn) beside the
+instance with its REST-auth scheme (`use-auth-secret`), and give both the same secret:
+
+```bash
+CAIRN_TURN_URLS=stun:turn.example.org:3478,turn:turn.example.org:3478?transport=udp,turns:turn.example.org:5349
+CAIRN_TURN_SECRET=...      # at least 16 bytes; `openssl rand -hex 32`. coturn's static-auth-secret
+CAIRN_TURN_TTL_SECS=14400  # optional; how long each credential lasts (60–86400, default 4 hours)
+```
+
+and in `turnserver.conf`:
+
+```
+use-auth-secret
+static-auth-secret=<the same secret>
+realm=turn.example.org
+# Never relay into your own network: a relay is otherwise a door into it.
+no-multicast-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+# How many relay allocations one credential, and the whole relay, may hold at once.
+user-quota=12
+total-quota=1200
+```
+
+**What the instance does.** A member who joins a call asks the instance for credentials for
+*that room*; the instance answers only an authenticated member of it, with
+`HMAC-SHA1(secret, "<expiry>:<account id>")` — the scheme coturn checks without contacting
+the instance. Anyone else, including a request with no signature, gets a refusal that does not
+say whether a relay exists. Credentials are fresh on every call and expire after the TTL, which
+trades two things: a shorter TTL bounds how long a leaked credential lets a stranger spend your
+bandwidth, a longer one keeps a long call from losing its relay when coturn re-checks the
+credential. The account id in the username means your coturn logs say which account relayed
+when.
+
+**What it does not do.** Membership is a gate against strangers, not against your own members:
+any account can create a room and ask. Abuse by a member is bounded by coturn's quotas, not
+Cairn. And the relay operator — you — sees the IP address of everyone relayed through it, plus
+the size and timing of their media. It cannot read the media: DTLS-SRTP runs end to end between
+the participants, through the relay.
+
+If the URLs include a `stun:` entry, clients use it **instead of** the public STUN default,
+so a call never contacts a third party. If they list only `turn:`/`turns:`, clients keep the
+public default for discovering direct paths. Setting one of `CAIRN_TURN_URLS` and
+`CAIRN_TURN_SECRET` without the other stops the instance at startup.
+
+Members can then switch on **Settings → Voice & video → Always use the relay**, which hides
+their IP address from the other people in a call. The setting says what it costs: the relay —
+you — sees that address instead, and on an instance with no relay it means calls cannot
+connect.
+
+### 2a. Voice channels: the SFU (optional, off by default)
+
+Drop-in voice channels need a media server, and Cairn's is built in: set
+
+```
+CAIRN_SFU_BIND=0.0.0.0:3480            # a UDP port; open it in your firewall
+CAIRN_SFU_ADVERTISE=203.0.113.7:3480   # the public address clients send to (needed with 0.0.0.0)
+```
+
+and every room gets a voice channel. Without them there are none, and calls are the mesh only.
+[ADR-012](adr/012-sfu-voice-channels.md) is the design.
+
+**What it costs you.** All of a channel's audio crosses your connection: each speaker's
+stream goes in once and out to every other participant, so egress grows as N×(N−1) Opus
+streams — around 40 kbps each, so a full channel of 16 is roughly 10 Mbps out at worst, and
+an ordinary handful of people far less. A participant who has played a soundboard clip adds
+a second stream, nearly silent between clips. No video goes through it.
+
+**What it lets you see**, and your users are told the same: who is in which channel, from
+which IP address, and when; the size and timing of each person's packets, which shows who
+is speaking; and when each person plays a soundboard clip, which travels on a track of its own
+so listeners can mute clips apart from voices. In an end-to-end encrypted room you do **not** get the audio — frames are sealed
+on the device before they reach you — unless a participant's client cannot seal, in which case
+the call is badged transport-only for everyone and then you do.
+
+**What it does not do yet.** It is not behind TURN, so a client whose network blocks the UDP
+port cannot join a voice channel. Caddy does not proxy it; it is UDP straight to the instance.
+
 ## 3. Why TLS is not optional here
 
 The server terminates no TLS of its own, and `docker-compose.yml` deliberately gives it no
@@ -408,11 +497,14 @@ Honest list. Each of these is real and none is hypothetical.
   governs the local copy too, so an expired message is deleted from disk rather than merely
   hidden.
 - **Polling, not push.** The client fetches when you press enter.
-- **No voice, video, or screen sharing.** Designed, unbuilt, and behind the native clients
-  ([`12-realtime-media.md`](12-realtime-media.md)). Worth reading before you plan an
-  instance around it: a media server's egress scales with the square of the participant
-  count — five people on 720p video is roughly 30 Mbps out, sustained — so calls are the
-  point where a self-hosted instance stops being bandwidth-negligible.
+- **Calls you ring are a peer-to-peer mesh of at most six.** Voice, video and screen sharing
+  work in the desktop client, with media going directly between participants, so they cost
+  your instance nothing — unless you run the optional TURN relay (§2), whose traffic is yours.
+  **Voice channels** go through the SFU if you configure one (§2a): audio only, 16 people.
+  The designed media server ([`12-realtime-media.md`](12-realtime-media.md) §2–§4) is
+  unbuilt; worth reading before you plan an instance around it, because its egress scales
+  with the square of the participant count — five people on 720p video is roughly 30 Mbps
+  out, sustained.
 - **Client state lives in the user's data directory** — `~/.local/share/cairn/<name>` on
   Linux (honouring `XDG_DATA_HOME`), `~/Library/Application Support/cairn/<name>` on macOS,
   `%APPDATA%\cairn\<name>` on Windows. Override with `CAIRN_HOME`.

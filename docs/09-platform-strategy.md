@@ -69,9 +69,11 @@ Honest reporting of what has actually been verified, and where:
 The cross-platform claim is therefore checked rather than assumed: the same source tree
 builds and passes its tests on all three desktop platforms today, before any UI exists.
 
-**Minimum supported Rust version: 1.85.** This is a hard floor rather than a preference —
-the crypto dependency tree pulls in crates requiring `edition2024`, which stabilized in
-exactly that release. CI enforces it.
+**Minimum supported Rust version: 1.88.** This is a hard floor rather than a preference. It
+was 1.85 — the crypto tree needs `edition2024` — until the voice-channel SFU: str0m's tree
+depends on `time`, which needs 1.88 from 0.3.47, the release fixing RUSTSEC-2026-0009. The
+owner chose one floor for the whole workspace over exempting the SFU. CI enforces it on
+everything but the desktop app, whose system webview packages the MSRV runner lacks.
 
 CI (`.github/workflows/ci.yml`) builds and tests on Linux, Windows, and macOS so the
 cross-platform claim is continuously checked rather than assumed.

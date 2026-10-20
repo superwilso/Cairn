@@ -383,7 +383,8 @@ test("a voice call still negotiates a video line", async () => {
     await b.join({ video: false, myUser: "usr_b" });
     await room.settle();
 
-    assert.strictEqual(senders("usr_a").length, 2, "one audio sender and one empty video sender");
+    // The microphone, the empty video line, and the soundboard's own audio line (call.js).
+    assert.strictEqual(senders("usr_a").length, 3, "a microphone sender, an empty video sender and a soundboard sender");
 });
 
 test("the answering side does not pre-create the video line", async () => {

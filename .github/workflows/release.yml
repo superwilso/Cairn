@@ -110,6 +110,11 @@ jobs:
         # was run locally against this exact config, through to a finished bundle.
         run: cargo tauri build --bundles ${{ matrix.bundles }}
 
+      # The instance server ships beside the client, so someone trying Cairn on Windows can run
+      # their own instance without installing a Rust toolchain. Same workspace target dir.
+      - name: Build the instance server
+        run: cargo build --release -p cairn-server
+
       # The bundle lands in the *workspace* target directory at the repository root, not
       # under src-tauri — verified locally rather than assumed. The listing is deliberate:
       # if the layout ever moves, the log says where to.
@@ -122,6 +127,8 @@ jobs:
           find target/release/bundle -type f \
             \( -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' \) \
             -exec cp {} dist/ \;
+          if [ -f target/release/cairn-server.exe ]; then cp target/release/cairn-server.exe dist/; fi
+          if [ -f target/release/cairn-server ]; then cp target/release/cairn-server dist/; fi
           echo "--- to be published ---"
           ls -l dist
 
@@ -134,6 +141,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          # A hand-run build from a branch must tag the commit it built, not the default
+          # branch's head, or the release would claim code it does not contain.
+          target_commitish: ${{ github.sha }}
           name: Cairn ${{ github.event.inputs.tag || github.ref_name }}
           # Pre-alpha, and it says so where somebody will actually read it. Marking it
           # otherwise would be the first dishonest thing this project shipped.
@@ -145,52 +155,71 @@ jobs:
             ## Cairn desktop — pre-alpha
 
             **Not audited. Not reviewed. Do not use this for anything that matters yet.**
+            Built from a branch whose security-relevant changes are still waiting for the
+            owner's review; see the linked pull request.
+
+            ### Downloads
+
+            - `Cairn_*_x64-setup.exe` — the desktop client installer (or the `.msi`).
+            - `cairn-server.exe` — an instance server, so you can run your own without Rust.
+
+            Neither is code-signed, so Windows SmartScreen will warn you: **More info → Run
+            anyway**.
 
             ### What works
 
-            - **Group chats**, end-to-end encrypted with MLS (RFC 9420). A private group is
-              T2: the instance stores ciphertext it cannot read, and a bigger room is not a
-              weaker one — only public discoverability drops a room to a server-readable tier.
-            - **Invites**, of two kinds, and the sign-in card labels which is which. A
-              *registration* invite admits an account to the instance — most instances should
-              require one. A *room* invite carries an existing account into a room: redeeming
-              joins the room, and a member still has to **admit** them into the encrypted
-              group, so nothing is readable until somebody chooses to share it.
-            - **Voice and video calls**, peer-to-peer. Media never touches the instance, and
-              the SDP handshake travels inside the encrypted message body rather than beside
-              it — so the instance never sees your codecs, candidates or addresses.
-            - **Screen sharing**, and microphone / camera / output device selection.
+            - **Encrypted group chats** (MLS, RFC 9420): the instance stores ciphertext it cannot
+              read. Reactions, attachments, voice notes, disappearing messages. (Replies and
+              editing are not built yet.)
+            - **Spaces, channels and roles**: a space holds channels, each an ordinary room with
+              its own fixed tier; roles carry permissions under a strict rank rule, with
+              per-channel overrides. Roles are the instance's metadata — it sees them, and a
+              malicious instance could fabricate them (it still cannot read encrypted channels).
+            - **Calls**: ringing with accept/decline and missed-call notices, mute and deafen,
+              speaking indicator, push-to-talk (while the window is focused), per-person volume,
+              noise suppression / echo cancellation / gain toggles, screen sharing. Optional TURN
+              relay, opt-in, if your instance operator configures one.
+            - **Voice channels**: drop in and out of a room's voice channel, audio only, through
+              an SFU built into the instance. In an encrypted room the audio stays end-to-end
+              encrypted through it; if someone cannot do that, the call shows its own badge and
+              tells everyone. The SFU sees who is connected, when, and packet sizes and timing.
+            - **Profiles and customisation**: encrypted profiles, nicknames, themes, custom CSS.
+            - **Custom emoji, stickers and a soundboard** per room, as one encrypted set. Each
+              listener can turn one person's clips down, or everyone's off. Whoever carries the
+              audio can tell when a clip plays, not which.
+            - **Link previews** made by the sender (off by default, per-site opt-in) and **GIF
+              search** through the instance — needs the operator's KLIPY or GIPHY key.
 
-            ### What does not
+            ### What does not (yet)
 
-            - **Calls are a mesh, capped at 6 people.** Everyone sends their stream to
-              everyone else, so a larger call would saturate a domestic upload rather than
-              fail cleanly.
-            - **No TURN relay is configured.** Calls use STUN only, which cannot cross some
-              home networks. When that happens the client says so instead of leaving you to
-              blame your broadband.
-            - **A call shows every participant every other participant's IP address.** That
-              is what peer-to-peer media means. A relay is the only thing that changes it,
-              and a relay costs an operator bandwidth.
-            - **Windows only.** The client builds on Linux too, but calls cannot start there:
-              WebKitGTK denies the microphone permission, because the webview wrapper only
-              handles the clipboard one. No macOS build is produced yet.
+            - **Calls you ring are a mesh**: everyone sends to everyone, and each person sees
+              the others' IP addresses unless the relay is on. Voice channels use the SFU instead.
+            - **Voice channels are audio only**, with no TURN in front of the SFU, and you leave
+              the channel if you open another room.
+            - **Rings only reach the room you have open.**
+            - **Windows only.** No macOS build; on Linux, WebKitGTK denies the microphone.
             - **No key backup.** Losing the profile directory loses that device's history.
+            - Only exercised in Chromium-based test harnesses and WebView2 builds, never by a
+              person on two real machines. Expect rough edges and please report them.
 
-            ### Running it
+            ### Starting
 
-            You also need an instance to connect to, and both people must point at the same
-            one. For a local instance use `http://127.0.0.1:8080`:
+            1. Run your own instance. In PowerShell, in a folder where it may keep a `data`
+               directory:
 
-            ```bash
-            CAIRN_REGISTRATION_POLICY=invite_only CAIRN_INVITES=alice-7f3k9q2m4x8w,bob-2n6v1r5t9z3c \
-              cargo run -p cairn-server
-            ```
+               ```powershell
+               $env:CAIRN_REGISTRATION_POLICY = "invite_only"
+               $env:CAIRN_INVITES = "me-7f3k9q2m4x8w,friend-2n6v1r5t9z3c"
+               $env:CAIRN_SFU_BIND = "127.0.0.1:3480"   # voice channels; omit to turn them off
+               .\cairn-server.exe
+               ```
 
-            Hand each person one of those tokens for the **Invite code** field. Registration
-            is invite-only by default and should stay that way on anything reachable from the
-            internet.
-
-            Over plain `http://` the client shows a **plaintext** badge, and it means it:
-            message bodies are still end-to-end encrypted, but account ids, membership
-            changes and request timing are in the clear on the wire.
+               It listens on `127.0.0.1:8080`. For a friend on another machine, set
+               `$env:CAIRN_BIND = "0.0.0.0:8080"`, plus `$env:CAIRN_SFU_BIND = "0.0.0.0:3480"` and
+               `$env:CAIRN_SFU_ADVERTISE = "<your-ip>:3480"` for voice channels (UDP; allow it
+               through Windows Firewall), and give them your address — but over plain
+               `http://` account ids, membership and timing are visible on the network (message
+               bodies stay end-to-end encrypted). Put it behind TLS for anything real.
+            2. Install and open Cairn, enter `http://127.0.0.1:8080` as the instance, pick a
+               username, and paste one of the invite codes.
+            3. Your friend does the same with the other code, pointing at your instance.

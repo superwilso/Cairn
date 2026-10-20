@@ -53,9 +53,22 @@ pub use attachments::{
     kind_of, normalize_mime, safe_file_name, AttachmentKind, AttachmentView, PendingDownload,
     PendingUpload, UploadedAttachment, MAX_ATTACHMENT_BYTES, SEAL_OVERHEAD,
 };
+mod custom;
+pub use custom::{
+    custom_limits, CustomItemView, CustomLimits, CustomSetView, CustomSync, PendingCustomUpload,
+    UploadedCustom,
+};
 mod profiles;
+mod spaces;
+mod voice;
 pub use crate::profile::{ImageSlot, ImageView, ProfileView, StatusView};
 pub use profiles::{profile_limits, PendingProfileImage, ProfileEdit, ProfileLimits};
+pub use spaces::{
+    ChannelDisplay, OverrideDisplay, RoleDisplay, SpaceDisplay, SpaceListing, SpaceMemberDisplay,
+};
+pub use voice::{
+    VoiceJoined, VoiceKeyView, VoiceKeysView, VoiceParticipantView, VoiceProtection, VoiceStateView,
+};
 
 use crate::profile::{Label, ProfileError, ProfileStore, ProfileStoreError};
 use std::collections::HashMap;
@@ -122,6 +135,12 @@ pub enum SessionError {
     RoomChanged,
     #[error("link preview settings could not be saved: {0}")]
     Preferences(String),
+    #[error(transparent)]
+    Custom(#[from] crate::custom::CustomError),
+    #[error(transparent)]
+    CustomStore(#[from] crate::custom::CustomStoreError),
+    #[error("that emoji, sticker or sound is not in this room's set on this device")]
+    UnknownCustomAsset,
 }
 
 /// A room as a frontend needs to show it.
@@ -201,6 +220,10 @@ pub struct MessageView {
     /// ([`crate::embed::Card::view_for`]).
     #[serde(default)]
     pub card: Option<Box<crate::embed::CardView>>,
+    /// The room sticker this message is, by name. A frontend draws it from the room's set on
+    /// this device ([`Session::custom_asset`]) and shows `body` (`:name:`) if it has none.
+    #[serde(default)]
+    pub sticker: Option<String>,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -248,11 +271,25 @@ pub enum Event {
         from: String,
         signal: CallSignal,
     },
+    /// A device in the open room said, under the room's encryption, what its voice-channel
+    /// media is. Only sent when it changed what this device knew. A frontend re-reads
+    /// `voice_state` and, if the protection moved, tells its user — §5's announcement.
+    VoiceMedia {
+        user: String,
+        device: String,
+        e2ee: bool,
+    },
     /// Somebody's profile arrived, or the room's membership changed. Every profile in the
     /// room, not the one that changed: a new name can make two *other* members ambiguous, so
     /// a frontend redraws every label rather than keeping its own copy of that rule.
     Profiles {
         profiles: Vec<ProfileView>,
+    },
+    /// The room's custom emoji, stickers and sounds changed. A frontend fetches the new
+    /// assets with `prepare_custom_sync` straight away — all of them, used or not — and
+    /// redraws; see `crate::custom` for why it must not wait for first use.
+    Custom {
+        set: CustomSetView,
     },
 }
 
@@ -272,6 +309,11 @@ struct OpenRoom {
     listed: Vec<UserId>,
     /// What to call everyone, and who needs their id shown. See [`crate::profile::labels`].
     labels: HashMap<UserId, Label>,
+    /// The instance's roles for this room, as last read: who may change its custom set.
+    /// `None` until first read.
+    roles: Option<HashMap<UserId, String>>,
+    /// When `roles` was last read. On the timer's clock — never because a set arrived.
+    roles_checked_ms: i64,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -283,6 +325,15 @@ struct OpenRoom {
 /// the room stays open.
 const TIMER_RECHECK_MS: i64 = 10_000;
 
+/// A call this device is being rung for: which call, and who announced it.
+///
+/// Who is kept so a decline can be addressed to them — a decline broadcast to the room
+/// would tell every participant, rather than the person who rang.
+struct Ringing {
+    call: String,
+    from: String,
+}
+
 /// One signed-in client.
 pub struct Session {
     client: Client<HttpTransport>,
@@ -291,6 +342,8 @@ pub struct Session {
     contacts: ContactStore,
     history: History,
     profiles: ProfileStore,
+    /// Each room's custom emoji, stickers and sounds, and the cache they are drawn from.
+    custom: crate::custom::CustomStore,
     open: Option<OpenRoom>,
     dir: PathBuf,
     tls: bool,
@@ -306,7 +359,11 @@ pub struct Session {
     /// This is what makes a call *ring*. Without it the only way into a call was for both
     /// people to press the button independently and hope their minted ids reconciled —
     /// there was no way to be told a call had started at all.
-    ringing: Option<String>,
+    ringing: Option<Ringing>,
+    /// This device's seat in a voice channel, if it holds one. See `session::voice`.
+    voice: Option<voice::Seat>,
+    /// What each device in the open room has announced about its voice media.
+    voice_modes: voice::Modes,
     /// Attachments seen in the open room, with the keys that open them. Never handed to a
     /// frontend; see `attachments.rs` for why a frontend can only fetch what is in here.
     attachments: attachments::Known,
@@ -375,12 +432,15 @@ impl Session {
             contacts: ContactStore::open(&dir)?,
             history: History::open(&dir)?,
             profiles: ProfileStore::open(&dir)?,
+            custom: crate::custom::CustomStore::open(&dir)?,
             open: None,
             dir: dir.clone(),
             tls,
             call: None,
             negotiated: false,
             ringing: None,
+            voice: None,
+            voice_modes: HashMap::new(),
             attachments: attachments::Known::new(),
             timer_recheck_ms: TIMER_RECHECK_MS,
             gifs: None,
@@ -455,38 +515,51 @@ impl Session {
 
     fn create_room(&mut self, shape: RoomShape) -> Result<String, SessionError> {
         let created = self.client.create_room(shape)?;
+        self.start_group(created.room, created.seal)
+    }
+
+    /// Found the encrypted group for a room this device just created, and open it.
+    ///
+    /// Shared by rooms and channels: a channel is a room, and its group starts the same way —
+    /// with only this device in it, everyone else waiting to be admitted.
+    fn start_group(&mut self, room: RoomId, seal: RoomSeal) -> Result<String, SessionError> {
         let convo = Conversation::create_encrypted(
-            created.seal,
-            created.room,
+            seal,
+            room,
             self.client.user(),
             self.client.device(),
             self.mls.clone(),
         )?;
-        self.index.record(created.room, &created.seal, convo.group_id())?;
-        let cursor = self.index.cursor(&created.room);
+        self.index.record(room, &seal, convo.group_id())?;
+        let cursor = self.index.cursor(&room);
         // A room is created without a timer; nobody has had the chance to set one.
         let mut open = OpenRoom {
             convo,
-            seal: created.seal,
+            seal,
             cursor,
             ttl: None,
             ttl_checked_ms: now_ms(),
             thread: Thread::default(),
             listed: Vec::new(),
             labels: HashMap::new(),
+            roles: None,
+            roles_checked_ms: now_ms(),
         };
         self.relabel(&mut open);
+        self.refresh_roles(&mut open);
         self.open = Some(open);
         // Found by a probe: without this, creating a room left the previous room's
         // attachments fetchable from the new one.
         self.attachments.clear();
-        Ok(created.room.to_string())
+        Ok(room.to_string())
     }
 
-    /// Every room this device knows about.
+    /// Every DM and group this device knows about. Channels are listed by
+    /// [`Session::space`], under their space.
     pub fn rooms(&self) -> Vec<RoomSummary> {
         self.index
             .rooms()
+            .filter(|(_, record)| record.space.is_none())
             .map(|(room, record)| RoomSummary {
                 id: room.to_string(),
                 tier: record.tier.label().to_string(),
@@ -504,6 +577,10 @@ impl Session {
         self.call = None;
         self.negotiated = false;
         self.ringing = None;
+        // A voice channel too: this device only polls the open room, so it would stop
+        // hearing announcements — including a fallback — from the channel it left behind.
+        let _ = self.voice_leave();
+        self.voice_modes.clear();
         let record = self.index.get(&room);
         let seal = match record {
             Some(record) => RoomSeal::new(RoomShape {
@@ -568,7 +645,14 @@ impl Session {
             thread,
             listed: Vec::new(),
             labels,
+            roles: None,
+            roles_checked_ms: now_ms(),
         });
+        // Who may change the room's custom set, read now rather than when a set arrives.
+        if let Some(mut open) = self.open.take() {
+            self.refresh_roles(&mut open);
+            self.open = Some(open);
+        }
         Ok(views)
     }
 
@@ -631,6 +715,7 @@ impl Session {
             reply_to,
             reaction: None,
             card,
+            sticker: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
@@ -669,6 +754,7 @@ impl Session {
             reply_to: None,
             reaction: Some(reaction),
             card: None,
+            sticker: None,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
@@ -703,6 +789,7 @@ impl Session {
         };
         let mut events = Vec::new();
         let mut profiles_changed = false;
+        let mut custom_changed = false;
 
         for message in fetched {
             open.cursor = open.cursor.max(message.server_seq);
@@ -747,10 +834,32 @@ impl Session {
                     if let Some(signal) = received.signal {
                         let me = self.client.user().to_string();
                         let from = message.envelope.sender.to_string();
+                        // A voice channel's media announcement is not part of a rung call.
+                        // Recorded per device, from the envelope `receive` has already
+                        // checked against the roster — never from anything the instance
+                        // says on its own. Own announcements are skipped by device, not by
+                        // account: another of this user's devices is someone else's media.
+                        if signal.kind == SignalKind::VoiceMedia {
+                            let (user, device) =
+                                (message.envelope.sender, message.envelope.sender_device);
+                            if device != self.client.device() {
+                                self.open = Some(open);
+                                let news = self.voice_media_heard(user, device, &signal.payload);
+                                open = self.open.take().expect("just put back");
+                                if news {
+                                    events.push(Event::VoiceMedia {
+                                        user: user.to_string(),
+                                        device: device.to_string(),
+                                        e2ee: signal.payload == crate::call::VOICE_E2EE,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         // Own signals come back through the room; applying one to yourself
                         // would have a peer negotiating with itself.
                         if from != me && signal.is_for(&me) {
-                            if let Some(signal) = self.reconcile(*signal) {
+                            if let Some(signal) = self.reconcile(&from, *signal) {
                                 events.push(Event::Signal { from, signal });
                             }
                         }
@@ -770,6 +879,19 @@ impl Session {
                         }
                         continue;
                     }
+                    // A room's custom set is state too. Whether its sender may change it is
+                    // checked against the roles last read — see `session::custom`.
+                    if let Some(set) = received.custom_set {
+                        if message.envelope.sender != self.client.user() {
+                            custom_changed |= self.receive_custom(
+                                &open,
+                                message.envelope.sender,
+                                message.server_seq,
+                                *set,
+                            );
+                        }
+                        continue;
+                    }
                     // Attributed to the envelope's sender, for a reaction as for a message:
                     // the payload has no field naming who reacted, so none can be forged.
                     let attachment = received.attachment.map(|a| *a);
@@ -783,6 +905,7 @@ impl Session {
                         reply_to: received.reply_to.map(|r| *r),
                         reaction: received.reaction.map(|r| *r),
                         card: received.card.map(|c| *c),
+                        sticker: received.sticker,
                     };
                     let _ = self.history.append(room, &entry);
                     open.thread.record(&entry);
@@ -810,6 +933,7 @@ impl Session {
                     // account's profile included, so it goes again once this poll is done.
                     if !added.is_empty() {
                         let _ = self.profiles.resend(&room);
+                        let _ = self.custom.mark_due(&room);
                     }
                     profiles_changed = true;
                     events.push(Event::Membership {
@@ -823,6 +947,7 @@ impl Session {
                     // same for what its members called themselves.
                     let _ = self.history.forget(room);
                     let _ = self.profiles.forget(&room);
+                    let _ = self.custom.forget(&room);
                     events.push(Event::Removed);
                 }
                 Ok(TimelineEvent::Nothing) => {}
@@ -849,6 +974,14 @@ impl Session {
         // After everything fetched has been processed, so the group is at its current epoch
         // and a member who just joined can read it. A failure is retried on the next poll.
         let _ = self.flush_profile(&mut open);
+        // Roles on their own clock, so the request says nothing about what just arrived.
+        if now_ms().saturating_sub(open.roles_checked_ms) >= self.timer_recheck_ms {
+            custom_changed |= self.refresh_roles(&mut open);
+        }
+        let _ = self.flush_custom(&mut open);
+        if custom_changed {
+            events.push(Event::Custom { set: self.custom_view(&open) });
+        }
         if profiles_changed {
             self.relabel(&mut open);
             let mut users: Vec<&UserId> = open.labels.keys().collect();
@@ -965,7 +1098,7 @@ impl Session {
         let call = self
             .call
             .clone()
-            .or_else(|| self.ringing.take())
+            .or_else(|| self.ringing.take().map(|r| r.call))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.call = Some(call.clone());
         self.signal(CallSignal {
@@ -991,6 +1124,54 @@ impl Session {
         Ok(())
     }
 
+    /// Say no to the call this device is being rung for.
+    ///
+    /// Addressed to whoever rang, and sent under *their* call id: this device is not in a
+    /// call, so there is no id of its own to stamp. Forgets the ring, so pressing "call"
+    /// afterwards starts a call rather than quietly joining the one just declined.
+    ///
+    /// A no-op when nothing is ringing: declining twice, or after the caller hung up, must
+    /// not put a stray signal on the wire.
+    pub fn call_decline(&mut self) -> Result<(), SessionError> {
+        if self.call.is_some() {
+            return Ok(());
+        }
+        let Some(ring) = self.ringing.take() else { return Ok(()) };
+        let decline = CallSignal {
+            call: ring.call,
+            kind: SignalKind::Decline,
+            to: Some(ring.from),
+            payload: String::new(),
+        };
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        let outbound = open.convo.send_signal(decline, now_ms())?;
+        self.client.send(open.convo.room(), &outbound.envelope)?;
+        Ok(())
+    }
+
+    /// What a call in the open room should use: ICE servers, with fresh relay credentials
+    /// when the instance runs a relay, and whether the room is a DM.
+    ///
+    /// Asked for on every join rather than once per session, because relay credentials
+    /// expire. Without an open room there is no call to configure, and the answer is the
+    /// STUN-only default.
+    pub fn call_config(&self) -> Result<crate::call::CallConfig, SessionError> {
+        let (instance, direct) = match &self.open {
+            Some(open) => (self.client.turn_credentials(open.convo.room())?, open.seal.is_direct()),
+            None => (Vec::new(), false),
+        };
+        let ice_servers = crate::call::ice_servers_with(instance);
+        Ok(crate::call::CallConfig {
+            has_relay: crate::call::has_relay(&ice_servers),
+            ice_servers,
+            max_participants: crate::call::MAX_MESH_PARTICIPANTS,
+            direct,
+        })
+    }
+
     /// Decide whether an incoming signal belongs to the call this device is in — and, when
     /// two devices disagree about which call that is, settle it.
     ///
@@ -1014,7 +1195,7 @@ impl Session {
     /// attacker nothing they did not have; it is recorded because the failure is silent and
     /// looks like a network fault. Closing it needs a roster the call does not have —
     /// `docs/12-realtime-media.md` §2's per-call MLS group is where that comes from.
-    fn reconcile(&mut self, mut signal: CallSignal) -> Option<CallSignal> {
+    fn reconcile(&mut self, from: &str, mut signal: CallSignal) -> Option<CallSignal> {
         let Some(mine) = self.call.clone() else {
             // Not in the call. Arrival and departure announcements are still worth
             // surfacing: the first is the only way this device learns a call is happening —
@@ -1025,14 +1206,15 @@ impl Session {
             // its user has not accepted.
             return match signal.kind {
                 SignalKind::Join => {
-                    self.ringing = Some(signal.call.clone());
+                    self.ringing =
+                        Some(Ringing { call: signal.call.clone(), from: from.to_string() });
                     Some(signal)
                 }
                 SignalKind::Leave => {
                     // Whoever was calling has given up. Forgetting the id stops a later
                     // `call_join` adopting a call nobody is in; if somebody else is still in
                     // it, their acknowledgement renames this device into it anyway.
-                    if self.ringing.as_deref() == Some(signal.call.as_str()) {
+                    if self.ringing.as_ref().is_some_and(|r| r.call == signal.call) {
                         self.ringing = None;
                     }
                     Some(signal)
@@ -1110,6 +1292,9 @@ impl Session {
         // too, then attach each member's profile.
         if let Some(mut open) = self.open.take() {
             open.listed = listed.iter().map(|(u, _)| *u).collect();
+            // A member list is a role list; a set held for want of one may now apply. A
+            // change shows up on the next poll's `custom` event or the next `custom_set`.
+            self.apply_roles(&mut open, &listed);
             self.relabel(&mut open);
             for v in &mut views {
                 if let Ok(user) = v.user.parse::<UserId>() {
@@ -1205,6 +1390,7 @@ impl Session {
         // This device committed the add, so no poll will report it here — and the new member
         // still needs this account's profile, sent after the welcome.
         let _ = self.profiles.resend(&room);
+        let _ = self.custom.mark_due(&room);
         Ok(())
     }
 
@@ -1500,6 +1686,7 @@ fn view(
         // Rendered from what arrived inside the envelope. Nothing is fetched to draw it —
         // the recipient-fetches-nothing rule (`docs/05-embeds.md`).
         card: entry.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),
+        sticker: entry.sticker.clone(),
         body,
     }
 }

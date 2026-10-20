@@ -15,11 +15,9 @@ let pollTimer = null;
 let myUser = null;
 let inCall = false;
 let sharing = false;
-let muted = false;
 let cameraOff = false;
 let callStarted = 0;
 let elapsedTimer = null;
-let ringingFrom = null;
 let callConfig = null;
 // Whose safety numbers are on screen, so a roster change can redraw them.
 let safetyFor = null;
@@ -67,7 +65,9 @@ $("go").onclick = async () => {
         // failure looks like "my friend cannot add me" much later.
         try { await invoke("publish_key_packages", { count: 5 }); } catch (_) {}
         await refreshRooms();
-        await describeRelay();
+        // Spaces are an addition to the app, not a gate on it: an instance too old to have
+        // them, or one refusing the list, must not stop the rest of sign-in.
+        try { await CairnSpaces.signedIn(); } catch (e) { fail($("error"), e); }
         await listDevices();
         await CairnLinkCards.loadSettings();
     } catch (e) {
@@ -156,7 +156,7 @@ async function selectRoom(room) {
     if (inCall && room !== openRoom) await hangUp();
 
     fail($("error"), null);
-    stopRinging();
+    CairnCallUi.stopRinging();
     // A safety number belongs to one group; leaving it on screen over another room's would
     // invite comparing the wrong one.
     closeSafety();
@@ -164,12 +164,17 @@ async function selectRoom(room) {
     CairnMessages.cancelReply();
     $("room-id").textContent = short(room);
     $("room-id").title = room;
+    CairnSpaces.opened(room);
     $("timeline").textContent = "";
     CairnAttach.reset();
+    CairnEmoji.reset();
     try {
         const history = await invoke("open_room", { room });
         await CairnProfile.load();
         for (const m of history) addMessage(m);
+        // Not awaited: the room's set is drawn from the cache at once, and anything missing
+        // is downloaded — all of it — and swapped in, without holding up the room.
+        CairnEmoji.load();
     } catch (e) { fail($("error"), e); }
 
     // Derived in Rust from the room's sealed shape, never taken from the instance. An empty
@@ -186,6 +191,10 @@ async function selectRoom(room) {
     await CairnTimer.load();
     await refreshRooms();
     await refreshMembers();
+    // Per room: whether a relay exists is the instance's answer, and whether this is a DM
+    // decides what a declined call does.
+    await describeRelay();
+    await CairnVoicePanel.roomChanged();
     startPolling();
 }
 
@@ -197,6 +206,7 @@ async function refreshMembers() {
     const list = $("member-list");
     list.textContent = "";
     const waiting = [];
+    const departed = [];
     for (const m of members) {
         const li = document.createElement("li");
 
@@ -221,6 +231,7 @@ async function refreshMembers() {
             li.classList.add("openable");
             li.onclick = () => openSafety(m.user);
 
+            if (m.role === "unlisted") departed.push(m.user);
             if (m.role === "unlisted") {
                 // Rust found them in the group's roster; the instance's member list left
                 // them out. They can read the room, so they are shown — loudly.
@@ -255,7 +266,20 @@ async function refreshMembers() {
     show($("waiting"), waiting.length > 0);
     $("waiting-text").textContent =
         waiting.length + " joined by invite and cannot read this room yet";
+    // Rust labelled them: in the encrypted group, no longer on the instance's list. A kick
+    // from a space leaves exactly this behind.
+    show($("departed"), departed.length > 0);
+    $("departed-text").textContent =
+        departed.length + " no longer in this room still hold its keys";
 }
+
+$("evict").onclick = async () => {
+    try {
+        const removed = await invoke("remove_departed");
+        addNotice("Removed " + removed.length + " from the encrypted group.");
+        await refreshMembers();
+    } catch (e) { fail($("error"), e); }
+};
 
 $("admit").onclick = async () => {
     try {
@@ -493,6 +517,34 @@ CairnGifs.bind({
     onError: (e) => fail($("error"), e),
 });
 
+// ---- emoji, stickers, sounds ------------------------------------------------
+//
+// emoji.js draws a room's set from this device's cache and owns the picker; customise.js is
+// the panel that changes it; soundboard.js plays clips into a call. Rust decides who may
+// change the set and downloads all of it when it changes.
+
+CairnEmoji.bind({
+    invoke,
+    button: $("emoji"),
+    input: $("text"),
+    canSend: () => (openRoom ? true : (fail($("error"), "Open a room first."), false)),
+    onSent: (view) => { fail($("error"), null); addMessage(view); },
+    onError: (e) => fail($("error"), e),
+});
+CairnCustomise.bind({
+    invoke,
+    button: $("customise-btn"),
+    roomOpen: () => !!openRoom,
+    onError: (e) => fail($("error"), e),
+});
+CairnSoundboard.bind({
+    bar: document.querySelector("#stage .callbar"),
+    // A rung call or a voice channel: clips go out on whichever one this device is in.
+    inCall: () => inCall || CairnVoicePanel.active,
+    onError: (e) => fail($("error"), e),
+});
+CairnSoundboard.addButton(document.querySelector("#voice-channel .vc-controls"));
+
 // ---- calls -----------------------------------------------------------------
 
 CairnCall.bind({
@@ -505,46 +557,41 @@ CairnCall.bind({
         upsertTile(user, stream, { local });
         if (local) syncCallButtons();
     },
-    onState: (user, state) => markTile(user, state),
+    onState: (user, state) => { markTile(user, state); CairnCallUi.peerConnection(user, state); },
     onNotice: (text) => addNotice(text),
     onEnd: () => teardownCallUi(),
 });
 
 $("start-voice").onclick = () => startCall(false);
 $("start-video").onclick = () => startCall(true);
-$("accept-voice").onclick = () => startCall(false);
-$("accept-video").onclick = () => startCall(true);
 $("hangup").onclick = () => hangUp();
-// Dismissing hides the banner without leaving the call running for everyone else, and
-// without pretending to the caller that anything happened.
-$("decline").onclick = () => stopRinging();
 
-// Somebody started a call in this room. `call_join` adopts the announced call id, so
-// accepting joins *that* call rather than starting a rival one beside it.
-function ring(from, signal) {
-    if (signal.kind === "join") {
-        ringingFrom = from;
-        $("ringing-text").textContent = short(from) + " started a call";
-        show($("ringing"), true);
-    } else if (signal.kind === "leave" && from === ringingFrom) {
-        stopRinging();
-    }
-}
-
-function stopRinging() {
-    ringingFrom = null;
-    show($("ringing"), false);
-}
+// Ringing, answering, declining, mute, deafen and push-to-talk are callui.js's.
+CairnCallUi.init({
+    invoke,
+    me: () => myUser,
+    short,
+    addNotice: (text) => addNotice(text),
+    inCall: () => inCall,
+    startCall: (video) => startCall(video),
+    hangUp: () => hangUp(),
+});
 
 async function startCall(video) {
     if (inCall || !openRoom) return;
     fail($("error"), null);
-    stopRinging();
+    // One microphone, one call. A ringing call is a mesh call and a voice channel is an SFU
+    // call (docs/adr/012-sfu-voice-channels.md, "the switchover rule"); they do not mix.
+    if (CairnVoicePanel.active) {
+        fail($("error"), "Leave the voice channel first.");
+        return;
+    }
+    CairnCallUi.stopRinging();
     try {
-        const { local } = await CairnCall.join({ video, myUser });
+        const { local, config } = await CairnCall.join({ video, myUser });
+        callConfig = config;
         inCall = true;
         cameraOff = !video;
-        muted = false;
         sharing = false;
 
         show($("stage"), true);
@@ -557,6 +604,7 @@ async function startCall(video) {
         elapsedTimer = setInterval(tickElapsed, 1000);
         tickElapsed();
         startPolling();
+        CairnCallUi.started(config);
 
         // The device labels only exist once permission has been granted, so this is the
         // first moment the pickers can say anything useful.
@@ -567,6 +615,8 @@ async function startCall(video) {
                 "STUN only — no relay is configured, so this call may not connect across " +
                 "some home networks."
             );
+        } else if (CairnCall.prefs.relayOnly) {
+            addNotice("Relay only: your media goes through the instance's relay, so the others in this call do not see your IP address.");
         }
     } catch (e) {
         fail($("error"), e);
@@ -583,6 +633,7 @@ async function hangUp() {
 function teardownCallUi() {
     inCall = false;
     sharing = false;
+    CairnCallUi.ended();
     show($("stage"), false);
     $("tiles").textContent = "";
     if (elapsedTimer) clearInterval(elapsedTimer);
@@ -596,12 +647,6 @@ function tickElapsed() {
     const ss = String(s % 60).padStart(2, "0");
     $("elapsed").textContent = mm + ":" + ss;
 }
-
-$("mute").onclick = () => {
-    muted = !muted;
-    CairnCall.setMuted(muted);
-    syncCallButtons();
-};
 
 $("camera").onclick = async () => {
     try {
@@ -637,10 +682,6 @@ $("share").onclick = async () => {
 };
 
 function syncCallButtons() {
-    $("mute").classList.toggle("on", muted);
-    $("mute-text").textContent = muted ? "Unmuted" : "Mute";
-    $("mute").querySelector("use").setAttribute("href", muted ? "#i-mic-off" : "#i-mic");
-
     $("camera").classList.toggle("on", !cameraOff);
     $("camera-text").textContent = cameraOff ? "Camera off" : "Camera on";
     $("camera").querySelector("use").setAttribute("href", cameraOff ? "#i-cam-off" : "#i-cam");
@@ -667,6 +708,7 @@ function upsertTile(user, stream, opts = {}) {
         // into your speakers with a few hundred milliseconds of delay.
         video.muted = !!opts.local;
 
+        // callui.js puts the member's avatar in here; initials until it does.
         const face = document.createElement("span");
         face.className = "initials";
         face.textContent = initials(user);
@@ -689,6 +731,8 @@ function upsertTile(user, stream, opts = {}) {
         video.play().catch(() => {});
     }
     if (!opts.local) CairnCall.applySpeaker(video);
+    // Avatar, mute badges, the speaking ring, and this person's volume.
+    CairnCallUi.tile(tile, user, stream, !!opts.local);
     // A muted video track is a camera that is off, not one that is missing — treating them
     // the same is what leaves a frozen last frame on screen for the rest of the call.
     const live = stream.getVideoTracks().some((t) => !t.muted && t.readyState === "live");
@@ -697,6 +741,7 @@ function upsertTile(user, stream, opts = {}) {
 }
 
 function removeTile(user) {
+    CairnCallUi.untile(user);
     const tile = $("tile-" + cssId(user));
     if (tile) tile.remove();
 }
@@ -765,6 +810,7 @@ $("dev-out").onchange = (e) => {
     for (const v of document.querySelectorAll("#tiles video")) {
         if (!v.muted) CairnCall.applySpeaker(v);
     }
+    CairnCallAudio.applySpeakerAll();
 };
 
 // What the call configuration can and cannot do, said before someone hits a call that will
@@ -774,6 +820,7 @@ async function describeRelay() {
     let config;
     try { config = await CairnCall.loadConfig(); } catch (_) { return; }
     callConfig = config;
+    CairnCallUi.syncPrefs();
     const note = $("relay-note");
     if (config.has_relay) {
         note.className = "note";
@@ -812,13 +859,15 @@ async function tick() {
         if (CairnMessages.handle(ev)) continue;
         if (CairnTimer.handle(ev)) continue;
         if (CairnProfile.handle(ev)) continue;
+        if (CairnEmoji.handle(ev)) continue;
+        if (CairnVoicePanel.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
         } else if (ev.kind === "signal") {
             // Already filtered in Rust: signals addressed to somebody else never arrive, and
             // a device that has not joined a call is only ever told that one started or
             // ended. Everything else is the mesh's business.
-            if (!inCall) ring(ev.from, ev.signal);
+            if (!inCall) CairnCallUi.ring(ev.from, ev.signal);
             else await CairnCall.handle(ev.from, ev.signal);
         } else if (ev.kind === "membership") {
             membershipChanged = true;
@@ -828,14 +877,19 @@ async function tick() {
             for (const who of ev.left) addNotice("left the group: " + short(who));
         } else if (ev.kind === "removed") {
             addNotice("You were removed from this room.");
+            CairnEmoji.reset();
             closeSafety();
             if (inCall) await hangUp();
+            CairnVoicePanel.roomClosed();
             clearInterval(pollTimer);
             openRoom = null;
             await refreshRooms();
         }
     }
-    if (membershipChanged) await refreshMembers();
+    if (membershipChanged) {
+        await refreshMembers();
+        CairnSpaces.membershipChanged();
+    }
 }
 
 // ---- rendering -------------------------------------------------------------
@@ -865,7 +919,14 @@ CairnProfile.init({
     invoke, openSafety: (user) => openSafety(user), roomOpen: () => !!openRoom,
     onError: (e) => fail($("error"), e),
 });
+CairnVoicePanel.init({
+    notice: (text) => addNotice(text),
+    onError: (e) => fail($("error"), e),
+    inCall: () => inCall,
+    short,
+});
 CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
+CairnSpaces.bind({ invoke, selectRoom, addNotice, fail, short, initials, me: () => myUser });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();
