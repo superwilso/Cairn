@@ -413,6 +413,18 @@ impl Room {
     }
 }
 
+/// One room a caller may read, as [`Instance::activity`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomActivity {
+    pub room: RoomId,
+    /// The highest sequence number the room has assigned; 0 for a room with no messages.
+    pub latest_seq: u64,
+    /// The space this room is a channel of, so a client that has never listed that space
+    /// can still file the channel under it rather than among its DMs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceId>,
+}
+
 /// A message the server has accepted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
@@ -1893,6 +1905,41 @@ impl Instance {
         // Read from storage rather than memory: the log is the one thing that grows
         // without bound, and it is where attachment bytes will land.
         Ok(self.storage.messages_since(room, after)?)
+    }
+
+    /// Every room `actor` may read, with the last sequence number each holds.
+    ///
+    /// What lets a client follow all of its rooms with one request per tick instead of one
+    /// per room: it compares each `latest_seq` against its own cursor and fetches only the
+    /// rooms that moved. Without it, rings and unread messages reached the room on screen
+    /// and nowhere else (`docs/12-realtime-media.md` §0).
+    ///
+    /// **Decided by [`Self::room_access`], room by room** — the same check every read path
+    /// asks — so a room leaves this list on the same request that its messages stop being
+    /// served: removal from a room, a kick from a space, a channel override that takes away
+    /// `READ`, a deleted channel. A second list of "rooms this account is in" would be one
+    /// more thing a removal had to remember to empty.
+    ///
+    /// What it tells the caller is no more than they could learn by asking each room for
+    /// its messages; what it tells the *instance* is that this device is online and
+    /// watching every room it is in, which `docs/01-threat-model.md` §3a states.
+    ///
+    /// Linear in the instance's rooms. Fine at the sizes this server is built for; an index
+    /// from account to rooms is the fix when it is not, and it must be kept by the same
+    /// writes that change access or it becomes the second list above.
+    pub fn activity(&self, actor: UserId) -> Vec<RoomActivity> {
+        let rooms = self.rooms.lock().expect("rooms mutex poisoned");
+        let mut out: Vec<RoomActivity> = rooms
+            .iter()
+            .filter(|(id, room)| self.room_access(room, **id, actor).is_some())
+            .map(|(id, room)| RoomActivity {
+                room: *id,
+                latest_seq: room.next_seq,
+                space: room.space,
+            })
+            .collect();
+        out.sort_by_key(|a| *a.room.as_uuid());
+        out
     }
 
     /// Verify a franking report submitted by a recipient.
@@ -6309,5 +6356,147 @@ mod spaces {
         let held = inst.spaces.lock().unwrap()[&space].base_permissions(m.user).unwrap();
         assert!(!held.contains(Permissions::KICK), "the failed grant is not in memory");
         inst.messages_since(channel, m.user, 0, 0).expect("nor is the failed kick");
+    }
+}
+
+/// `Instance::activity`, attacked before anything relied on it. The list answers "which rooms
+/// may I read", so every way of losing — or never having — access is tried, and each must
+/// drop the room from the list on the same request it stops being served.
+#[cfg(test)]
+mod activity {
+    use super::tests::*;
+    use super::*;
+    use cairn_proto::EnvelopePayload;
+
+    fn ct() -> EnvelopePayload {
+        EnvelopePayload::MlsApplication { ciphertext: vec![7] }
+    }
+
+    fn group(inst: &Instance, owner: UserId) -> RoomId {
+        inst.create_room(
+            RoomShape { is_direct: false, is_publicly_discoverable: false, member_ceiling: 8 },
+            owner,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn listed(inst: &Instance, who: UserId) -> Vec<RoomId> {
+        inst.activity(who).into_iter().map(|a| a.room).collect()
+    }
+
+    #[test]
+    fn activity_lists_a_members_rooms_with_their_latest_sequence() {
+        // The counterfactual: without it, every "not listed" below might only mean "nothing
+        // is ever listed".
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = group(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+        inst.accept(alice.envelope(room, ct()), 0).unwrap();
+        inst.accept(alice.envelope(room, ct()), 0).unwrap();
+        let seen = inst.activity(bob.user);
+        assert_eq!(seen, vec![RoomActivity { room, latest_seq: 2, space: None }]);
+    }
+
+    #[test]
+    fn activity_never_lists_a_room_to_someone_outside_it() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let mallory = TestSender::registered(&inst);
+        let room = group(&inst, alice.user);
+        inst.accept(alice.envelope(room, ct()), 0).unwrap();
+        assert_eq!(listed(&inst, alice.user), vec![room]);
+        assert!(listed(&inst, mallory.user).is_empty(), "a stranger learns no room exists");
+    }
+
+    #[test]
+    fn a_member_removed_from_a_room_stops_seeing_its_activity() {
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let room = group(&inst, alice.user);
+        inst.add_room_member(room, alice.user, bob.user).unwrap();
+        assert_eq!(listed(&inst, bob.user), vec![room]);
+        inst.remove_room_member(room, alice.user, bob.user).unwrap();
+        inst.accept(alice.envelope(room, ct()), 0).unwrap();
+        assert!(listed(&inst, bob.user).is_empty(), "removed means unlisted at once");
+    }
+
+    struct World {
+        inst: Instance,
+        space: SpaceId,
+        general: RoomId,
+        owner: TestSender,
+        member: TestSender,
+    }
+
+    fn world() -> World {
+        let inst = Instance::in_memory();
+        let owner = TestSender::registered(&inst);
+        let member = TestSender::registered(&inst);
+        let space = inst.create_space(owner.user, "Trailhead", 50).unwrap();
+        let (general, _) = inst.create_channel(space, owner.user, "general", false).unwrap();
+        let t = inst.create_space_invite(space, owner.user, 5, None).unwrap();
+        inst.redeem_space_invite(member.user, &t, 0).unwrap();
+        inst.accept(owner.envelope(general, ct()), 0).unwrap();
+        World { inst, space, general, owner, member }
+    }
+
+    #[test]
+    fn a_space_member_sees_its_channels_filed_under_the_space() {
+        let w = world();
+        assert_eq!(
+            w.inst.activity(w.member.user),
+            vec![RoomActivity { room: w.general, latest_seq: 1, space: Some(w.space) }]
+        );
+    }
+
+    #[test]
+    fn a_member_kicked_from_a_space_stops_seeing_its_channels() {
+        let w = world();
+        w.inst.kick_from_space(w.space, w.owner.user, w.member.user).unwrap();
+        w.inst.accept(w.owner.envelope(w.general, ct()), 0).unwrap();
+        assert!(listed(&w.inst, w.member.user).is_empty());
+    }
+
+    #[test]
+    fn a_member_of_one_space_sees_nothing_of_another() {
+        let w = world();
+        let other_owner = TestSender::registered(&w.inst);
+        let other = w.inst.create_space(other_owner.user, "Elsewhere", 50).unwrap();
+        let (secret, _) = w.inst.create_channel(other, other_owner.user, "secret", false).unwrap();
+        let (lobby, _) = w.inst.create_channel(other, other_owner.user, "lobby", true).unwrap();
+        w.inst.accept(other_owner.envelope(secret, ct()), 0).unwrap();
+        let seen = listed(&w.inst, w.member.user);
+        assert_eq!(seen, vec![w.general]);
+        assert!(!seen.contains(&lobby), "not even a public channel of a space they are not in");
+    }
+
+    #[test]
+    fn a_channel_the_member_may_not_read_is_not_listed() {
+        let w = world();
+        let (staff, _) = w.inst.create_channel(w.space, w.owner.user, "staff", false).unwrap();
+        w.inst
+            .set_channel_override(
+                w.space,
+                w.owner.user,
+                staff,
+                None,
+                Permissions::NONE,
+                Permissions::READ,
+            )
+            .unwrap();
+        w.inst.accept(w.owner.envelope(staff, ct()), 0).unwrap();
+        assert_eq!(listed(&w.inst, w.member.user), vec![w.general]);
+    }
+
+    #[test]
+    fn a_deleted_channel_is_listed_to_nobody() {
+        let w = world();
+        w.inst.delete_channel(w.space, w.owner.user, w.general).unwrap();
+        assert!(listed(&w.inst, w.member.user).is_empty());
+        assert!(listed(&w.inst, w.owner.user).is_empty(), "the owner included");
     }
 }

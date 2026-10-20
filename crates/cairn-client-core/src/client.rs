@@ -269,6 +269,18 @@ pub struct FetchedMessage {
     pub franking_tag: Option<String>,
 }
 
+/// One room the instance says this account may read, and how far its log has got.
+///
+/// The instance's word, used only to decide *which rooms to fetch*. Nothing here is trusted
+/// for content: every message is still fetched, and decrypted or refused, room by room.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RoomActivity {
+    pub room: RoomId,
+    pub latest_seq: u64,
+    #[serde(default)]
+    pub space: Option<cairn_proto::SpaceId>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReportVerdict {
     pub verified: bool,
@@ -737,6 +749,15 @@ impl<T: Transport> Client<T> {
             &self.auth("read", Some(ResourceRef::Room(room)))?,
             None,
         )?;
+        Ok(serde_json::from_slice(&response.body)?)
+    }
+
+    /// Every room this account may read, with each room's latest sequence number.
+    ///
+    /// One request in place of one poll per room. It tells the instance this device is
+    /// online and following all of its rooms — `docs/01-threat-model.md` §3a.
+    pub fn activity(&self) -> Result<Vec<RoomActivity>, ClientError> {
+        let response = self.call("GET", "/v1/activity", &self.auth("activity", None)?, None)?;
         Ok(serde_json::from_slice(&response.body)?)
     }
 

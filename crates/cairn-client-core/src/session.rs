@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use cairn_crypto::mls::Session as MlsSession;
 use cairn_crypto::verification::VerificationState;
-use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, Tier, UserId};
+use cairn_proto::{DeviceId, DeviceIdentity, RoomId, RoomSeal, RoomShape, SpaceId, Tier, UserId};
 
 use crate::call::{CallSignal, SignalKind};
 use crate::client::{Client, ClientError};
@@ -71,7 +71,7 @@ pub use voice::{
 };
 
 use crate::profile::{Label, ProfileError, ProfileStore, ProfileStoreError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -155,6 +155,28 @@ pub struct RoomSummary {
     pub e2ee: bool,
     /// Whether this device holds the encrypted group. False means joined-but-not-admitted.
     pub joined: bool,
+    /// Messages from others that arrived while this room was not open. See [`UnreadView`].
+    #[serde(default)]
+    pub unread: u32,
+    /// How many of those mention this account.
+    #[serde(default)]
+    pub mentions: u32,
+}
+
+/// A room with something this device has not shown its user.
+///
+/// Counted here, on this device, from messages it decrypted — the instance is never told
+/// what has been read, which would be a read receipt by another name (`docs/10-roadmap.md`
+/// declined those). It does not survive a restart: messages that arrive while the client is
+/// closed are counted on the first poll after it opens, and anything counted but not yet
+/// looked at before closing is forgotten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadView {
+    pub room: String,
+    /// The space the room is a channel of, so a frontend can mark the space too.
+    pub space: Option<String>,
+    pub unread: u32,
+    pub mentions: u32,
 }
 
 /// One person in a room, as both halves of the system see them.
@@ -224,6 +246,10 @@ pub struct MessageView {
     /// this device ([`Session::custom_asset`]) and shows `body` (`:name:`) if it has none.
     #[serde(default)]
     pub sticker: Option<String>,
+    /// The body mentions this account (`@` and one of its names in this room). Decided by
+    /// [`crate::mention`]; a frontend highlights it and never re-derives it.
+    #[serde(default)]
+    pub mentions_me: bool,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -267,14 +293,25 @@ pub enum Event {
     },
     /// Call signalling addressed to this device, for the WebRTC layer rather than the
     /// timeline. Already filtered: signals meant for somebody else never reach a frontend.
+    ///
+    /// `room` is set when the signal came from a room that is **not** open: then it is only
+    /// ever a call starting or ending there — a ring — and accepting it means opening that
+    /// room first. `None` is the open room, as it always was.
     Signal {
         from: String,
         signal: CallSignal,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room: Option<String>,
     },
     /// A device in the open room said, under the room's encryption, what its voice-channel
     /// media is. Only sent when it changed what this device knew. A frontend re-reads
     /// `voice_state` and, if the protection moved, tells its user — §5's announcement.
+    ///
+    /// `room` is where it was heard: the open room, or the room whose voice channel this
+    /// device is connected to while it looks at another.
     VoiceMedia {
+        #[serde(default)]
+        room: String,
         user: String,
         device: String,
         e2ee: bool,
@@ -291,6 +328,23 @@ pub enum Event {
     Custom {
         set: CustomSetView,
     },
+    /// What is unread in rooms that are not open changed. Every such room, not the change,
+    /// for the same reason as `Profiles`: a frontend redraws, it does not keep a tally.
+    Unread {
+        rooms: Vec<UnreadView>,
+    },
+    /// This device was removed from a room that is **not** open. Its transcript is gone; a
+    /// frontend redraws its room list. (The open room's removal is [`Event::Removed`].)
+    RemovedFrom {
+        room: String,
+    },
+}
+
+/// What one room's poll produced.
+struct Polled {
+    events: Vec<Event>,
+    /// This device was removed from the room's group in this poll.
+    removed: bool,
 }
 
 struct OpenRoom {
@@ -330,8 +384,18 @@ const TIMER_RECHECK_MS: i64 = 10_000;
 /// Who is kept so a decline can be addressed to them — a decline broadcast to the room
 /// would tell every participant, rather than the person who rang.
 struct Ringing {
+    /// Where the call is. A ring from a room that is not open is still a ring; accepting it
+    /// opens that room, and declining is sent into it.
+    room: RoomId,
     call: String,
     from: String,
+}
+
+/// What a room not on screen has that its user has not seen.
+#[derive(Debug, Clone, Copy, Default)]
+struct Unread {
+    count: u32,
+    mentions: u32,
 }
 
 /// One signed-in client.
@@ -345,6 +409,18 @@ pub struct Session {
     /// Each room's custom emoji, stickers and sounds, and the cache they are drawn from.
     custom: crate::custom::CustomStore,
     open: Option<OpenRoom>,
+    /// Every other room this device is following, live: its group, cursor and labels, so a
+    /// message there is decrypted and filed when it arrives rather than when the room is next
+    /// opened. **A room is in `open` or here, never both** — two live copies of one MLS group
+    /// would diverge the moment either processed a commit.
+    background: HashMap<RoomId, OpenRoom>,
+    /// What each room not on screen has that its user has not seen. See [`UnreadView`].
+    unread: HashMap<RoomId, Unread>,
+    /// Spaces described because activity named a channel this device had never listed, so a
+    /// space that cannot be described is not asked about on every poll.
+    described: HashSet<SpaceId>,
+    /// `unread` changed since a frontend was last told.
+    unread_changed: bool,
     dir: PathBuf,
     tls: bool,
     /// The call this device is in, if any. One per room.
@@ -362,8 +438,9 @@ pub struct Session {
     ringing: Option<Ringing>,
     /// This device's seat in a voice channel, if it holds one. See `session::voice`.
     voice: Option<voice::Seat>,
-    /// What each device in the open room has announced about its voice media.
-    voice_modes: voice::Modes,
+    /// What each device has announced about its voice media, per room: the open room's, for
+    /// the voice channel shown beside it, and the connected one's, wherever this device is.
+    voice_modes: HashMap<RoomId, voice::Modes>,
     /// Attachments seen in the open room, with the keys that open them. Never handed to a
     /// frontend; see `attachments.rs` for why a frontend can only fetch what is in here.
     attachments: attachments::Known,
@@ -434,6 +511,10 @@ impl Session {
             profiles: ProfileStore::open(&dir)?,
             custom: crate::custom::CustomStore::open(&dir)?,
             open: None,
+            background: HashMap::new(),
+            unread: HashMap::new(),
+            described: HashSet::new(),
+            unread_changed: false,
             dir: dir.clone(),
             tls,
             call: None,
@@ -547,6 +628,7 @@ impl Session {
         };
         self.relabel(&mut open);
         self.refresh_roles(&mut open);
+        self.park_open();
         self.open = Some(open);
         // Found by a probe: without this, creating a room left the previous room's
         // attachments fetchable from the new one.
@@ -560,29 +642,49 @@ impl Session {
         self.index
             .rooms()
             .filter(|(_, record)| record.space.is_none())
-            .map(|(room, record)| RoomSummary {
-                id: room.to_string(),
-                tier: record.tier.label().to_string(),
-                e2ee: record.tier.is_e2ee(),
-                joined: self.index.group_id(room).ok().flatten().is_some(),
+            .map(|(room, record)| {
+                let unread = self.unread.get(room).copied().unwrap_or_default();
+                RoomSummary {
+                    id: room.to_string(),
+                    tier: record.tier.label().to_string(),
+                    e2ee: record.tier.is_e2ee(),
+                    joined: self.index.group_id(room).ok().flatten().is_some(),
+                    unread: unread.count,
+                    mentions: unread.mentions,
+                }
             })
             .collect()
     }
 
-    /// Open a room, resuming its encrypted group if this device holds one.
-    pub fn open_room(&mut self, room: &str) -> Result<Vec<MessageView>, SessionError> {
-        let room: RoomId = room.parse().map_err(|_| SessionError::NoRoomOpen)?;
-        // Calls belong to a room. Carrying one across would have this device signalling into
-        // a call whose participants are no longer being polled.
-        self.call = None;
-        self.negotiated = false;
-        self.ringing = None;
-        // A voice channel too: this device only polls the open room, so it would stop
-        // hearing announcements — including a fallback — from the channel it left behind.
-        let _ = self.voice_leave();
-        self.voice_modes.clear();
-        let record = self.index.get(&room);
-        let seal = match record {
+    /// Every room with something unread, for a frontend's first draw; afterwards it is told
+    /// by [`Event::Unread`].
+    pub fn unread(&self) -> Vec<UnreadView> {
+        let mut rooms: Vec<UnreadView> = self
+            .unread
+            .iter()
+            .filter(|(_, u)| u.count > 0)
+            .map(|(room, u)| UnreadView {
+                room: room.to_string(),
+                space: self.index.get(room).and_then(|r| r.space).map(|s| s.to_string()),
+                unread: u.count,
+                mentions: u.mentions,
+            })
+            .collect();
+        rooms.sort_by(|a, b| a.room.cmp(&b.room));
+        rooms
+    }
+
+    /// Move the open room into the background, still live, so switching away from it does
+    /// not stop it being followed — or drop the voice channel this device is connected to.
+    fn park_open(&mut self) {
+        if let Some(open) = self.open.take() {
+            self.background.insert(open.convo.room(), open);
+        }
+    }
+
+    /// The local seal for a room, from what this device recorded about it.
+    fn local_seal(&self, room: RoomId) -> Result<RoomSeal, SessionError> {
+        Ok(match self.index.get(&room) {
             Some(record) => RoomSeal::new(RoomShape {
                 is_direct: record.tier == Tier::Private,
                 is_publicly_discoverable: !record.tier.is_e2ee(),
@@ -594,9 +696,13 @@ impl Session {
                 is_publicly_discoverable: false,
                 member_ceiling: 256,
             })?,
-        };
+        })
+    }
 
-        let convo = match self.index.group_id(&room)? {
+    /// The conversation for a room, resumed from disk — or, before admission, a placeholder
+    /// that can still pick up a welcome.
+    fn load_convo(&mut self, room: RoomId, seal: RoomSeal) -> Result<Conversation, SessionError> {
+        Ok(match self.index.group_id(&room)? {
             Some(group_id) => Conversation::resume_encrypted(
                 seal,
                 room,
@@ -621,7 +727,88 @@ impl Session {
                     self.mls.clone(),
                 )?
             }
+        })
+    }
+
+    /// A room to follow in the background: its conversation and enough state to file what
+    /// arrives. No transcript is replayed — nothing is drawn — and the timer is left to
+    /// whoever opens it, which re-reads it then.
+    fn load_background(&mut self, room: RoomId) -> Result<OpenRoom, SessionError> {
+        let seal = self.local_seal(room)?;
+        let convo = self.load_convo(room, seal)?;
+        let labels = profiles::labels_for(&self.profiles, self.client.user(), &convo, &[]);
+        let mut bg = OpenRoom {
+            convo,
+            seal,
+            cursor: self.index.cursor(&room),
+            ttl: None,
+            ttl_checked_ms: now_ms(),
+            thread: Thread::default(),
+            listed: Vec::new(),
+            labels,
+            roles: None,
+            roles_checked_ms: now_ms(),
         };
+        // Once, now: a custom set arriving here is checked against these.
+        self.refresh_roles(&mut bg);
+        Ok(bg)
+    }
+
+    /// The names this account answers to in a room, for [`crate::mention`]: its nickname
+    /// there, its display name, and its short id.
+    fn my_names(&self, room: &RoomId) -> Vec<String> {
+        let me = self.client.user();
+        let mine = self.profiles.outgoing(room);
+        let mut names: Vec<String> = Vec::new();
+        names.extend(mine.nickname.clone());
+        names.extend(mine.display_name.clone());
+        names.push(crate::profile::short_id(&me));
+        names
+    }
+
+    fn mentions_me(&self, room: &RoomId, entry: &HistoryEntry) -> bool {
+        entry.sender != self.client.user()
+            && entry.reaction.is_none()
+            && crate::mention::mentions(&String::from_utf8_lossy(&entry.body), &self.my_names(room))
+    }
+
+    /// Open a room, resuming its encrypted group if this device holds one.
+    ///
+    /// The room that was open is not closed: it goes on being followed in the background,
+    /// and so does a voice channel this device is connected to there. What does end is a
+    /// call somebody rang: its peer connections are signalled through the open room, and
+    /// the frontend hangs up before switching.
+    pub fn open_room(&mut self, room: &str) -> Result<Vec<MessageView>, SessionError> {
+        let room: RoomId = room.parse().map_err(|_| SessionError::NoRoomOpen)?;
+        self.call = None;
+        self.negotiated = false;
+        // A ring is kept: it names its room, so it can still be accepted or declined from
+        // here, and `call_join` only adopts it in that room.
+        //
+        // The live copy of this room, if there is one — the open one being reopened, or the
+        // background one. Resuming the group again from disk beside a live copy would leave
+        // two groups that diverge at the next commit.
+        let live = match self.open.take() {
+            Some(open) if open.convo.room() == room => Some(open),
+            other => {
+                if let Some(other) = other {
+                    self.background.insert(other.convo.room(), other);
+                }
+                self.background.remove(&room)
+            }
+        };
+        let (seal, convo) = match live {
+            Some(live) => (live.seal, live.convo),
+            None => {
+                let seal = self.local_seal(room)?;
+                let convo = self.load_convo(room, seal)?;
+                (seal, convo)
+            }
+        };
+        // Looking at it is what reading it means here; nothing is sent to say so.
+        if self.unread.remove(&room).is_some_and(|u| u.count > 0) {
+            self.unread_changed = true;
+        }
 
         let cursor = self.index.cursor(&room);
         let ttl = self.client.room_ttl(room).ok().flatten();
@@ -634,7 +821,11 @@ impl Session {
         let views = entries
             .iter()
             .filter(|e| e.reaction.is_none())
-            .map(|e| view(e, &thread, &labels, true))
+            .map(|e| {
+                let mut v = view(e, &thread, &labels, true);
+                v.mentions_me = self.mentions_me(&room, e);
+                v
+            })
             .collect();
         self.open = Some(OpenRoom {
             convo,
@@ -772,22 +963,159 @@ impl Session {
         Ok(target)
     }
 
-    /// Fetch and decrypt whatever has arrived since the last poll.
+    /// Fetch and decrypt whatever has arrived since the last poll — in **every** room this
+    /// device follows, not only the open one.
     ///
-    /// The open room is taken out for the duration rather than borrowed in place: joining a
-    /// group mid-loop *replaces* the conversation, and that cannot be done through a live
-    /// borrow of the field it lives in.
+    /// One request asks the instance how far each readable room's log has got
+    /// ([`Client::activity`]); only rooms that moved are fetched. The open room's events come
+    /// back as they always did. A room that is not open is filed exactly as if it were — its
+    /// transcript, profiles, custom set and group all advance — and what reaches the
+    /// frontend from it is a summary: [`Event::Unread`], a ring as an [`Event::Signal`] with
+    /// its room, voice-channel announcements, and [`Event::RemovedFrom`].
+    ///
+    /// Against an instance without the activity endpoint, only the open room is polled.
+    ///
+    /// An error fetching the open room is returned only when nothing else happened: a room
+    /// this device can no longer read must not stop every other room's ring getting through.
     pub fn poll(&mut self) -> Result<Vec<Event>, SessionError> {
-        let Some(mut open) = self.open.take() else { return Ok(Vec::new()) };
-        let room = open.convo.room();
-        let fetched = match self.client.fetch_since(room, open.cursor) {
-            Ok(f) => f,
-            Err(e) => {
-                self.open = Some(open);
-                return Err(e.into());
+        let activity = self.client.activity().ok();
+        let mut events = Vec::new();
+        let mut failure = None;
+
+        if let Some(open) = self.open.take() {
+            let room = open.convo.room();
+            // A room missing from the list is fetched anyway, so the refusal (or the removal
+            // commit) is seen rather than silently waited out.
+            let moved = activity.as_ref().is_none_or(|list| {
+                list.iter().find(|a| a.room == room).is_none_or(|a| a.latest_seq > open.cursor)
+            });
+            let (open, outcome) = self.poll_room(open, true, moved);
+            match outcome {
+                Ok(polled) => {
+                    events.extend(polled.events);
+                    // The frontend closes a room this device was removed from. Keeping it open
+                    // here would have every later poll fetch a room it may no longer read.
+                    if !polled.removed {
+                        self.open = Some(open);
+                    }
+                }
+                Err(e) => {
+                    self.open = Some(open);
+                    failure = Some(e);
+                }
             }
+        }
+
+        if let Some(list) = &activity {
+            events.extend(self.poll_background(list));
+        }
+        if std::mem::take(&mut self.unread_changed) {
+            events.push(Event::Unread { rooms: self.unread() });
+        }
+        match failure {
+            Some(e) if events.is_empty() => Err(e),
+            _ => Ok(events),
+        }
+    }
+
+    /// Every room in `list` that is not open and has moved past this device's cursor.
+    ///
+    /// Only rooms this device has recorded are followed. A channel of a space it has never
+    /// listed gets that space described once, which records its channels with their checked
+    /// seals; any other room this device does not know is left until it is opened or joined,
+    /// because nothing local says what its tier is, and a badge needs that.
+    fn poll_background(&mut self, list: &[crate::client::RoomActivity]) -> Vec<Event> {
+        let open = self.open.as_ref().map(|o| o.convo.room());
+        let mut events = Vec::new();
+        for a in list {
+            if Some(a.room) == open {
+                continue;
+            }
+            let cursor = match self.background.get(&a.room) {
+                Some(bg) => bg.cursor,
+                None => self.index.cursor(&a.room),
+            };
+            if a.latest_seq <= cursor {
+                continue;
+            }
+            if self.index.get(&a.room).is_none() {
+                if let Some(space) = a.space {
+                    if self.described.insert(space) {
+                        let _ = self.space(&space.to_string());
+                    }
+                }
+                if self.index.get(&a.room).is_none() {
+                    continue;
+                }
+            }
+            let bg = match self.background.remove(&a.room) {
+                Some(bg) => bg,
+                None => match self.load_background(a.room) {
+                    Ok(bg) => bg,
+                    Err(_) => continue,
+                },
+            };
+            let (bg, outcome) = self.poll_room(bg, false, true);
+            let Ok(polled) = outcome else {
+                self.background.insert(a.room, bg);
+                continue;
+            };
+            if polled.removed {
+                self.unread.remove(&a.room);
+                self.unread_changed = true;
+                events.push(Event::RemovedFrom { room: a.room.to_string() });
+                continue;
+            }
+            self.background.insert(a.room, bg);
+            for ev in polled.events {
+                match ev {
+                    Event::Message(m) => {
+                        if m.sender == self.client.user().to_string() {
+                            continue;
+                        }
+                        let u = self.unread.entry(a.room).or_default();
+                        u.count = u.count.saturating_add(1);
+                        if m.mentions_me {
+                            u.mentions = u.mentions.saturating_add(1);
+                        }
+                        self.unread_changed = true;
+                    }
+                    ev @ (Event::Signal { .. } | Event::VoiceMedia { .. }) => events.push(ev),
+                    // State, already filed: the room is redrawn from it when it is opened.
+                    _ => {}
+                }
+            }
+        }
+        events
+    }
+
+    /// Fetch (when `fetch`) and file one room, open or not.
+    ///
+    /// The room is taken out of its slot for the duration rather than borrowed in place:
+    /// joining a group mid-loop *replaces* the conversation, and that cannot be done through
+    /// a live borrow of the field it lives in. It is handed back whatever happens.
+    ///
+    /// `foreground` is whether it is the open room. Only the open room negotiates calls,
+    /// offers its attachments for fetching, re-reads its timer and roles on their clocks,
+    /// and reports profile and custom-set changes; a room in the background files the same
+    /// things and is redrawn from them when it is opened.
+    fn poll_room(
+        &mut self,
+        mut open: OpenRoom,
+        foreground: bool,
+        fetch: bool,
+    ) -> (OpenRoom, Result<Polled, SessionError>) {
+        let room = open.convo.room();
+        let fetched = if fetch {
+            match self.client.fetch_since(room, open.cursor) {
+                Ok(f) => f,
+                Err(e) => return (open, Err(e.into())),
+            }
+        } else {
+            Vec::new()
         };
         let mut events = Vec::new();
+        let mut removed = false;
         let mut profiles_changed = false;
         let mut custom_changed = false;
 
@@ -843,11 +1171,15 @@ impl Session {
                             let (user, device) =
                                 (message.envelope.sender, message.envelope.sender_device);
                             if device != self.client.device() {
-                                self.open = Some(open);
-                                let news = self.voice_media_heard(user, device, &signal.payload);
-                                open = self.open.take().expect("just put back");
+                                let news = self.voice_media_heard(room, user, device, &signal.payload);
+                                // News is answered with this device's own announcement, so a
+                                // newcomer learns it — into this room, wherever it is shown.
+                                if news && self.voice.as_ref().is_some_and(|s| s.room == room) {
+                                    let _ = self.announce_voice_media_in(&mut open);
+                                }
                                 if news {
                                     events.push(Event::VoiceMedia {
+                                        room: room.to_string(),
                                         user: user.to_string(),
                                         device: device.to_string(),
                                         e2ee: signal.payload == crate::call::VOICE_E2EE,
@@ -859,8 +1191,17 @@ impl Session {
                         // Own signals come back through the room; applying one to yourself
                         // would have a peer negotiating with itself.
                         if from != me && signal.is_for(&me) {
-                            if let Some(signal) = self.reconcile(&from, *signal) {
-                                events.push(Event::Signal { from, signal });
+                            if foreground {
+                                if let Some(signal) = self.reconcile(room, &from, *signal) {
+                                    events.push(Event::Signal { from, signal, room: None });
+                                }
+                            } else if let Some(signal) = self.ring_elsewhere(room, &from, *signal)
+                            {
+                                events.push(Event::Signal {
+                                    from,
+                                    signal,
+                                    room: Some(room.to_string()),
+                                });
                             }
                         }
                         continue;
@@ -909,8 +1250,13 @@ impl Session {
                     };
                     let _ = self.history.append(room, &entry);
                     open.thread.record(&entry);
-                    if let Some(a) = &entry.attachment {
-                        self.attachments.insert(a.blob, a.clone());
+                    // Only the open room's attachments are fetchable — found by a probe when
+                    // switching rooms left the last one's open — so a background room's wait
+                    // in its transcript until it is opened.
+                    if foreground {
+                        if let Some(a) = &entry.attachment {
+                            self.attachments.insert(a.blob, a.clone());
+                        }
                     }
                     if let Some(reaction) = &entry.reaction {
                         let target = &reaction.target;
@@ -920,12 +1266,9 @@ impl Session {
                             reactions: open.thread.reactions(target),
                         });
                     } else {
-                        events.push(Event::Message(view(
-                            &entry,
-                            &open.thread,
-                            &open.labels,
-                            false,
-                        )));
+                        let mut v = view(&entry, &open.thread, &open.labels, false);
+                        v.mentions_me = self.mentions_me(&room, &entry);
+                        events.push(Event::Message(v));
                     }
                 }
                 Ok(TimelineEvent::Membership { added, removed, .. }) => {
@@ -948,6 +1291,7 @@ impl Session {
                     let _ = self.history.forget(room);
                     let _ = self.profiles.forget(&room);
                     let _ = self.custom.forget(&room);
+                    removed = true;
                     events.push(Event::Removed);
                 }
                 Ok(TimelineEvent::Nothing) => {}
@@ -967,31 +1311,56 @@ impl Session {
             let _ = verify::observe_roster(&open.convo, &mut self.contacts);
         }
 
-        if let Some(live) = self.recheck_timer(&mut open, &mut events) {
-            // An expired message takes the only in-memory key to its attachment with it.
-            attachments::remember(&mut self.attachments, &live);
+        if foreground {
+            if let Some(live) = self.recheck_timer(&mut open, &mut events) {
+                // An expired message takes the only in-memory key to its attachment with it.
+                attachments::remember(&mut self.attachments, &live);
+            }
         }
         // After everything fetched has been processed, so the group is at its current epoch
         // and a member who just joined can read it. A failure is retried on the next poll.
         let _ = self.flush_profile(&mut open);
-        // Roles on their own clock, so the request says nothing about what just arrived.
-        if now_ms().saturating_sub(open.roles_checked_ms) >= self.timer_recheck_ms {
+        // Roles on their own clock, so the request says nothing about what just arrived. A
+        // background room read them when it was loaded, and again when it is opened.
+        if foreground && now_ms().saturating_sub(open.roles_checked_ms) >= self.timer_recheck_ms
+        {
             custom_changed |= self.refresh_roles(&mut open);
         }
         let _ = self.flush_custom(&mut open);
-        if custom_changed {
+        if foreground && custom_changed {
             events.push(Event::Custom { set: self.custom_view(&open) });
         }
-        if profiles_changed {
+        if foreground && profiles_changed {
             self.relabel(&mut open);
             let mut users: Vec<&UserId> = open.labels.keys().collect();
             users.sort();
             let profiles = users.into_iter().map(|u| self.view_of(&open, u)).collect();
             events.push(Event::Profiles { profiles });
+        } else if profiles_changed {
+            self.relabel(&mut open);
         }
         let _ = self.index.advance(room, open.cursor);
-        self.open = Some(open);
-        Ok(events)
+        (open, Ok(Polled { events, removed }))
+    }
+
+    /// A call starting or ending in a room that is not open. Only those two signals mean
+    /// anything to a device that is not in the call, as in [`Self::reconcile`]; everything
+    /// else is a negotiation between other devices.
+    fn ring_elsewhere(&mut self, room: RoomId, from: &str, signal: CallSignal) -> Option<CallSignal> {
+        match signal.kind {
+            SignalKind::Join => {
+                self.ringing =
+                    Some(Ringing { room, call: signal.call.clone(), from: from.to_string() });
+                Some(signal)
+            }
+            SignalKind::Leave => {
+                if self.ringing.as_ref().is_some_and(|r| r.room == room && r.call == signal.call) {
+                    self.ringing = None;
+                }
+                Some(signal)
+            }
+            _ => None,
+        }
     }
 
     /// The open room's disappearing-message timer, in milliseconds. `None` is off.
@@ -1095,10 +1464,12 @@ impl Session {
         // `MAX_MESH_PARTICIPANTS` so the number still lives here.
         // Joining a call that has been announced must join *that* call. Minting a fresh id
         // here is what made two people pressing the button a race rather than a meeting.
+        // Only a ring from *this* room: one from another room is answered by opening it.
+        let room = open.convo.room();
         let call = self
             .call
             .clone()
-            .or_else(|| self.ringing.take().map(|r| r.call))
+            .or_else(|| self.ringing.take_if(|r| r.room == room).map(|r| r.call))
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.call = Some(call.clone());
         self.signal(CallSignal {
@@ -1138,18 +1509,27 @@ impl Session {
         }
         let Some(ring) = self.ringing.take() else { return Ok(()) };
         let decline = CallSignal {
-            call: ring.call,
+            call: ring.call.clone(),
             kind: SignalKind::Decline,
             to: Some(ring.from),
             payload: String::new(),
         };
-        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
-        if open.convo.group_id().is_none() {
+        // Into the room that rang, which need not be the open one.
+        let target = self.live_room_mut(ring.room).ok_or(SessionError::NoRoomOpen)?;
+        if target.convo.group_id().is_none() {
             return Err(SessionError::NoGroupYet);
         }
-        let outbound = open.convo.send_signal(decline, now_ms())?;
-        self.client.send(open.convo.room(), &outbound.envelope)?;
+        let outbound = target.convo.send_signal(decline, now_ms())?;
+        self.client.send(ring.room, &outbound.envelope)?;
         Ok(())
+    }
+
+    /// The live copy of a room — open or followed in the background — to send into.
+    fn live_room_mut(&mut self, room: RoomId) -> Option<&mut OpenRoom> {
+        match &mut self.open {
+            Some(open) if open.convo.room() == room => Some(open),
+            _ => self.background.get_mut(&room),
+        }
     }
 
     /// What a call in the open room should use: ICE servers, with fresh relay credentials
@@ -1195,7 +1575,7 @@ impl Session {
     /// attacker nothing they did not have; it is recorded because the failure is silent and
     /// looks like a network fault. Closing it needs a roster the call does not have —
     /// `docs/12-realtime-media.md` §2's per-call MLS group is where that comes from.
-    fn reconcile(&mut self, from: &str, mut signal: CallSignal) -> Option<CallSignal> {
+    fn reconcile(&mut self, room: RoomId, from: &str, mut signal: CallSignal) -> Option<CallSignal> {
         let Some(mine) = self.call.clone() else {
             // Not in the call. Arrival and departure announcements are still worth
             // surfacing: the first is the only way this device learns a call is happening —
@@ -1207,14 +1587,14 @@ impl Session {
             return match signal.kind {
                 SignalKind::Join => {
                     self.ringing =
-                        Some(Ringing { call: signal.call.clone(), from: from.to_string() });
+                        Some(Ringing { room, call: signal.call.clone(), from: from.to_string() });
                     Some(signal)
                 }
                 SignalKind::Leave => {
                     // Whoever was calling has given up. Forgetting the id stops a later
                     // `call_join` adopting a call nobody is in; if somebody else is still in
                     // it, their acknowledgement renames this device into it anyway.
-                    if self.ringing.as_ref().is_some_and(|r| r.call == signal.call) {
+                    if self.ringing.as_ref().is_some_and(|r| r.room == room && r.call == signal.call) {
                         self.ringing = None;
                     }
                     Some(signal)
