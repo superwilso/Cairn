@@ -463,3 +463,21 @@ test("rooms that could not be searched are named, and clearing restores the list
     assert.ok(!(await page.isVisible("#search-results")));
     await page.close();
 });
+
+// Found by looking at a screenshot: profile.js and settings.js each put an avatar on every
+// message, and the profile's fell below the first, so every message showed two.
+test("each message shows its sender's avatar once", { skip }, async () => {
+    const fake = new FakeSession();
+    fake.history = [
+        msg(BOB, "first", 1_000, { id: ID1 }),
+        msg(BOB, "second, grouped under the first", 2_000, { id: "b2".repeat(32) }),
+    ];
+    const page = await openApp(browser, fake);
+    await page.waitForSelector("#timeline li.msg");
+    const counts = await page.$$eval("#timeline li.msg", (lis) =>
+        lis.map((li) => li.querySelectorAll(":scope > .avatar, :scope > .pf-avatar").length));
+    assert.deepStrictEqual(counts, [1, 1]);
+    assert.ok(await page.isVisible("#timeline li.msg:first-child > .avatar"), "and it is visible");
+    await shoot(page, "one-avatar");
+    await page.close();
+});

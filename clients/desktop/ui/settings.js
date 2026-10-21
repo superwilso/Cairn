@@ -443,10 +443,18 @@ const CairnLook = (() => {
         li.style.setProperty("--h", hue(ini));
         li.dataset.from = m.sender;
 
-        const av = document.createElement("span");
-        av.className = "avatar";
-        av.textContent = ini;
-        av.setAttribute("aria-hidden", "true");
+        // profile.js has already put the sender's own avatar on the message (their image or
+        // colours, and the card on click). That one takes the avatar slot; drawing a second
+        // beside it left every message with two, the profile's falling below the first.
+        let av = li.querySelector(":scope > .pf-avatar");
+        if (av) {
+            av.classList.add("avatar");
+        } else {
+            av = document.createElement("span");
+            av.className = "avatar";
+            av.textContent = ini;
+            av.setAttribute("aria-hidden", "true");
+        }
         av.style.setProperty("--h", hue(ini));
 
         const head = document.createElement("div");
