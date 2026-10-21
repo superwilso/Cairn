@@ -211,12 +211,15 @@ Two things the UI states rather than hides, because both are real:
 
 `wry` registers a WebView2 permission handler for the clipboard only, so on Windows a call
 raises WebView2's own microphone/camera prompt and works. On Linux, WebKitGTK's
-`permission-request` signal is unhandled and its default is **deny** — so `getUserMedia`
-fails and calls cannot start. Chat is unaffected.
+`permission-request` signal went unhandled and its default is **deny**, so `getUserMedia`
+failed and calls could not start.
 
-The fix is a `permission-request` handler reached through `with_webview`, which means a
-Linux-only `webkit2gtk` dependency on this crate. Not taken yet because Windows is the
-target; recorded here so it is a decision rather than a mystery.
+`grant_media_requests` in `src-tauri/src/main.rs` now answers that signal through
+`with_webview`, with a Linux-only `webkit2gtk` dependency (the same version wry uses). It
+allows microphone, camera and device-list requests only, and only while the webview shows the
+app's own bundled UI. There is no system prompt on Linux as there is on Windows: the click that
+starts or joins a call is the consent. It compiles and passes clippy; it has not yet been run
+on a real Linux desktop with a microphone.
 
 ## Attachments
 

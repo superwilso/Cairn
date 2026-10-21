@@ -22,6 +22,11 @@ serde_json = { workspace = true }
 # does not otherwise need. The URL is checked below the FFI line first (`embed::openable`).
 open = "5"
 
+# Linux only: WebKitGTK denies getUserMedia unless the app answers its `permission-request`
+# signal, and wry only answers the clipboard one. Same version and feature level wry uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
+
 [features]
 # Tauri's own convention; kept so `cargo tauri build` behaves.
 custom-protocol = ["tauri/custom-protocol"]

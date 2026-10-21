@@ -6,13 +6,11 @@
 # installer packager, and what it produces is a release, not a check — `ci.yml` already
 # builds and tests every platform. This runs only on a version tag or when asked by hand.
 #
-# ## Windows only, for now
+# ## Windows and Linux
 #
-# That is where the client is. WebView2 is the only webview it has been exercised against,
-# and the Linux build has a known gap — WebKitGTK denies the microphone permission because
-# `wry` only handles the clipboard one, so calls cannot start (clients/desktop/README.md).
-# Shipping a Linux bundle with a call button that silently fails is worse than shipping none.
-# The Linux leg is commented out rather than deleted so turning it on is one line.
+# Linux was held back while WebKitGTK denied the microphone (wry answers only the clipboard
+# permission). The client now answers WebKitGTK's permission-request signal for media itself
+# (`grant_media_requests` in main.rs), so the Linux leg is on. No macOS build yet.
 #
 # ## What has and has not been exercised
 #
@@ -72,9 +70,9 @@ jobs:
           - os: windows-latest
             name: Windows (x86_64)
             bundles: nsis,msi
-          # - os: ubuntu-22.04
-          #   name: Linux (x86_64)
-          #   bundles: deb,appimage
+          - os: ubuntu-22.04
+            name: Linux (x86_64)
+            bundles: deb,appimage
 
     steps:
       - uses: actions/checkout@v4
@@ -88,7 +86,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf file
 
       - uses: Swatinem/rust-cache@v2
 
@@ -160,8 +158,9 @@ jobs:
 
             ### Downloads
 
-            - `Cairn_*_x64-setup.exe` — the desktop client installer (or the `.msi`).
-            - `cairn-server.exe` — an instance server, so you can run your own without Rust.
+            - **Windows:** `Cairn_*_x64-setup.exe` (or the `.msi`), and `cairn-server.exe`.
+            - **Linux:** `Cairn_*_amd64.AppImage` (or the `.deb`), and `cairn-server`. The
+              AppImage needs `chmod +x` and WebKitGTK 4.1 (most current distros ship it).
 
             Neither is code-signed, so Windows SmartScreen will warn you: **More info → Run
             anyway**.
@@ -197,7 +196,8 @@ jobs:
             - **Voice channels are audio only**, with no TURN in front of the SFU, and you leave
               the channel if you open another room.
             - **Rings only reach the room you have open.**
-            - **Windows only.** No macOS build; on Linux, WebKitGTK denies the microphone.
+            - **No macOS build.** Linux calls are new in this build: microphone access is now
+              granted by the app itself, but has not yet been tried on a real Linux desktop.
             - **No key backup.** Losing the profile directory loses that device's history.
             - Only exercised in Chromium-based test harnesses and WebView2 builds, never by a
               person on two real machines. Expect rough edges and please report them.
@@ -223,3 +223,13 @@ jobs:
             2. Install and open Cairn, enter `http://127.0.0.1:8080` as the instance, pick a
                username, and paste one of the invite codes.
             3. Your friend does the same with the other code, pointing at your instance.
+
+            **On Linux** the same steps work in a terminal:
+
+            ```bash
+            chmod +x cairn-server Cairn_*_amd64.AppImage
+            CAIRN_REGISTRATION_POLICY=invite_only \
+              CAIRN_INVITES=me-7f3k9q2m4x8w,friend-2n6v1r5t9z3c \
+              CAIRN_SFU_BIND=127.0.0.1:3480 ./cairn-server &
+            ./Cairn_*_amd64.AppImage
+            ```
