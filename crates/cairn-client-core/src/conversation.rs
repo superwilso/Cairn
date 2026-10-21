@@ -192,6 +192,20 @@ impl Conversation {
         self.group.as_mut()
     }
 
+    /// Whether a commit this device built is waiting to be settled. See
+    /// [`cairn_crypto::mls::GroupHandle::stage_add`].
+    pub fn has_pending_commit(&self) -> bool {
+        self.group.as_ref().is_some_and(GroupHandle::has_pending_commit)
+    }
+
+    /// Drop this device's pending commit: it never reached the instance.
+    pub fn discard_commit(&mut self) -> Result<(), ConversationError> {
+        if let Some(group) = self.group.as_mut() {
+            group.discard_commit()?;
+        }
+        Ok(())
+    }
+
     /// Everyone in this conversation, as the MLS group's own state records them.
     ///
     /// Empty for a T3 conversation, which has no group: its membership is the server's to

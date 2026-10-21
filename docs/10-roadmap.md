@@ -461,10 +461,19 @@ Four calls made by the owner, so a session does not re-litigate them:
       past one for good. A failed commit (a full disk) left the change live in memory until
       the next restart undid it, and refused the retry of a registration as already claimed.
 
-      **Found, not yet fixed:** an MLS commit whose upload is lost leaves its sender alone
-      in the next epoch — nobody can read them again and the newcomer is never welcomed.
-      After a server restart a voice client still believes it is seated while the instance
-      has no seats.
+      **Fixed, client:** an MLS commit whose upload was lost left its sender alone in the
+      next epoch — nobody could read them again, and the person being admitted was never
+      welcomed nor listed as waiting. A commit is now held pending until the instance
+      accepts it, and an upload that fails is settled by the next poll: kept and followed
+      if it is in the log (its welcome goes then), forgotten if it is not. Sending waits
+      while one is unsettled. **Left open:** the held welcome lives in memory, so a client
+      restart in that window still strands the newcomer; and a commit could in principle
+      land after the poll that gave up on it, if the instance were still working on a
+      request whose connection had already died.
+
+      **Found, not yet fixed:** after a server restart a voice client still believes it is
+      seated while the instance has no seats. `cairn-cli` adds members with the old
+      apply-first call.
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
 

@@ -314,6 +314,13 @@ struct OpenRoom {
     roles: Option<HashMap<UserId, String>>,
     /// When `roles` was last read. On the timer's clock — never because a set arrived.
     roles_checked_ms: i64,
+    /// The welcome that goes with this device's pending commit, held until the commit is
+    /// known to have landed. Sent early, it would invite someone into an epoch nobody else
+    /// may ever reach.
+    held_welcome: Option<Vec<u8>>,
+    /// Welcomes whose commits landed, not yet sent. In memory only, like `held_welcome`: a
+    /// restart before they go leaves the newcomer in the group but never welcomed.
+    unsent_welcomes: Vec<Vec<u8>>,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -544,6 +551,8 @@ impl Session {
             labels: HashMap::new(),
             roles: None,
             roles_checked_ms: now_ms(),
+            held_welcome: None,
+            unsent_welcomes: Vec::new(),
         };
         self.relabel(&mut open);
         self.refresh_roles(&mut open);
@@ -647,6 +656,8 @@ impl Session {
             labels,
             roles: None,
             roles_checked_ms: now_ms(),
+            held_welcome: None,
+            unsent_welcomes: Vec::new(),
         });
         // Who may change the room's custom set, read now rather than when a set arrives.
         if let Some(mut open) = self.open.take() {
@@ -826,7 +837,19 @@ impl Session {
                 continue;
             }
 
-            match open.convo.receive(&message.envelope) {
+            let unsettled = open.convo.has_pending_commit();
+            let outcome = open.convo.receive(&message.envelope);
+            if unsettled && !open.convo.has_pending_commit() {
+                if message.envelope.sender_device == self.client.device() {
+                    // Ours, back from the log: it landed even though the upload failed.
+                    open.unsent_welcomes.extend(open.held_welcome.take());
+                } else {
+                    // Someone else's commit was sequenced first, and `mls-rs` dropped ours
+                    // for it. Whoever this device was adding was not added: still waiting.
+                    open.held_welcome = None;
+                }
+            }
+            match outcome {
                 Ok(TimelineEvent::Message(received)) => {
                     // Signalling first: it arrives as an ordinary encrypted message with an
                     // empty body, and rendering that in the timeline would show every
@@ -966,6 +989,16 @@ impl Session {
         {
             let _ = verify::observe_roster(&open.convo, &mut self.contacts);
         }
+
+        // A commit of ours still pending after the whole log has been read never reached the
+        // instance — the upload failed before this poll began, and the instance commits a
+        // message within the request that carries it. Dropped, so this device stays in the
+        // epoch everyone else is in.
+        if open.convo.has_pending_commit() {
+            let _ = open.convo.discard_commit();
+            open.held_welcome = None;
+        }
+        let _ = self.flush_welcomes(&mut open);
 
         if let Some(live) = self.recheck_timer(&mut open, &mut events) {
             // An expired message takes the only in-memory key to its attachment with it.
@@ -1369,26 +1402,55 @@ impl Session {
 
     fn admit_one(&mut self, user: UserId) -> Result<(), SessionError> {
         let claimed = self.client.claim_key_packages(user)?;
-        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
-        for package in &claimed {
+        // Taken out for the duration, so a welcome can be sent through `self` with the room
+        // in hand; put back whatever happens.
+        let mut open = self.open.take().ok_or(SessionError::NoRoomOpen)?;
+        let result = self.admit_packages(&mut open, &claimed);
+        let recorded = self.index.record(open.convo.room(), &open.seal, open.convo.group_id());
+        self.open = Some(open);
+        result?;
+        Ok(recorded?)
+    }
+
+    fn admit_packages(
+        &mut self,
+        open: &mut OpenRoom,
+        claimed: &[crate::client::ClaimedKeyPackage],
+    ) -> Result<(), SessionError> {
+        for package in claimed {
             let bytes = hex::decode(&package.key_package).map_err(|_| SessionError::NoGroupYet)?;
             let key_package = cairn_crypto::mls::parse_message(&bytes)?;
             let group = open.convo.group_mut().ok_or(SessionError::NoGroupYet)?;
-            let output = group.add_member(key_package)?;
-
+            let output = group.stage_add(key_package)?;
             let commit = output.commit.to_bytes().map_err(|_| SessionError::NoGroupYet)?;
-            let wrapped = open.convo.wrap_handshake(&commit, now_ms())?;
-            self.client.send(open.convo.room(), &wrapped)?;
-            if let Some(welcome) = output.welcome {
-                let bytes = welcome.to_bytes().map_err(|_| SessionError::NoGroupYet)?;
-                let wrapped = open.convo.wrap_handshake(&bytes, now_ms())?;
-                self.client.send(open.convo.room(), &wrapped)?;
-            }
+            // Held before the commit goes, so a commit whose fate is unknown still has its
+            // welcome when a poll finds it in the log.
+            open.held_welcome = match output.welcome {
+                Some(w) => Some(w.to_bytes().map_err(|_| SessionError::NoGroupYet)?),
+                None => None,
+            };
+            relay_commit(&self.client, open, &commit)?;
+            self.flush_welcomes(open)?;
+        }
+        Ok(())
+    }
+
+    /// Send the welcomes held for people this device added, once nothing is pending.
+    ///
+    /// Retried on every poll until it goes: a newcomer whose commit landed is in the group
+    /// and no longer listed as waiting, so nothing else would ever send it again.
+    fn flush_welcomes(&mut self, open: &mut OpenRoom) -> Result<(), SessionError> {
+        if open.convo.has_pending_commit() || open.unsent_welcomes.is_empty() {
+            return Ok(());
         }
         let room = open.convo.room();
-        self.index.record(room, &open.seal, open.convo.group_id())?;
-        // This device committed the add, so no poll will report it here — and the new member
-        // still needs this account's profile, sent after the welcome.
+        while let Some(welcome) = open.unsent_welcomes.first() {
+            let wrapped = open.convo.wrap_handshake(welcome, now_ms())?;
+            self.client.send(room, &wrapped)?;
+            open.unsent_welcomes.remove(0);
+        }
+        // This device committed the add, so its own poll reports nothing to prompt these —
+        // and the new member still needs this account's profile, sent after the welcome.
         let _ = self.profiles.resend(&room);
         let _ = self.custom.mark_due(&room);
         Ok(())
@@ -1413,6 +1475,26 @@ impl Session {
         self.index.record(room, &seal, None)?;
         Ok(room.to_string())
     }
+}
+
+/// Upload a commit this device staged, and settle it if the instance accepted it.
+///
+/// On any failure the commit stays pending rather than being applied or dropped, because a
+/// failed request does not say whether the instance stored it: a connection lost after the
+/// request went out looks the same as one refused before it. The next poll reads the log
+/// and settles it either way. Applying first, as this used to, put the committer alone in
+/// an epoch nobody else reached whenever the upload was lost — a probe that dropped one
+/// commit on its way to the instance left the room unable to read its owner for good.
+fn relay_commit(
+    client: &Client<HttpTransport>,
+    open: &mut OpenRoom,
+    commit: &[u8],
+) -> Result<(), SessionError> {
+    let wrapped = open.convo.wrap_handshake(commit, now_ms())?;
+    client.send(open.convo.room(), &wrapped)?;
+    open.convo.group_mut().ok_or(SessionError::NoGroupYet)?.confirm_commit()?;
+    open.unsent_welcomes.extend(open.held_welcome.take());
+    Ok(())
 }
 
 /// Link-preview settings for one profile, persisted beside its state.
