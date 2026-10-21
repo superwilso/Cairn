@@ -288,8 +288,16 @@ fn a_member_removed_from_the_room_stops_hearing_its_voice_channel() {
             carol.user_id().parse().unwrap(),
         )
         .unwrap();
-    // One forwarding decision is enough; leave generous room for packets already in flight.
-    std::thread::sleep(Duration::from_millis(300));
+    // One forwarding decision is enough, but packets already written before it can still be
+    // arriving: a fixed 300 ms was not enough on a loaded Windows runner, where 6 frames
+    // trickled in after it (against ~50 a second while forwarding). So wait for the counts
+    // to stop moving. Forwarding that never stopped would never settle, and fails here.
+    let mut settled = (heard(&pc, "alice"), heard(&pb, "carol"));
+    wait_for("the removed member's audio to stop", || {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = (heard(&pc, "alice"), heard(&pb, "carol"));
+        std::mem::replace(&mut settled, now) == now
+    });
     let before = (heard(&pc, "alice"), heard(&pb, "carol"));
     std::thread::sleep(Duration::from_secs(1));
     let after = (heard(&pc, "alice"), heard(&pb, "carol"));
