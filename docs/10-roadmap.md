@@ -530,7 +530,9 @@ Four calls made by the owner, so a session does not re-litigate them:
       now written down and pinned by a test that fails if a dependency bump changes one.
       **Not ticked** until someone who has not read the source tries to implement against
       it — the item's own test, and the only one that can say the draft is good enough.
-- [ ] Public threat model review invited
+- [x] Public threat model review invited — [#31](https://github.com/superwilso/Cairn/issues/31),
+      volunteer review only; a paid audit is M5's. The spec's outsider test is open as
+      [#32](https://github.com/superwilso/Cairn/issues/32).
 - [x] Build and contribution instructions that work on a clean machine. Checked by
       building a fresh clone as an ordinary user with an empty cargo home: Rust 1.88+ and
       a C compiler are all the server, CLI and libraries need. The README and
