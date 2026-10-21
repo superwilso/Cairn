@@ -514,7 +514,15 @@ Four calls made by the owner, so a session does not re-litigate them:
       from their publishers at the owner's request; map in `README.md`. The trademark
       policy and the AGPL boundary note in ADR-004 are still open.
 - [ ] **Name clearance** — USPTO/EUIPO, domains *(owner; may rename, see `NAMING.md`)*
-- [ ] Protocol specification good enough for an outsider to implement against
+- [ ] Protocol specification good enough for an outsider to implement against.
+      **Drafted:** [`15-protocol.md`](15-protocol.md) covers identity, request and envelope
+      signing, rooms and membership, MLS usage, the encrypted body, franking, attachments
+      and the HTTP surface, each from the code. Writing it found a live hole: a member could
+      replay someone else's signed envelope, and get it franked again at a new position —
+      now refused (§5.3). The MLS wire choices it depends on (§7.1) are `mls-rs` defaults,
+      now written down and pinned by a test that fails if a dependency bump changes one.
+      **Not ticked** until someone who has not read the source tries to implement against
+      it — the item's own test, and the only one that can say the draft is good enough.
 - [ ] Public threat model review invited
 - [ ] Build and contribution instructions that work on a clean machine
 - [ ] Reproducible builds investigated
