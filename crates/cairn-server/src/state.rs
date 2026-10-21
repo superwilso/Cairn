@@ -34,6 +34,10 @@ pub enum ServerError {
     Shape(#[from] ShapeError),
     #[error("malformed franking commitment")]
     BadCommitment,
+    /// This room already holds a different envelope with this id, or held this one and
+    /// purged it. An identical resend of one still held is answered as the original was.
+    #[error("this room has already accepted a message with that id")]
+    DuplicateMessage,
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("message is not signed")]
@@ -1831,6 +1835,23 @@ impl Instance {
 
         envelope.validate_for_tier(room.seal.tier())?;
 
+        // An envelope is accepted once. Its signature covers who, where and what, but not
+        // *when in the room*: that is the sequence number the instance assigns. Accepting a
+        // resubmission let any member who had read someone's message post it again under
+        // their name, at a point of the member's choosing, with a fresh franking tag that
+        // chains it after whatever the member had just said — a report built that way
+        // verifies. Under the rooms lock, so two copies racing each other cannot both pass.
+        //
+        // The sender's own retry of a send whose answer was lost is the honest case, and it
+        // gets the original receipt back rather than an error, so it is safe to retry.
+        // Before the budget, so a replay does not spend the victim's.
+        if let Some(seen) = self.storage.message_by_id(envelope.room, envelope.id)? {
+            return match seen.stored {
+                Some(original) if original.envelope == envelope => Ok(original),
+                _ => Err(ServerError::DuplicateMessage),
+            };
+        }
+
         // After authentication and membership, so neither an impostor nor an outsider can
         // spend a member's budget, and before the sequence number moves, so a refused
         // message leaves no gap in the room's franking chain.
@@ -3587,6 +3608,13 @@ pub(crate) mod tests {
             after: u64,
         ) -> Result<Vec<StoredMessage>, StorageError> {
             self.inner.messages_since(room, after)
+        }
+        fn message_by_id(
+            &self,
+            room: RoomId,
+            id: cairn_proto::MessageId,
+        ) -> Result<Option<crate::storage::SeenMessage>, StorageError> {
+            self.inner.message_by_id(room, id)
         }
         fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
             self.inner.blob_meta(id)
@@ -6288,6 +6316,13 @@ mod spaces {
         ) -> Result<Vec<StoredMessage>, StorageError> {
             self.inner.messages_since(room, after)
         }
+        fn message_by_id(
+            &self,
+            room: RoomId,
+            id: cairn_proto::MessageId,
+        ) -> Result<Option<crate::storage::SeenMessage>, StorageError> {
+            self.inner.message_by_id(room, id)
+        }
         fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
             self.inner.blob_meta(id)
         }
@@ -6398,6 +6433,13 @@ mod resilience {
             after: u64,
         ) -> Result<Vec<StoredMessage>, StorageError> {
             self.inner.messages_since(room, after)
+        }
+        fn message_by_id(
+            &self,
+            room: RoomId,
+            id: cairn_proto::MessageId,
+        ) -> Result<Option<crate::storage::SeenMessage>, StorageError> {
+            self.inner.message_by_id(room, id)
         }
         fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
             self.inner.blob_meta(id)
