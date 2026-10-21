@@ -74,6 +74,10 @@ pub struct ChannelDisplay {
     /// Whether this device holds the channel's encrypted group.
     pub joined: bool,
     pub overrides: Option<Vec<OverrideDisplay>>,
+    /// Messages from others that arrived while it was not open, and how many mention this
+    /// account. Counted on this device; see [`super::UnreadView`].
+    pub unread: u32,
+    pub mentions: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,7 +154,10 @@ impl Session {
         for c in &view.channels {
             let seal = checked_channel_seal(&view, c)?;
             self.index.record_channel(c.room, &seal, view.id)?;
+            let unread = self.unread.get(&c.room).copied().unwrap_or_default();
             channels.push(ChannelDisplay {
+                unread: unread.count,
+                mentions: unread.mentions,
                 id: c.room.to_string(),
                 name: c.name.clone(),
                 tier: seal.tier().label(),

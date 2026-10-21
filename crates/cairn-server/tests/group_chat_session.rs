@@ -558,7 +558,7 @@ mod calls {
     fn wait_for(who: &mut Session, kind: SignalKind) -> Option<(String, CallSignal)> {
         for _ in 0..8 {
             for event in who.poll().unwrap() {
-                if let Event::Signal { from, signal } = event {
+                if let Event::Signal { from, signal, .. } = event {
                     if signal.kind == kind {
                         return Some((from, signal));
                     }

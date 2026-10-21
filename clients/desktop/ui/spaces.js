@@ -17,6 +17,9 @@ const CairnSpaces = (() => {
     let active = null;        // the open space's id, or null for Home
     let view = null;          // the open space as Rust described it
     let openChannel = null;
+    // Channel names seen in any space this session, so a ring or the voice bar can say
+    // "#general" for a channel whose space is not the one on screen.
+    const names = new Map();
 
     const has = (perm) => !!view && view.my_permissions.includes(perm);
     const err = (e) => api.fail($("error"), e);
@@ -67,6 +70,7 @@ const CairnSpaces = (() => {
             list.append(li);
         }
         $("rail-home").classList.toggle("active", active === null);
+        if (api.paintUnread) api.paintUnread();
     }
 
     // Two letters from the name, as Discord does. Display only; a name is not an identity.
@@ -140,6 +144,7 @@ const CairnSpaces = (() => {
         const list = $("channels");
         list.textContent = "";
         for (const c of view.channels) {
+            names.set(c.id, c.name);
             const li = document.createElement("li");
             li.dataset.channel = c.id;
             li.className = c.id === openChannel ? "active" : "";
@@ -172,6 +177,7 @@ const CairnSpaces = (() => {
             li.onclick = () => api.selectRoom(c.id);
             list.append(li);
         }
+        if (api.paintUnread) api.paintUnread();
         if (view.channels.length === 0) {
             const li = document.createElement("li");
             li.className = "empty";
@@ -359,5 +365,5 @@ const CairnSpaces = (() => {
     // `waiting` marks may have too.
     function membershipChanged() { if (active) reload(); }
 
-    return { bind, signedIn, opened, membershipChanged, reload };
+    return { bind, signedIn, opened, membershipChanged, reload, channelName: (id) => names.get(id) || null };
 })();

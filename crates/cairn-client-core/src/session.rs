@@ -2067,6 +2067,7 @@ fn view(
         // the recipient-fetches-nothing rule (`docs/05-embeds.md`).
         card: entry.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),
         sticker: entry.sticker.clone(),
+        mentions_me: false,
         body,
     }
 }

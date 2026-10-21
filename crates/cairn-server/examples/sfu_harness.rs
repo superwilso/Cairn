@@ -12,7 +12,7 @@
 //! Rust reference implementation. That is how the test proves the SFU held ciphertext, and
 //! that JavaScript and Rust agree on the frame format.
 //!
-//! Requests:  {"id": n, "op": "setup", "names": ["alice", "bob"]}
+//! Requests:  {"id": n, "op": "setup", "names": ["alice", "bob"], "rooms": 2}
 //!            {"id": n, "op": "invoke", "as": "alice", "cmd": "voice_state", "args": {}}
 //!            {"id": n, "op": "tap"}
 //!            {"id": n, "op": "remove", "as": "alice", "target": "bob"}
@@ -85,7 +85,8 @@ fn main() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// One room, everyone in its MLS group, everyone with the room open.
+/// `rooms` rooms (one unless asked), everyone in each one's MLS group, everyone with the last
+/// one open. The first is the one `remove` acts on.
 fn setup(
     req: &Value,
     base: &str,
@@ -108,7 +109,26 @@ fn setup(
         sessions.insert(name.clone(), s);
     }
     let owner = &names[0];
-    *room = sessions.get_mut(owner).unwrap().create_group(50).map_err(err)?;
+    let count = req["rooms"].as_u64().unwrap_or(1).max(1);
+    let mut rooms = Vec::new();
+    for _ in 0..count {
+        let r = sessions.get_mut(owner).unwrap().create_group(50).map_err(err)?;
+        admit_everyone(&names, sessions, &r)?;
+        rooms.push(r);
+    }
+    *room = rooms[0].clone();
+    let users: HashMap<&String, String> =
+        names.iter().map(|n| (n, sessions[n].user_id())).collect();
+    Ok(json!({"room": room, "rooms": rooms, "users": users}))
+}
+
+fn admit_everyone(
+    names: &[String],
+    sessions: &mut HashMap<String, Session>,
+    room: &String,
+) -> Result<(), String> {
+    let err = |e: cairn_client_core::session::SessionError| e.to_string();
+    let owner = &names[0];
     for (i, name) in names.iter().enumerate().skip(1) {
         let token = sessions.get_mut(owner).unwrap().create_invite(1, 24).map_err(err)?;
         sessions.get_mut(name).unwrap().redeem_invite(&token).map_err(err)?;
@@ -124,9 +144,7 @@ fn setup(
             }
         }
     }
-    let users: HashMap<&String, String> =
-        names.iter().map(|n| (n, sessions[n].user_id())).collect();
-    Ok(json!({"room": room, "users": users}))
+    Ok(())
 }
 
 fn invoke(req: &Value, sessions: &mut HashMap<String, Session>) -> Result<Value, String> {
@@ -146,8 +164,33 @@ fn invoke(req: &Value, sessions: &mut HashMap<String, Session>) -> Result<Value,
         "voice_leave" => s.voice_leave().map(|_| Value::Null).map_err(err),
         "voice_state" => to(serde_json::to_value(s.voice_state().map_err(err)?)),
         "voice_keys" => to(serde_json::to_value(s.voice_keys().map_err(err)?)),
+        "voice_call" => to(serde_json::to_value(s.voice_call().map_err(err)?)),
         "poll" => to(serde_json::to_value(s.poll().map_err(err)?)),
         "user_id" => Ok(json!(s.user_id())),
+        // What the whole desktop UI asks for, so a page can run `ui/index.html` against a
+        // real session (`background.browser.test.js`).
+        "sign_in" => Ok(json!({"user": s.user_id(), "tls": s.is_tls()})),
+        "publish_key_packages" => Ok(json!(s.publish_key_packages(2).map_err(err)?)),
+        "rooms" => to(serde_json::to_value(s.rooms())),
+        "unread" => to(serde_json::to_value(s.unread())),
+        "spaces" => to(serde_json::to_value(s.spaces().map_err(err)?)),
+        "open_room" => {
+            to(serde_json::to_value(s.open_room(args["room"].as_str().ok_or("room")?).map_err(err)?))
+        }
+        "open_room_tier" => Ok(json!(s.open_room_tier())),
+        "room_timer" => Ok(json!(s.room_timer().map_err(err)?)),
+        "members" => to(serde_json::to_value(s.members().map_err(err)?)),
+        "profiles" => to(serde_json::to_value(s.profiles().map_err(err)?)),
+        "my_profile" => to(serde_json::to_value(s.my_profile())),
+        "send" => to(serde_json::to_value(s.send(args["text"].as_str().ok_or("text")?).map_err(err)?)),
+        "call_config" => to(serde_json::to_value(s.call_config().map_err(err)?)),
+        "call_join" => Ok(json!(s.call_join().map_err(err)?)),
+        "call_leave" => s.call_leave().map(|_| Value::Null).map_err(err),
+        "call_decline" => s.call_decline().map(|_| Value::Null).map_err(err),
+        "signal" => {
+            let signal = serde_json::from_value(args["signal"].clone()).map_err(|e| e.to_string())?;
+            s.signal(signal).map(|_| Value::Null).map_err(err)
+        }
         other => Err(format!("the harness does not implement {other}")),
     }
 }
