@@ -6326,5 +6326,193 @@ mod spaces {
         assert!(!held.contains(Permissions::KICK), "the failed grant is not in memory");
         inst.messages_since(channel, m.user, 0, 0).expect("nor is the failed kick");
     }
+}
 
+/// Crash and restart resilience: what reaches the disk, in what order, and what memory does
+/// when it does not.
+///
+/// Every test here began as a probe that printed the wrong answer. Spaces already committed
+/// under their lock and changed memory only afterwards (`with_space`); rooms, accounts,
+/// devices, invites, key packages and handles did neither, and nothing had tried them.
+#[cfg(test)]
+mod resilience {
+    use super::spaces::FailingStorage;
+    use super::tests::*;
+    use super::*;
+    use crate::storage::DbStorage;
+    use cairn_proto::{DeviceId, EnvelopePayload, UserId, Username};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// A real store that holds the commit carrying message 1 until message 2 has committed,
+    /// or a short while has passed — standing in for a thread preempted between releasing
+    /// the rooms lock and opening its transaction.
+    #[derive(Debug)]
+    struct HoldFirstMessage {
+        inner: DbStorage,
+        second_landed: (Mutex<bool>, std::sync::Condvar),
+        /// Set if, after any commit, the log held a message without every one before it.
+        gap_seen: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::storage::Storage for HoldFirstMessage {
+        fn load_or_create_franking_key(
+            &self,
+        ) -> Result<cairn_crypto::franking::ServerFrankingKey, StorageError> {
+            self.inner.load_or_create_franking_key()
+        }
+        fn load_directory(&self) -> Result<crate::storage::Directory, StorageError> {
+            self.inner.load_directory()
+        }
+        fn commit(&self, writes: &[Write]) -> Result<(), StorageError> {
+            let seq = writes.iter().find_map(|w| match w {
+                Write::Message(_, m) => Some(m.server_seq),
+                _ => None,
+            });
+            if seq == Some(1) {
+                let (landed, cv) = &self.second_landed;
+                let guard = landed.lock().unwrap();
+                // Bounded: once the rule holds, message 2 cannot reach the disk until this
+                // one has, so waiting for it forever would be a deadlock of the test's own.
+                let _ = cv.wait_timeout_while(guard, Duration::from_millis(300), |l| !*l).unwrap();
+            }
+            let result = self.inner.commit(writes);
+            if let Some(Write::Message(room, _)) =
+                writes.iter().find(|w| matches!(w, Write::Message(..)))
+            {
+                let seqs: Vec<u64> =
+                    self.inner.messages_since(*room, 0)?.iter().map(|m| m.server_seq).collect();
+                if seqs.iter().enumerate().any(|(i, s)| *s != i as u64 + 1) {
+                    self.gap_seen.store(true, Ordering::SeqCst);
+                }
+            }
+            if seq == Some(2) {
+                *self.second_landed.0.lock().unwrap() = true;
+                self.second_landed.1.notify_all();
+            }
+            result
+        }
+        fn messages_since(
+            &self,
+            room: RoomId,
+            after: u64,
+        ) -> Result<Vec<StoredMessage>, StorageError> {
+            self.inner.messages_since(room, after)
+        }
+        fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
+            self.inner.blob_meta(id)
+        }
+        fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.blob_bytes(id)
+        }
+    }
+
+    fn plain(body: &str) -> EnvelopePayload {
+        EnvelopePayload::Plaintext { body: body.into() }
+    }
+
+    #[test]
+    fn an_acknowledged_message_is_never_overwritten_after_a_restart() {
+        // The probe: message 1 held on its way to disk, message 2 sent meanwhile, restart,
+        // send a third. Before the fix the disk's room record was message 1's (next_seq 1),
+        // so the third message was given seq 2 and *replaced* the acknowledged, franked
+        // message 2 in the log.
+        //
+        // The same race was visible live: for as long as message 1 was still on its way, the
+        // log held message 2 alone, a poller following its cursor stepped to 2, and it never
+        // saw message 1 at all. A separate jittered probe lost up to 7 messages in 80 that way.
+        let dir = temp_dir("reorder");
+        let store = Arc::new(HoldFirstMessage {
+            inner: DbStorage::new(&dir).unwrap(),
+            second_landed: Default::default(),
+            gap_seen: Default::default(),
+        });
+        let inst = Arc::new(Instance::open(store.clone()).unwrap());
+        let a = TestSender::registered(&inst);
+        let b = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape(), a.user).unwrap();
+        inst.join_room(room, b.user).unwrap();
+        std::thread::scope(|sc| {
+            let first = a.envelope(room, plain("first"));
+            let i = inst.clone();
+            sc.spawn(move || i.accept(first, 0).unwrap());
+            std::thread::sleep(Duration::from_millis(50));
+            let second = b.envelope(room, plain("second"));
+            let i = inst.clone();
+            sc.spawn(move || i.accept(second, 0).unwrap());
+        });
+        drop(inst);
+        assert!(
+            !store.gap_seen.load(Ordering::SeqCst),
+            "the log showed a message before the one ahead of it, so a poller could skip it"
+        );
+        drop(store);
+
+        let inst = Instance::open(Arc::new(DbStorage::new(&dir).unwrap())).unwrap();
+        let third = inst.accept(a.envelope(room, plain("third")), 0).unwrap();
+        let log: Vec<(u64, String)> = inst
+            .storage
+            .messages_since(room, 0)
+            .unwrap()
+            .into_iter()
+            .map(|m| match m.envelope.payload {
+                EnvelopePayload::Plaintext { body } => (m.server_seq, body),
+                other => panic!("unexpected payload {other:?}"),
+            })
+            .collect();
+        assert_eq!(third.server_seq, 3);
+        assert_eq!(log.len(), 3, "every acknowledged message is still in the log: {log:?}");
+        assert!(log.iter().any(|(_, b)| b == "first") && log.iter().any(|(_, b)| b == "second"));
+    }
+
+    #[test]
+    fn a_write_that_fails_to_persist_leaves_memory_as_it_was() {
+        // A full disk, or any failed commit. The probe found every one of these applied in
+        // memory regardless: the caller was told the request failed while the change worked
+        // until the next restart silently undid it.
+        let storage = Arc::new(FailingStorage::default());
+        let inst = Instance::open(storage.clone()).unwrap();
+        let fail = |on: bool| storage.fail.store(on, Ordering::SeqCst);
+        let o = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(dm_shape(), o.user).unwrap();
+        let (open, _) = inst.create_room(public_shape(), o.user).unwrap();
+
+        // A send: no sequence number consumed, no link in the franking chain to a commitment
+        // that is in no stored message.
+        let (lost, _) = cairn_crypto::commit(b"lost");
+        let e = o
+            .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
+            .with_franking_commitment(lost.to_hex());
+        fail(true);
+        assert!(matches!(inst.accept(o.sign(e), 0), Err(ServerError::Storage(_))));
+        fail(false);
+        let r = inst.rooms.lock().unwrap()[&room].clone();
+        assert_eq!((r.next_seq, r.last_franked), (0, None));
+
+        // Registration: a retry must succeed, not be refused as already claimed.
+        let (user, device) = (UserId::new(), DeviceId::new());
+        let id = cairn_proto::DeviceIdentity::new(user, device).to_credential();
+        let session = cairn_crypto::mls::Session::new(&id).unwrap();
+        fail(true);
+        assert!(inst.claim_account(user, device, session.public_key(), None, 0).is_err());
+        fail(false);
+        inst.claim_account(user, device, session.public_key(), None, 0)
+            .expect("a registration that failed to persist can be retried");
+
+        fail(true);
+        assert!(inst.create_invite("an-invite-token-long-enough", None).is_err());
+        assert!(inst.set_registration_policy(RegistrationPolicy::InviteOnly).is_err());
+        let rooms_before = inst.rooms.lock().unwrap().len();
+        assert!(inst.create_room(dm_shape(), o.user).is_err());
+        assert!(inst.publish_key_packages(o.user, o.device, o.key_packages(2)).is_err());
+        assert!(inst.add_room_member(open, o.user, user).is_err());
+        assert!(inst.claim_username(o.user, Username::parse("probe").unwrap()).is_err());
+        fail(false);
+        assert!(!inst.invites.lock().unwrap().contains_key("an-invite-token-long-enough"));
+        assert_eq!(inst.registration_policy(), RegistrationPolicy::Open);
+        assert_eq!(inst.rooms.lock().unwrap().len(), rooms_before);
+        assert_eq!(inst.key_packages_remaining(o.device), 0);
+        assert!(!inst.rooms.lock().unwrap()[&open].has_member(user));
+        assert_eq!(inst.username_of(o.user), None);
+    }
 }
