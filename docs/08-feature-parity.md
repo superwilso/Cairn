@@ -22,7 +22,7 @@ Legend: ✅ has it · ⚠️ partial or qualified · ❌ lacks it · 🎯 Cairn 
 | Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ per-room, from send |
 | Read receipts (optional) | ⚠️ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Typing indicators | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
-| Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | ⚠️ local history stored, search unbuilt |
+| Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | ✅ desktop, local — every room on this device, current text only; the query never leaves it |
 | Scheduled messages | ❌ | ❌ | ⚠️ | ❌ | ✅ | 🎯 v2 |
 | Voice messages | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ desktop — recorded Opus, sent as an encrypted attachment |
 
@@ -38,7 +38,9 @@ end-to-end encrypted product can.
 **Note on search.** Telegram's server-side search over all history is a genuine advantage
 that E2EE products structurally cannot match. Cairn's tiering means public communities get
 server-side search and private surfaces get local search — better than Signal, worse than
-Telegram, and the trade is explicit rather than hidden.
+Telegram, and the trade is explicit rather than hidden. Only the local half is built: the
+desktop client searches what this device holds, in every tier, and server-side search for
+public rooms does not exist yet.
 
 ## 2. Communities
 

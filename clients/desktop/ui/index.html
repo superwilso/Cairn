@@ -69,6 +69,9 @@
     <symbol id="i-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="12" cy="13.5" r="7.5"/><path d="M12 13.5V9.5M10 2.5h4M18.5 6.5l1.5-1.5"/>
     </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/>
+    </symbol>
     <symbol id="i-react" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="12" cy="12" r="8.5"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9.3 9.8h.01M14.7 9.8h.01"/>
     </symbol>
@@ -156,6 +159,15 @@
       <!-- Not decoration. Over http:// the transport protects nothing, and the UI has to
            say so rather than imply a protection that is not there. -->
       <span id="transport" class="badge"></span>
+    </div>
+    <!-- Search runs in Rust over this device's transcripts; the query never leaves it. -->
+    <label class="search">
+      <svg width="14" height="14"><use href="#i-search"/></svg>
+      <input id="search" type="search" placeholder="Search messages" aria-label="Search messages on this device" autocomplete="off" spellcheck="false">
+    </label>
+    <div id="search-results" hidden>
+      <ul id="search-hits"></ul>
+      <p id="search-note" class="hint"></p>
     </div>
     <form id="space-create" class="rail-form" hidden>
       <input id="space-create-name" placeholder="Space name" spellcheck="false" autocomplete="off" maxlength="100">
@@ -499,6 +511,7 @@
 <script src="messages.js"></script>
 <script src="profile.js"></script>
 <script src="spaces.js"></script>
+<script src="search.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

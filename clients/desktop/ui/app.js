@@ -1007,6 +1007,13 @@ CairnVoicePanel.init({
     openRoom: (room) => selectRoom(room),
     openRoomId: () => openRoom,
 });
+CairnSearch.init({
+    openRoom: (room) => selectRoom(room),
+    current: () => openRoom,
+    short,
+    roomLabel: (room) => roomLabel(room),
+    onError: (e) => fail($("error"), e),
+});
 CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
 CairnSpaces.bind({ invoke, selectRoom, addNotice, fail, short, initials, me: () => myUser, paintUnread: () => paintUnread() });
 

@@ -286,6 +286,17 @@ pub struct Revised {
     pub quote: QuoteView,
 }
 
+/// Most search results handed to a frontend, newest first.
+const MAX_SEARCH_HITS: usize = 100;
+
+/// What a search found, and which rooms it could not look in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub hits: Vec<crate::search::SearchHit>,
+    /// Rooms skipped because their timer could not be read — see [`Session::search`].
+    pub unsearched: Vec<String>,
+}
+
 /// Something that happened while polling, for a frontend to render in the timeline.
 ///
 /// The size lint is allowed: events live for one poll on their way to being serialised, and
@@ -715,6 +726,39 @@ impl Session {
             .collect();
         rooms.sort_by(|a, b| a.room.cmp(&b.room));
         rooms
+    }
+
+    /// Search every transcript on this device. The query never leaves it.
+    ///
+    /// Each room is swept against its timer before it is searched, with the timer read
+    /// fresh from the instance. A room whose timer cannot be read is **skipped and named**
+    /// in [`SearchResults::unsearched`] rather than searched as if it had none: assuming "no
+    /// timer" is exactly how a device that was offline when a message expired would bring
+    /// it back. The instance therefore sees one timer lookup per room with a transcript —
+    /// that a search-shaped burst happened, never what was searched for.
+    pub fn search(&self, query: &str) -> Result<SearchResults, SessionError> {
+        let mut results = SearchResults { hits: Vec::new(), unsearched: Vec::new() };
+        if query.trim().is_empty() {
+            return Ok(results);
+        }
+        let now = now_ms();
+        let rooms: Vec<RoomId> = self.index.rooms().map(|(room, _)| *room).collect();
+        for room in rooms {
+            // Read without a timer only to see whether there is anything to search; this
+            // pass deletes nothing and matches nothing.
+            if self.history.replay(room, None, now)?.is_empty() {
+                continue;
+            }
+            let Ok(ttl) = self.client.room_ttl(room) else {
+                results.unsearched.push(room.to_string());
+                continue;
+            };
+            let live = self.history.replay(room, ttl, now)?;
+            results.hits.extend(crate::search::search_entries(&room.to_string(), &live, query));
+        }
+        results.hits.sort_by_key(|h| std::cmp::Reverse(h.sent_at_ms));
+        results.hits.truncate(MAX_SEARCH_HITS);
+        Ok(results)
     }
 
     /// Move the open room into the background, still live, so switching away from it does

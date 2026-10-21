@@ -102,6 +102,16 @@ fn rooms(state: State<'_, AppState>) -> CmdResult<Vec<RoomSummary>> {
     Ok(session.rooms())
 }
 
+/// Search this device's transcripts. Runs entirely in Rust, over local history; the query is
+/// never sent anywhere.
+#[tauri::command]
+fn search(
+    state: State<'_, AppState>,
+    query: String,
+) -> CmdResult<cairn_client_core::session::SearchResults> {
+    with(&state, |s| s.search(&query))
+}
+
 /// What is unread in rooms that are not open, counted by Rust from what it decrypted. For
 /// the first draw; after that `poll` says when it changes.
 #[tauri::command]
@@ -855,6 +865,7 @@ fn main() {
             create_direct,
             rooms,
             unread,
+            search,
             open_room,
             open_room_tier,
             send,

@@ -27,6 +27,7 @@ pub mod gifs;
 pub mod history;
 pub mod mention;
 pub mod profile;
+pub mod search;
 #[cfg(feature = "http")]
 pub mod session;
 pub mod spaces;
