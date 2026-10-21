@@ -92,86 +92,93 @@ if command -v node >/dev/null 2>&1; then
     # SDP-level fault: a transceiver the answering side pre-created and the offer would not
     # reuse made every call connect cleanly and carry video one way only. Skips itself, with
     # a note, when Playwright's Chromium is not present.
+    #
+    # /opt/pw-browsers is where the development container keeps its Chromium. It is only a
+    # default: `npx playwright install` puts Chromium in Playwright's own cache, and pointed at
+    # a directory with no Chromium in it, a browser test fails rather than skipping.
+    if [ -z "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ -d /opt/pw-browsers ]; then
+        export PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+    fi
     if [ "$MODE" != "quick" ]; then
         run "desktop call in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/call.browser.test.js
         run "desktop calls UI between two browsers" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/calls.browser.test.js
         run "desktop safety panel in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/safety.browser.test.js
         run "desktop attachments in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/attachments.browser.test.js
 
         # The messaging UI against a stand-in for the Rust session. The decisions are Rust's
         # and tested in cargo; this checks the half that is drawn.
         run "desktop messaging UI in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/messaging.browser.test.js
         run "desktop edits and deletes in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/edits.browser.test.js
         run "desktop voice notes in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/voice.browser.test.js
         run "desktop GIF picker in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/gifs.browser.test.js
         run "desktop profiles in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/profile.browser.test.js
         run "desktop link cards in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/linkcards.browser.test.js
 
         # Appearance settings: that themes, accent, custom CSS and theme import/export work,
         # and that none of them can hide or repaint an encryption indicator.
         run "desktop appearance settings in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/settings.browser.test.js
 
         # Custom emoji: drawn from the local cache by id, never fetched at render time. And
         # the soundboard, mixed into a real call's microphone track and heard at the far end.
         run "desktop custom emoji in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/emoji.browser.test.js
         run "desktop soundboard in a real call" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/soundboard.browser.test.js
         # Spaces: that the rail and channel list draw the instance's permission flags and
         # decide none of them. The rules themselves are attacked in cargo (ADR-011).
         run "desktop spaces in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/spaces.browser.test.js
 
         # Voice channels: the panel against a stand-in, then sealed audio through the real
         # SFU between real browsers (builds the `sfu_harness` example on first run).
         run "desktop voice-channel panel in a browser" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/voicepanel.browser.test.js
         # Built first, as in CI: otherwise the build counts against the test's timeout.
         run "build the SFU harness" \
             cargo build -q -p cairn-server --example sfu_harness --features test-tap
         run "desktop voice channel through the SFU" \
-            env PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+            env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/voicechannel.browser.test.js
     fi
