@@ -124,6 +124,12 @@ jobs:
         env:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/messaging.browser.test.js
+      - name: Edits and delete-for-everyone in a browser
+        # Buttons only where Rust allowed them, the edited marker and its history, quotes that
+        # follow an edit, and a delete warning that promises no more than the protocol does.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/edits.browser.test.js
       - name: Voice notes in the real UI
         # Chromium's fake microphone feeds MediaRecorder, so a real recording is made, sent
         # as bytes, and played back through the waveform player.

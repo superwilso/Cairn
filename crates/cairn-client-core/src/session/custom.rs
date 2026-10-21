@@ -395,10 +395,12 @@ impl Session {
             reaction: None,
             card: None,
             sticker: Some(name.to_owned()),
+            edit: None,
+            deleted: false,
         };
         self.history.append(room, &entry)?;
         open.thread.record(&entry);
-        Ok(view(&entry, &open.thread, &open.labels, false))
+        Ok(view(&entry, &open.thread, &open.labels, false, self.client.user()))
     }
 
     /// A set arrived from `sender` at the instance's sequence `seq`. Applied if the room's
