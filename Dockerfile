@@ -34,6 +34,13 @@ RUN apt-get update \
 
 # Unprivileged. The server needs nothing but its own data directory.
 RUN useradd --system --create-home --uid 10001 cairn
+# The data directory has to exist in the image, owned by `cairn`, before the VOLUME below.
+# A new volume (anonymous, or the compose file's named `cairn-data`) copies its ownership
+# from the image's directory, and with none there it is created root-owned: the server
+# then exited at boot with "Permission denied", so the image as shipped never started.
+# Found by running the image, which had never been done. Owner-only, since it holds the
+# franking key.
+RUN mkdir -p /data && chown cairn:cairn /data && chmod 0700 /data
 USER cairn
 
 COPY --from=build /src/target/release/cairn-server /usr/local/bin/cairn-server
