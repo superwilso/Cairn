@@ -810,10 +810,14 @@ impl Session {
         names
     }
 
-    fn mentions_me(&self, room: &RoomId, entry: &HistoryEntry) -> bool {
+    /// Judged on `shown`, the text the view carries — after any edit. Judging the text first
+    /// sent was found by a probe to get both directions wrong: an edit that added a mention
+    /// went unmarked, and one that removed it stayed highlighted.
+    fn mentions_me(&self, room: &RoomId, entry: &HistoryEntry, shown: &str) -> bool {
         entry.sender != self.client.user()
             && entry.reaction.is_none()
-            && crate::mention::mentions(&String::from_utf8_lossy(&entry.body), &self.my_names(room))
+            && !entry.deleted
+            && crate::mention::mentions(shown, &self.my_names(room))
     }
 
     /// Open a room, resuming its encrypted group if this device holds one.
@@ -868,7 +872,7 @@ impl Session {
             .filter(|e| e.is_original())
             .map(|e| {
                 let mut v = view(e, &thread, &labels, true, me);
-                v.mentions_me = self.mentions_me(&room, e);
+                v.mentions_me = self.mentions_me(&room, e, &v.body);
                 v
             })
             .collect();
@@ -1413,7 +1417,14 @@ impl Session {
                     open.thread.record(&entry);
                     if let Some(target) = &entry.edit {
                         let me = self.client.user();
-                        if let Some(revised) = revised(&self.history, &open, me, target) {
+                        if let Some(mut revised) = revised(&self.history, &open, me, target) {
+                            // An edit can add a mention or take one away; the view says which.
+                            revised.message.mentions_me = !revised.message.deleted
+                                && revised.message.sender != me.to_string()
+                                && crate::mention::mentions(
+                                    &revised.message.body,
+                                    &self.my_names(&room),
+                                );
                             events.push(Event::Updated(revised));
                         }
                         continue;
@@ -1436,7 +1447,7 @@ impl Session {
                     } else {
                         let mut v =
                             view(&entry, &open.thread, &open.labels, false, self.client.user());
-                        v.mentions_me = self.mentions_me(&room, &entry);
+                        v.mentions_me = self.mentions_me(&room, &entry, &v.body);
                         events.push(Event::Message(v));
                     }
                 }

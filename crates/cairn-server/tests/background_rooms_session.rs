@@ -210,3 +210,48 @@ fn the_activity_list_over_http_names_no_room_to_a_stranger_or_an_unsigned_reques
     assert_eq!(status, 401, "{response}");
     assert!(!response.contains("rom_"), "and names no room: {response}");
 }
+
+#[test]
+fn a_mention_is_judged_on_the_text_shown_not_the_text_first_sent() {
+    let server = start();
+    let mut alice = session(&server, "alice");
+    let mut bob = session(&server, "bob");
+    let room = group_with(&mut alice, &mut bob);
+    let me = short(&bob.user_id());
+    alice.open_room(&room).unwrap();
+    let added = alice.send("hello").unwrap();
+    alice.edit(added.id.as_deref().unwrap(), &format!("hello @{me}")).unwrap();
+    let dropped = alice.send(&format!("@{me} are you there")).unwrap();
+    alice.edit(dropped.id.as_deref().unwrap(), "never mind").unwrap();
+    for _ in 0..3 {
+        bob.poll().unwrap();
+    }
+    let shown = bob.open_room(&room).unwrap();
+    let flags: Vec<(String, bool)> =
+        shown.iter().map(|m| (m.body.clone(), m.mentions_me)).collect();
+    assert!(flags.contains(&(format!("hello @{me}"), true)), "{flags:?}");
+    assert!(flags.contains(&("never mind".to_string(), false)), "{flags:?}");
+}
+
+#[test]
+fn an_edit_arriving_in_the_open_room_says_whether_it_now_mentions_you() {
+    let server = start();
+    let mut alice = session(&server, "alice");
+    let mut bob = session(&server, "bob");
+    let room = group_with(&mut alice, &mut bob);
+    let me = short(&bob.user_id());
+    alice.open_room(&room).unwrap();
+    let sent = alice.send("hello").unwrap();
+    for _ in 0..2 {
+        bob.poll().unwrap();
+    }
+    alice.edit(sent.id.as_deref().unwrap(), &format!("hello @{me}")).unwrap();
+    let updated = (0..3)
+        .flat_map(|_| bob.poll().unwrap())
+        .find_map(|e| match e {
+            Event::Updated(r) => Some(r.message),
+            _ => None,
+        })
+        .expect("the edit reached bob");
+    assert!(updated.mentions_me, "the edited text mentions bob: {:?}", updated.body);
+}
