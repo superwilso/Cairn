@@ -120,7 +120,7 @@ on-device unfurl is genuinely new.
 | No phone number required | ✅ | ⚠️ now optional | ❌ | ❌ | ❌ | 🎯 ✅ |
 | Metadata protection | ❌ | ✅ sealed sender | ❌ | ❌ | ❌ | ❌ **not v1** |
 | Key verification | n/a | ✅ | ✅ | ⚠️ | ⚠️ | 🎯 v1, required |
-| Reproducible builds | ❌ | ✅ | ❌ | ❌ | ⚠️ | 🎯 v2 |
+| Reproducible builds | ❌ | ✅ | ❌ | ❌ | ⚠️ | 🎯 v2 — investigated, not yet true of any release ([`16-reproducible-builds.md`](16-reproducible-builds.md)) |
 
 Two honest notes:
 
