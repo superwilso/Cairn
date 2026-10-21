@@ -72,10 +72,20 @@ the core is fully testable without a UI.
 
 ## Try it
 
+You need Rust **1.88 or newer** ([rustup](https://rustup.rs) is the easy way) and a C
+compiler, which `ring` builds with: `build-essential` or your distribution's equivalent on
+Linux, the Xcode Command Line Tools on macOS, the MSVC Build Tools on Windows (rustup's
+installer offers them). Nothing else for the server, the CLI, or the libraries.
+
 ```bash
-cargo test --workspace     # 193 tests
-cargo run -p cairn-cli     # the vertical slice, in-process, end to end
+cargo test --workspace --exclude cairn-desktop   # everything but the desktop app
+cargo run -p cairn-cli                           # the vertical slice, in-process, end to end
 ```
+
+`cairn-desktop` is excluded because on Linux it links the system webview; see
+[CONTRIBUTING.md](CONTRIBUTING.md#building) for the packages that build it, after which
+plain `cargo test --workspace` works too. On Windows and macOS the webview ships with the
+operating system, so nothing is excluded there.
 
 The demo establishes an MLS group, sends franked encrypted messages, has the "server"
 sequence and tag them without seeing plaintext, builds a transcript report, verifies it,
@@ -87,22 +97,29 @@ to another account are all detected.
 ```bash
 CAIRN_REGISTRATION_POLICY=open cargo run -p cairn-server    # 127.0.0.1:8080
 
-# Bob, in one terminal — publish key packages, then note his user id
+# Alice, in one terminal: publish key packages, create a room, mint an invite
+cargo run -p cairn-cli -- chat --name alice
+  /keys 5
+  /new
+  /invite
+
+# Bob, in another: redeem it, then open the room it names
 cargo run -p cairn-cli -- chat --name bob
   /keys 5
-  /whoami
-
-# Alice, in another — create a room and add him
-cargo run -p cairn-cli -- chat --name alice
-  /new
-  /add usr_...
-  hello
-
-# Bob opens the room id Alice was shown, compares safety numbers, and verifies
+  /join <token>
   /open rom_...
+
+# Alice lets him into the encrypted group; then they compare safety numbers and verify
+  /admit
+  hello
   /safety
   /verify 0
 ```
+
+`/admit` is deliberately a command and not automatic: the list of who is waiting comes from
+the instance, and admitting on its word alone would let a malicious instance name an account
+and have Alice's client hand it the room's keys. `/username` claims a handle, so `/dm @bob`
+and `/add @bob` work without anyone's user id.
 
 The prompt carries the tier badge at all times, and says `plaintext-transport` over
 `http://` — MLS protects the message body there and nothing protects anything else.
@@ -123,10 +140,6 @@ attachments.
 automatic TLS. **[docs/11-self-hosting.md](docs/11-self-hosting.md)** walks through it and
 is blunt about what is not ready — read that section before putting anyone's real
 conversations on it.
-
-**Not yet a room invite link:** a friend registers with an invite token, but room ids and
-user ids still have to be passed between people by hand. See M3 in
-[the roadmap](docs/10-roadmap.md).
 
 ## Documentation
 
