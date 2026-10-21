@@ -69,6 +69,9 @@
     <symbol id="i-timer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="12" cy="13.5" r="7.5"/><path d="M12 13.5V9.5M10 2.5h4M18.5 6.5l1.5-1.5"/>
     </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/>
+    </symbol>
     <symbol id="i-react" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="12" cy="12" r="8.5"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9.3 9.8h.01M14.7 9.8h.01"/>
     </symbol>
@@ -157,6 +160,15 @@
            say so rather than imply a protection that is not there. -->
       <span id="transport" class="badge"></span>
     </div>
+    <!-- Search runs in Rust over this device's transcripts; the query never leaves it. -->
+    <label class="search">
+      <svg width="14" height="14"><use href="#i-search"/></svg>
+      <input id="search" type="search" placeholder="Search messages" aria-label="Search messages on this device" autocomplete="off" spellcheck="false">
+    </label>
+    <div id="search-results" hidden>
+      <ul id="search-hits"></ul>
+      <p id="search-note" class="hint"></p>
+    </div>
     <form id="space-create" class="rail-form" hidden>
       <input id="space-create-name" placeholder="Space name" spellcheck="false" autocomplete="off" maxlength="100">
       <button type="submit" class="primary">Create</button>
@@ -205,9 +217,36 @@
       <p id="vc-note" class="note" role="status"></p>
       <div class="vc-controls">
         <button id="vc-join" class="primary">Join voice</button>
-        <button id="vc-mute" hidden aria-pressed="false">Mute</button>
-        <button id="vc-deafen" hidden aria-pressed="false">Deafen</button>
+        <button id="vc-mute" hidden aria-pressed="false"><span class="lbl">Mute</span></button>
+        <button id="vc-deafen" hidden aria-pressed="false"><span class="lbl">Deafen</span></button>
         <button id="vc-leave" class="danger" hidden>Leave</button>
+      </div>
+    </section>
+    <!-- The voice channel this device is connected to, from whichever room is open. It is
+         a different call from the panel above whenever another room is open, so it carries
+         that call's own badge — a transport-only call stays labelled from anywhere. -->
+    <section id="voice-bar" class="vbar" hidden aria-label="Connected to voice">
+      <div class="vbar-head">
+        <span class="vbar-live" aria-hidden="true"></span>
+        <span class="vbar-title">Voice connected</span>
+        <span id="vb-badge" class="badge"></span>
+      </div>
+      <div class="vbar-where">
+        <span class="vbar-in">in</span>
+        <button id="vb-room" type="button" class="ghost vbar-room"></button>
+        <span id="vb-count" class="vbar-count"></span>
+      </div>
+      <p id="vb-note" class="note" role="status"></p>
+      <div class="vbar-controls">
+        <button id="vb-mute" type="button" class="icon" aria-pressed="false" title="Mute your microphone in the voice channel">
+          <svg width="15" height="15" aria-hidden="true"><use href="#i-mic"/></svg> <span class="lbl">Mute</span>
+        </button>
+        <button id="vb-deafen" type="button" class="icon" aria-pressed="false" title="Hear nobody in the voice channel, and mute">
+          <svg width="15" height="15" aria-hidden="true"><use href="#i-headphones"/></svg> <span class="lbl">Deafen</span>
+        </button>
+        <button id="vb-leave" type="button" class="icon danger" title="Leave the voice channel">
+          <svg width="15" height="15" aria-hidden="true"><use href="#i-hangup"/></svg> <span class="lbl">Leave</span>
+        </button>
       </div>
     </section>
   </aside>
@@ -472,6 +511,7 @@
 <script src="messages.js"></script>
 <script src="profile.js"></script>
 <script src="spaces.js"></script>
+<script src="search.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -102,6 +102,25 @@ fn rooms(state: State<'_, AppState>) -> CmdResult<Vec<RoomSummary>> {
     Ok(session.rooms())
 }
 
+/// Search this device's transcripts. Runs entirely in Rust, over local history; the query is
+/// never sent anywhere.
+#[tauri::command]
+fn search(
+    state: State<'_, AppState>,
+    query: String,
+) -> CmdResult<cairn_client_core::session::SearchResults> {
+    with(&state, |s| s.search(&query))
+}
+
+/// What is unread in rooms that are not open, counted by Rust from what it decrypted. For
+/// the first draw; after that `poll` says when it changes.
+#[tauri::command]
+fn unread(state: State<'_, AppState>) -> CmdResult<Vec<cairn_client_core::session::UnreadView>> {
+    let guard = state.0.lock().map_err(|_| "session lock poisoned".to_string())?;
+    let session = guard.as_ref().ok_or("not signed in yet")?;
+    Ok(session.unread())
+}
+
 #[tauri::command]
 fn open_room(state: State<'_, AppState>, room: String) -> CmdResult<Vec<MessageView>> {
     with(&state, |s| s.open_room(&room))
@@ -446,6 +465,15 @@ fn voice_state(
     state: State<'_, AppState>,
 ) -> CmdResult<cairn_client_core::session::VoiceStateView> {
     with(&state, |s| s.voice_state())
+}
+
+/// The voice channel this device is connected to, in whichever room — the call the voice bar
+/// keeps running while other rooms are open. `null` when it holds no seat.
+#[tauri::command]
+fn voice_call(
+    state: State<'_, AppState>,
+) -> CmdResult<Option<cairn_client_core::session::VoiceStateView>> {
+    with(&state, |s| s.voice_call())
 }
 
 /// The current epoch's media keys. The one place raw keys cross this line; the webview
@@ -836,6 +864,8 @@ fn main() {
             create_group,
             create_direct,
             rooms,
+            unread,
+            search,
             open_room,
             open_room_tier,
             send,
@@ -854,6 +884,7 @@ fn main() {
             voice_join,
             voice_leave,
             voice_state,
+            voice_call,
             voice_keys,
             call_decline,
             send_file,

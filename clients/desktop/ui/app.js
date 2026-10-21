@@ -21,6 +21,9 @@ let elapsedTimer = null;
 let callConfig = null;
 // Whose safety numbers are on screen, so a roster change can redraw them.
 let safetyFor = null;
+// What Rust counted as unread in rooms that are not open: room id -> { unread, mentions,
+// space }. Replaced wholesale by each `unread` event — a copy to draw from, never a tally.
+let unread = new Map();
 
 const show = (el, on) => { el.hidden = !on; };
 const fail = (el, e) => { el.textContent = e ? String(e) : ""; };
@@ -68,6 +71,10 @@ $("go").onclick = async () => {
         // Spaces are an addition to the app, not a gate on it: an instance too old to have
         // them, or one refusing the list, must not stop the rest of sign-in.
         try { await CairnSpaces.signedIn(); } catch (e) { fail($("error"), e); }
+        try { setUnread(await invoke("unread")); } catch (_) {}
+        // Before any room is open: every room is followed, so a ring or a message can reach
+        // someone who has not opened anything yet.
+        startPolling();
         await listDevices();
         await CairnLinkCards.loadSettings();
     } catch (e) {
@@ -100,15 +107,70 @@ async function refreshRooms() {
         name.textContent = short(room.id);
 
         li.append(tier, name);
+        li.dataset.room = room.id;
         if (!room.joined) {
             const pend = document.createElement("span");
             pend.className = "pending";
             pend.textContent = "waiting";
             li.append(pend);
         }
+        if (room.unread && room.id !== openRoom) {
+            unread.set(room.id, { unread: room.unread, mentions: room.mentions || 0, space: null });
+        }
         li.onclick = () => selectRoom(room.id);
         list.append(li);
     }
+    paintUnread();
+}
+
+// ---- unread ----------------------------------------------------------------
+//
+// The counts and the mention flag are Rust's (Session::unread), from messages it decrypted in
+// rooms that are not open. Nothing here counts anything; it puts numbers where rooms are.
+
+function setUnread(rooms) {
+    unread = new Map();
+    for (const r of rooms || []) {
+        if (r.room !== openRoom) unread.set(r.room, { unread: r.unread, mentions: r.mentions, space: r.space });
+    }
+    paintUnread();
+}
+
+function pill(li, u, nameSel) {
+    for (const old of li.querySelectorAll(".unread")) old.remove();
+    li.classList.toggle("has-unread", !!u);
+    if (!u) return;
+    const b = document.createElement("span");
+    b.className = "unread" + (u.mentions ? " mentioned" : "");
+    b.textContent = u.mentions ? "@" + (u.mentions > 1 ? u.mentions : "") : String(u.unread > 99 ? "99+" : u.unread);
+    b.title = u.unread + " unread" + (u.mentions ? ", " + u.mentions + " mentioning you" : "");
+    const name = li.querySelector(nameSel);
+    if (name) name.after(b); else li.append(b);
+}
+
+function paintUnread() {
+    for (const li of document.querySelectorAll("#rooms li[data-room]")) pill(li, unread.get(li.dataset.room), ".room-name");
+    for (const li of document.querySelectorAll("#channels li[data-channel]")) pill(li, unread.get(li.dataset.channel), ".channel-name");
+    // A space is marked when any of its channels is; Home, when any DM or group is.
+    const spaces = new Map();
+    let home = null;
+    for (const u of unread.values()) {
+        const mark = u.mentions ? "mention" : "unread";
+        if (u.space) { if (spaces.get(u.space) !== "mention") spaces.set(u.space, mark); }
+        else if (home !== "mention") home = mark;
+    }
+    for (const b of document.querySelectorAll("#space-list .rail-btn[data-space]")) {
+        const m = spaces.get(b.dataset.space);
+        if (m) b.dataset.unread = m; else delete b.dataset.unread;
+    }
+    const h = $("rail-home");
+    if (home) h.dataset.unread = home; else delete h.dataset.unread;
+}
+
+// What a room is called here: a channel's name, or a DM's or group's short id.
+function roomLabel(id) {
+    const name = CairnSpaces.channelName ? CairnSpaces.channelName(id) : null;
+    return name ? "#" + name : short(id);
 }
 
 $("new-group").onclick = async () => {
@@ -156,7 +218,8 @@ async function selectRoom(room) {
     if (inCall && room !== openRoom) await hangUp();
 
     fail($("error"), null);
-    CairnCallUi.stopRinging();
+    // A ring is not stopped: it may be from another room, and switching rooms is no answer
+    // to it. Accepting one opens its room through here.
     // A safety number belongs to one group; leaving it on screen over another room's would
     // invite comparing the wrong one.
     closeSafety();
@@ -170,6 +233,9 @@ async function selectRoom(room) {
     CairnEmoji.reset();
     try {
         const history = await invoke("open_room", { room });
+        // Rust cleared it on opening; the copy here follows.
+        unread.delete(room);
+        paintUnread();
         await CairnProfile.load();
         for (const m of history) addMessage(m);
         // Not awaited: the room's set is drawn from the cache at once, and anything missing
@@ -575,6 +641,9 @@ CairnCallUi.init({
     inCall: () => inCall,
     startCall: (video) => startCall(video),
     hangUp: () => hangUp(),
+    openRoom: (room) => selectRoom(room),
+    openRoomId: () => openRoom,
+    roomLabel: (room) => roomLabel(room),
 });
 
 async function startCall(video) {
@@ -850,7 +919,7 @@ function startPolling() {
 }
 
 async function tick() {
-    if (!openRoom) return;
+    // Runs with no room open too: every room is followed, not only the one on screen.
     let events = [];
     try { events = await invoke("poll"); } catch (_) { return; }
     let membershipChanged = false;
@@ -863,11 +932,19 @@ async function tick() {
         if (CairnVoicePanel.handle(ev)) continue;
         if (ev.kind === "message") {
             addMessage(ev);
+        } else if (ev.kind === "unread") {
+            setUnread(ev.rooms);
+        } else if (ev.kind === "removed_from") {
+            addNotice("You were removed from " + roomLabel(ev.room) + ".");
+            unread.delete(ev.room);
+            await refreshRooms();
         } else if (ev.kind === "signal") {
             // Already filtered in Rust: signals addressed to somebody else never arrive, and
             // a device that has not joined a call is only ever told that one started or
-            // ended. Everything else is the mesh's business.
-            if (!inCall) CairnCallUi.ring(ev.from, ev.signal);
+            // ended. Everything else is the mesh's business. One with a `room` is a ring
+            // from a room that is not open; it never carries a negotiation.
+            if (ev.room) { if (!inCall) CairnCallUi.ring(ev.from, ev.signal, ev.room); }
+            else if (!inCall) CairnCallUi.ring(ev.from, ev.signal);
             else await CairnCall.handle(ev.from, ev.signal);
         } else if (ev.kind === "membership") {
             membershipChanged = true;
@@ -881,7 +958,7 @@ async function tick() {
             closeSafety();
             if (inCall) await hangUp();
             CairnVoicePanel.roomClosed();
-            clearInterval(pollTimer);
+            // Rust has closed it; polling goes on for every other room.
             openRoom = null;
             await refreshRooms();
         }
@@ -898,6 +975,8 @@ async function tick() {
 function addMessage(m) {
     // Avatar, timestamp and grouping are appearance, and settings.js's (CairnLook).
     const li = CairnLook.decorate(CairnMessages.render(m), m);
+    // Rust's judgement that it names this account (crate::mention); drawn, not re-derived.
+    if (m.mentions_me) li.classList.add("mention");
     $("timeline").append(li);
     CairnMessages.arrived(li, m.sender === myUser);
 }
@@ -924,9 +1003,19 @@ CairnVoicePanel.init({
     onError: (e) => fail($("error"), e),
     inCall: () => inCall,
     short,
+    roomLabel: (room) => roomLabel(room),
+    openRoom: (room) => selectRoom(room),
+    openRoomId: () => openRoom,
+});
+CairnSearch.init({
+    openRoom: (room) => selectRoom(room),
+    current: () => openRoom,
+    short,
+    roomLabel: (room) => roomLabel(room),
+    onError: (e) => fail($("error"), e),
 });
 CairnLinkCards.bind({ invoke, onError: (e) => fail($("error"), e) });
-CairnSpaces.bind({ invoke, selectRoom, addNotice, fail, short, initials, me: () => myUser });
+CairnSpaces.bind({ invoke, selectRoom, addNotice, fail, short, initials, me: () => myUser, paintUnread: () => paintUnread() });
 
 // Devices change while the app is open — a headset gets plugged in mid-call.
 if (navigator.mediaDevices) navigator.mediaDevices.ondevicechange = () => listDevices();

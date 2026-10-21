@@ -170,6 +170,17 @@ who is listening. A member removed from the room is dropped by the SFU at once, 
 removal commit is processed the keys they hold still open frames sealed under them. Calls
 somebody rings are still the peer-to-peer mesh, which the instance never carries.
 
+**A running client follows every room, and the instance can see it doing so.** Rings,
+unread counts and mentions from rooms that are not open need those rooms fetched while they
+are not open. One signed request (`GET /v1/activity`) asks which of the account's readable
+rooms have moved, and the client then fetches each that has. The instance already knew when
+a device was running. It now also learns, from the fetch that follows a message, roughly
+when each device received it in every room. That is a delivery receipt in all but name: the
+instance can derive it, and the sender is not shown it. Before, only the open room was
+polled, which told the instance which room was on screen instead. Counts and mentions are worked out on the device from decrypted
+messages; **the instance is never told what was read or who was mentioned**, and nothing
+about reading is sent back.
+
 ## 3b. Replies, edits and delete-for-everyone
 
 All three travel **inside the room's encrypted MLS stream** as ordinary franked application

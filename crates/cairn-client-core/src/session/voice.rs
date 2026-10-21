@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use base64::Engine as _;
 use serde::Serialize;
 
-use cairn_proto::{DeviceId, DeviceIdentity, UserId};
+use cairn_proto::{DeviceId, DeviceIdentity, RoomId, UserId};
 
 use super::{Session, SessionError};
 use crate::call::{CallSignal, SignalKind, VOICE_CHANNEL, VOICE_E2EE, VOICE_TRANSPORT_ONLY};
@@ -19,12 +19,12 @@ use crate::client::VoiceSlot;
 /// This device's seat, while it holds one.
 #[derive(Debug, Clone)]
 pub(super) struct Seat {
-    room: cairn_proto::RoomId,
+    pub(super) room: cairn_proto::RoomId,
     session: String,
     e2ee: bool,
 }
 
-/// What each device in the open room has announced about its media, from MLS-authenticated
+/// What each device in one room has announced about its media, from MLS-authenticated
 /// signals only. `true` is end to end.
 pub(super) type Modes = HashMap<(UserId, DeviceId), bool>;
 
@@ -64,6 +64,11 @@ pub struct VoiceParticipantView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceStateView {
+    /// The room whose voice channel this is.
+    pub room: String,
+    /// The room this device holds a voice seat in, if any — possibly not this one. A
+    /// frontend shows "connected elsewhere" from it; it never works it out.
+    pub connected_room: Option<String>,
     /// False when the instance runs no SFU: no voice channel to show.
     pub available: bool,
     pub joined: bool,
@@ -128,28 +133,36 @@ impl Session {
     /// Tell the room what this device's media is. Encrypted, so the instance cannot forge
     /// one; repeated when a newcomer announces, because what was said before they joined is
     /// not readable to them.
+    ///
+    /// Into the seat's room, which need not be the open one: a device connected to a voice
+    /// channel while it looks at another room still answers newcomers there.
     fn announce_voice_media(&mut self) -> Result<(), SessionError> {
-        let Some(seat) = &self.voice else { return Ok(()) };
-        let payload = if seat.e2ee { VOICE_E2EE } else { VOICE_TRANSPORT_ONLY };
-        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
-        if open.convo.group_id().is_none() {
-            return Ok(());
-        }
-        let signal = CallSignal {
-            call: VOICE_CHANNEL.to_string(),
-            kind: SignalKind::VoiceMedia,
-            to: None,
-            payload: payload.to_string(),
+        let Some(seat) = self.voice.clone() else { return Ok(()) };
+        let live = match &mut self.open {
+            Some(open) if open.convo.room() == seat.room => Some(open),
+            _ => self.background.get_mut(&seat.room),
         };
-        let outbound = open.convo.send_signal(signal, super::now_ms())?;
-        self.client.send(open.convo.room(), &outbound.envelope)?;
-        Ok(())
+        let live = live.ok_or(SessionError::NoRoomOpen)?;
+        announce(&self.client, &seat, live)
     }
 
-    /// Record an announcement that arrived in the open room. Returns whether it was news,
-    /// in which case this device answers with its own so the newcomer learns it.
+    /// The announcement, into a room already in hand (one taken out of its slot to poll).
+    pub(super) fn announce_voice_media_in(
+        &self,
+        open: &mut super::OpenRoom,
+    ) -> Result<(), SessionError> {
+        match &self.voice {
+            Some(seat) => announce(&self.client, seat, open),
+            None => Ok(()),
+        }
+    }
+
+    /// Record an announcement heard in `room`. Returns whether it was news; the caller
+    /// answers news with this device's own announcement when it is seated there, so the
+    /// newcomer learns it.
     pub(super) fn voice_media_heard(
         &mut self,
+        room: RoomId,
         user: UserId,
         device: DeviceId,
         payload: &str,
@@ -159,17 +172,35 @@ impl Session {
             VOICE_TRANSPORT_ONLY => false,
             _ => return false,
         };
-        let before = self.voice_modes.insert((user, device), e2ee);
-        let news = before != Some(e2ee);
-        if news && self.voice.is_some() {
-            let _ = self.announce_voice_media();
-        }
-        news
+        let before = self.voice_modes.entry(room).or_default().insert((user, device), e2ee);
+        before != Some(e2ee)
     }
 
-    /// The open room's voice channel as this device should show and run it.
+    /// The open room's voice channel as this device should show it — which may not be the
+    /// one it is connected to; `connected_room` says where that is.
     pub fn voice_state(&mut self) -> Result<VoiceStateView, SessionError> {
         let room = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?.convo.room();
+        self.voice_state_for(room)
+    }
+
+    /// The voice channel this device is connected to, wherever it is, as it should run it:
+    /// the call a frontend keeps alive while its user looks at other rooms. `None` when it
+    /// holds no seat — including when the seat was just lost to removal.
+    pub fn voice_call(&mut self) -> Result<Option<VoiceStateView>, SessionError> {
+        let Some(room) = self.voice.as_ref().map(|s| s.room) else { return Ok(None) };
+        let state = self.voice_state_for(room)?;
+        Ok(state.joined.then_some(state))
+    }
+
+    /// The live room — open or followed in the background — with the voice channel.
+    fn voice_room(&self, room: RoomId) -> Option<&super::OpenRoom> {
+        match &self.open {
+            Some(open) if open.convo.room() == room => Some(open),
+            _ => self.background.get(&room),
+        }
+    }
+
+    fn voice_state_for(&mut self, room: RoomId) -> Result<VoiceStateView, SessionError> {
         let seat = self.voice.as_ref().filter(|s| s.room == room).cloned();
         let roster = match self.client.voice_roster(room, seat.as_ref().map(|s| s.session.as_str()))
         {
@@ -194,13 +225,16 @@ impl Session {
             }
         }
         let seat = self.voice.as_ref().filter(|s| s.room == room).cloned();
-        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        let connected_room = self.voice.as_ref().map(|s| s.room.to_string());
+        let open = self.voice_room(room).ok_or(SessionError::NoRoomOpen)?;
         let has_group = open.convo.group_id().is_some();
         let group: Vec<Vec<u8>> = open.convo.members().into_iter().map(|m| m.identity).collect();
         let me = (self.client.user(), self.client.device());
 
         let Some(roster) = roster else {
             return Ok(VoiceStateView {
+                room: room.to_string(),
+                connected_room,
                 available: false,
                 joined: false,
                 session: None,
@@ -226,7 +260,7 @@ impl Session {
             let mode = if is_me {
                 seat.as_ref().map(|s| s.e2ee)
             } else {
-                self.voice_modes.get(&(user, device)).copied()
+                self.voice_modes.get(&room).and_then(|m| m.get(&(user, device))).copied()
             };
             if mode == Some(false) && !fallback_by.contains(&p.user) {
                 fallback_by.push(p.user.clone());
@@ -247,6 +281,8 @@ impl Session {
         }
         let protection = protection_of(has_group, !fallback_by.is_empty());
         Ok(VoiceStateView {
+            room: room.to_string(),
+            connected_room,
             available: true,
             joined: seat.is_some(),
             session: seat.map(|s| s.session),
@@ -261,8 +297,15 @@ impl Session {
     ///
     /// The one place raw media keys cross to the frontend. Refused outside an encrypted
     /// room, where there is nothing to derive them from.
+    ///
+    /// For the room this device is connected to when it has a seat — not the open room, which
+    /// may be another one by now — and the open room otherwise.
     pub fn voice_keys(&self) -> Result<VoiceKeysView, SessionError> {
-        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        let open = match &self.voice {
+            Some(seat) => self.voice_room(seat.room),
+            None => self.open.as_ref(),
+        }
+        .ok_or(SessionError::NoRoomOpen)?;
         let group = open.convo.group().ok_or(SessionError::NoGroupYet)?;
         let room = open.convo.room();
         let room_bytes = room.as_uuid().as_bytes().to_vec();
@@ -279,6 +322,26 @@ impl Session {
         }
         Ok(VoiceKeysView { epoch: group.epoch() as u32, me_leaf: group.own_member()?.index, keys })
     }
+}
+
+fn announce(
+    client: &crate::client::Client<crate::transport::HttpTransport>,
+    seat: &Seat,
+    open: &mut super::OpenRoom,
+) -> Result<(), SessionError> {
+    if seat.room != open.convo.room() || open.convo.group_id().is_none() {
+        return Ok(());
+    }
+    let payload = if seat.e2ee { VOICE_E2EE } else { VOICE_TRANSPORT_ONLY };
+    let signal = CallSignal {
+        call: VOICE_CHANNEL.to_string(),
+        kind: SignalKind::VoiceMedia,
+        to: None,
+        payload: payload.to_string(),
+    };
+    let outbound = open.convo.send_signal(signal, super::now_ms())?;
+    client.send(seat.room, &outbound.envelope)?;
+    Ok(())
 }
 
 /// The rule, separate so it can be tested without a network: transport by tier if the room

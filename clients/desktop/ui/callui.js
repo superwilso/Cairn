@@ -21,6 +21,7 @@ const CairnCallUi = (() => {
     let hooks = {
         invoke: null, me: () => null, short: (id) => id, addNotice: () => null,
         inCall: () => false, startCall: async () => {}, hangUp: async () => {},
+        openRoom: async () => {}, openRoomId: () => null, roomLabel: (id) => id,
     };
 
     const DEFAULTS = {
@@ -30,7 +31,7 @@ const CairnCallUi = (() => {
     let prefs = load();
 
     // Call state this file draws.
-    let ringing = null;       // { call, from, timer }
+    let ringing = null;       // { call, from, room, timer } — room is null for the open room
     // Calls already declined or missed here. In a group, every newcomer announces itself to
     // the room, and without this each arrival would ring again someone who already said no.
     const quiet = new Set();
@@ -168,15 +169,20 @@ const CairnCallUi = (() => {
         return v ? v.label : hooks.short(user);
     };
 
-    // Somebody started a call in the open room. `call_join` adopts the announced call id,
-    // so accepting joins *that* call rather than starting a rival one beside it.
-    function ring(from, signal) {
+    // Somebody started a call. `call_join` adopts the announced call id, so accepting joins
+    // *that* call rather than starting a rival one beside it.
+    //
+    // `room` is set when the call is in a room that is not open — Rust follows every room,
+    // so a ring reaches its user wherever they are looking. Accepting opens that room first;
+    // declining is sent into it by Rust from here.
+    function ring(from, signal, room = null) {
+        if (room && room === hooks.openRoomId()) room = null;
         if (signal.kind === "join") {
             if (ringing && ringing.call === signal.call) return;
             if (quiet.has(signal.call)) return;
             stopRinging();
-            const direct = !!(CairnCall.config && CairnCall.config.direct);
-            ringing = { call: signal.call, from, timer: setTimeout(() => missed(from), RING_MS) };
+            const direct = !room && !!(CairnCall.config && CairnCall.config.direct);
+            ringing = { call: signal.call, from, room, timer: setTimeout(() => missed(from), RING_MS) };
 
             const face = $("ringing-avatar");
             face.textContent = "";
@@ -187,7 +193,9 @@ const CairnCallUi = (() => {
             } else {
                 name.textContent = hooks.short(from);
             }
-            $("ringing-text").textContent = direct ? "is calling you" : "started a call in this group";
+            $("ringing-text").textContent = room
+                ? "is calling in " + hooks.roomLabel(room)
+                : direct ? "is calling you" : "started a call in this group";
             const sound = prefs.ring ? CairnCallAudio.startRing() : false;
             // The ring is generated in the page, and a webview may not let a page make sound
             // before it has been clicked. Say so rather than letting a silent ring look like
@@ -213,33 +221,42 @@ const CairnCallUi = (() => {
     // Not answered: the caller gave up, or the ring ran out. Left in the timeline with a way
     // to call back, which is the reason a missed call is worth showing at all.
     function missed(from) {
+        const where = ringing && ringing.room;
         if (ringing) quiet.add(ringing.call);
         stopRinging();
-        const li = hooks.addNotice("Missed call from " + label(from));
+        const li = hooks.addNotice("Missed call from " + label(from) + (where ? " in " + hooks.roomLabel(where) : ""));
         if (li) {
             li.classList.add("call-notice", "missed");
             const back = document.createElement("button");
             back.type = "button";
             back.className = "ghost call-back";
             back.textContent = "Call back";
-            back.addEventListener("click", () => hooks.startCall(false));
+            back.addEventListener("click", async () => {
+                if (where && where !== hooks.openRoomId()) await hooks.openRoom(where);
+                await hooks.startCall(false);
+            });
             li.append(" ", back);
         }
     }
 
     async function accept(video) {
-        answering = true;
+        const room = ringing && ringing.room;
         stopRinging();
         CairnCallAudio.resume();
+        // A call in another room is joined from that room: `call_join` adopts a ring only
+        // in the room it came from.
+        if (room && room !== hooks.openRoomId()) await hooks.openRoom(room);
+        answering = true;
         await hooks.startCall(video);
     }
 
     async function decline() {
         const from = ringing && ringing.from;
+        const where = ringing && ringing.room;
         if (ringing) quiet.add(ringing.call);
         stopRinging();
         try { await hooks.invoke("call_decline"); } catch (e) { hooks.addNotice("Could not decline: " + e); return; }
-        if (from) hooks.addNotice("You declined a call from " + label(from) + ".");
+        if (from) hooks.addNotice("You declined a call from " + label(from) + (where ? " in " + hooks.roomLabel(where) : "") + ".");
     }
 
     // ---- in a call -------------------------------------------------------------------

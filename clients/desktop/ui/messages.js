@@ -351,6 +351,8 @@ const CairnMessages = (() => {
                 else if (now) old.append(now);
             }
             old.classList.toggle("deleted", !!m.deleted);
+            // Rust's judgement on the new text: an edit can add a mention or remove one.
+            old.classList.toggle("mention", !!m.mentions_me);
             old.classList.remove("editing");
         }
         for (const q of document.querySelectorAll("#timeline .quote")) {

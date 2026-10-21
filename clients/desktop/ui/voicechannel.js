@@ -10,7 +10,7 @@
 //
 // ## What this file decides: nothing protocol-shaped
 //
-// Whether the call is end to end, and with which keys, comes from `voice_state` and
+// Whether the call is end to end, and with which keys, comes from `voice_call` and
 // `voice_keys`. This applies them. The only judgement made here is the honest one only the
 // webview can make — "can I transform frames at all?" — and it is reported to Rust, which
 // announces it to the room.
@@ -45,7 +45,7 @@ const CairnVoiceChannel = (() => {
     let path = "none";                // "script" | "legacy" | "none"
     let session = null;
     let timer = null;
-    let state = null;                 // last voice_state
+    let state = null;                 // last voice_call: the connected channel, in any room
     let epoch = null;
     let keyTable = new Map();         // "epoch:leaf" -> CryptoKey
     let leafInfo = new Map();         // leaf -> { user, device }
@@ -123,7 +123,14 @@ const CairnVoiceChannel = (() => {
     async function refresh() {
         if (!session) return;
         let next;
-        try { next = await invoke("voice_state"); } catch (e) { ui.onNotice("Voice channel: " + e); return; }
+        // `voice_call`, not `voice_state`: the channel this device is connected to, which
+        // stays connected while its user opens other rooms. `null` means the seat is gone.
+        try { next = await invoke("voice_call"); } catch (e) { ui.onNotice("Voice channel: " + e); return; }
+        if (!next) {                  // evicted — removed from the room, or the seat lapsed
+            ui.onNotice("You are no longer in the voice channel.");
+            await leave();
+            return;
+        }
         const before = state && state.protection;
         state = next;
         while (old.length && old[0].until < Date.now()) old.shift();
