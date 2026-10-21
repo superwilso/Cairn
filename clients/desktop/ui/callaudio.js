@@ -229,8 +229,7 @@ const CairnCallAudio = (() => {
             try {
                 v.source = c.createMediaStreamSource(stream);
                 v.gain = c.createGain();
-                v.analyser = c.createAnalyser();
-                v.analyser.fftSize = 512;
+                v.analyser = speakingAnalyser(c);
                 const dest = c.createMediaStreamDestination();
                 v.source.connect(v.analyser);
                 v.source.connect(v.gain);
@@ -297,8 +296,7 @@ const CairnCallAudio = (() => {
         if (!c || !stream || !stream.getAudioTracks().length) return;
         try {
             const source = c.createMediaStreamSource(stream);
-            const analyser = c.createAnalyser();
-            analyser.fftSize = 512;
+            const analyser = speakingAnalyser(c);
             source.connect(analyser);
             localVoice = { user, stream, source, analyser };
         } catch (_) { localVoice = null; }
@@ -309,6 +307,26 @@ const CairnCallAudio = (() => {
         if (!localVoice) return;
         try { localVoice.source.disconnect(); } catch (_) {}
         localVoice = null;
+    }
+
+    // How often the speaking loop reads the analysers, and how much each read must see.
+    //
+    // An analyser holds only its last `fftSize` samples. At 512 — the size this used to be —
+    // that is 10.7 ms of each 90 ms tick, so nearly nine tenths of what someone said was
+    // never measured, and any sound shorter than a tick was seen or missed by where it fell
+    // against the loop's phase. Found by tracing the browser test: the fake microphone beeps
+    // for a few tens of milliseconds every 500 ms, and the ring caught at most every other
+    // beep, in a pattern that drifted with the aliasing between the two periods — dark for
+    // seconds at a time while sound was arriving. The window now spans a whole tick (the
+    // next power of two up, so reads overlap slightly), and every sample is looked at.
+    const TICK_MS = 90;
+    function speakingAnalyser(c) {
+        const analyser = c.createAnalyser();
+        const want = Math.ceil((c.sampleRate * TICK_MS) / 1000);
+        let size = 32;
+        while (size < want && size < 32768) size *= 2;
+        analyser.fftSize = size;
+        return analyser;
     }
 
     function level(analyser) {
@@ -347,7 +365,7 @@ const CairnCallAudio = (() => {
                 mark(localVoice.user, open && level(localVoice.analyser) > THRESHOLD, now);
             }
             if (!voices.size && !localVoice) { clearInterval(loop); loop = null; }
-        }, 90);
+        }, TICK_MS);
     }
 
     function reset() {

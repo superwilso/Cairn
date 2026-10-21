@@ -363,14 +363,52 @@ test("calls in the real UI", { skip }, async (t) => {
         await t.test("the speaking ring lights when the other side's microphone has sound", async () => {
             const relay = new Relay();
             const { a, b } = await ringAndAccept(browser, relay);
-            // The fake microphone beeps about once a second.
-            await b.waitForSelector(tileSel(ALICE) + ".speaking", { timeout: 10000 });
+            // The fake microphone beeps for a few tens of milliseconds every 500 ms, so the
+            // ring is a pulse, not a state. It is watched from inside the page, because
+            // Playwright's waitForSelector does not observe: it polls, every 500 ms once it
+            // has backed off, and that cadence aliases against a pulse with the same period —
+            // half of why this test used to fail about one run in four, the ring lighting and
+            // going out several times between two looks. Every change is recorded.
+            await b.evaluate((id) => {
+                const el = document.getElementById(id);
+                const changes = window.__ring = [[performance.now(), el.classList.contains("speaking")]];
+                new MutationObserver(() => {
+                    const on = el.classList.contains("speaking");
+                    if (on !== changes[changes.length - 1][1]) changes.push([performance.now(), on]);
+                }).observe(el, { attributes: true, attributeFilter: ["class"] });
+            }, "tile-" + ALICE);
+            const ring = () => b.evaluate(() => ({ now: performance.now(), changes: window.__ring }));
+            const lit = (r) => r.changes.filter(([, on]) => on).length;
+            await b.waitForFunction(() => window.__ring.some(([, on]) => on), null, { timeout: 10000 });
             await shot(b, "speaking");
+
+            // The other half: the detector read 10.7 ms of every 90 ms, caught at most every
+            // other beep, and left the ring dark for seconds while sound was arriving. Every
+            // beep must light it now, so it is never dark for a whole beep period.
+            const from = (await ring()).now;
+            await b.waitForTimeout(3000);
+            const r = await ring();
+            let longest = 0;
+            r.changes.forEach(([t, on], i) => {
+                if (on) return;
+                const until = i + 1 < r.changes.length ? r.changes[i + 1][0] : r.now;
+                if (until > from) longest = Math.max(longest, until - Math.max(t, from));
+            });
+            assert.ok(longest < 500, `the ring went dark for ${Math.round(longest)} ms while the microphone was beeping`);
+
             // Counterfactual: a muted microphone sends silence, so the ring must go out and
-            // stay out.
+            // stay out — never lit again, not merely unlit at the moment of a final look,
+            // which a pulse could slip between. A beep already on the wire when mute was
+            // pressed can still arrive and light it once, so the strict window opens only
+            // after the ring has been dark for longer than any gap between beeps.
             await a.click("#mute");
-            await b.waitForSelector(tileSel(ALICE) + ".speaking", { state: "detached", timeout: 5000 });
+            await b.waitForFunction(() => {
+                const last = window.__ring[window.__ring.length - 1];
+                return !last[1] && performance.now() - last[0] > 1000;
+            }, null, { timeout: 5000 });
+            const before = lit(await ring());
             await b.waitForTimeout(2500);
+            assert.strictEqual(lit(await ring()), before, "a muted participant is not shown speaking");
             assert.strictEqual(await b.$(tileSel(ALICE) + ".speaking"), null, "a muted participant is not shown speaking");
             await a.close(); await b.close();
         });

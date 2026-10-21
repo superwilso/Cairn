@@ -9,6 +9,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # `[patch.crates-io]` in Cargo.toml points here; see vendor/str0m-rust-crypto/VENDORED.md.
 COPY vendor ./vendor
+# The desktop client is a workspace member, so cargo refuses to load the workspace without
+# its manifest, even to build only the server. The manifest is all it needs: an empty target
+# satisfies cargo's discovery, `cairn-desktop` is never compiled here, and the client's own
+# source stays out of the image (and out of its cache key).
+COPY clients/desktop/src-tauri/Cargo.toml ./clients/desktop/src-tauri/
+RUN mkdir -p clients/desktop/src-tauri/src && touch clients/desktop/src-tauri/src/main.rs
 
 # --locked so the image cannot silently resolve different dependency versions than the
 # ones `cargo audit` ran against in CI.
@@ -28,6 +34,13 @@ RUN apt-get update \
 
 # Unprivileged. The server needs nothing but its own data directory.
 RUN useradd --system --create-home --uid 10001 cairn
+# The data directory has to exist in the image, owned by `cairn`, before the VOLUME below.
+# A new volume (anonymous, or the compose file's named `cairn-data`) copies its ownership
+# from the image's directory, and with none there it is created root-owned: the server
+# then exited at boot with "Permission denied", so the image as shipped never started.
+# Found by running the image, which had never been done. Owner-only, since it holds the
+# franking key.
+RUN mkdir -p /data && chown cairn:cairn /data && chmod 0700 /data
 USER cairn
 
 COPY --from=build /src/target/release/cairn-server /usr/local/bin/cairn-server
