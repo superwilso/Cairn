@@ -446,6 +446,27 @@ Four calls made by the owner, so a session does not re-litigate them:
       **Not done:** the per-call MLS group (so the channel's roster is the instance's word),
       SFrame proper, video and screen share through the SFU, TURN in front of it, staying in a
       voice channel while viewing another room, boosting a voice past 100% in voice channels.
+- [x] **Replies, edits and delete-for-everyone**, inside the encrypted stream and below the
+      FFI line: a reply carries a reference and each recipient resolves the quote from its own
+      transcript; an edit is a franked message whose commitment binds the message it replaces,
+      shown with "(edited)" and its history; a delete is a request every honest client honours
+      by rewriting its transcript. The desktop client draws what `Session` decides
+      (`can_edit`, `can_delete`, the resolved quote) and decides nothing.
+
+      **Probed:** editing or deleting someone else's message, an edit backdating itself, a
+      reply stuffing its own quote into the body, an edit franked over the bare text or over a
+      different target, a delete sent before its message, and an edit outliving a disappearing
+      original. All refused in-process; the ones that need a dishonest member (someone else's
+      message, a stuffed quote, a delete sent first) also against one over HTTP
+      (`crates/cairn-server/tests/edits_session.rs`), checked to fail with the
+      sender rule removed. Nothing was found open: replies were already reference-only, and the
+      edit and delete rules were written with their probes.
+
+      **Stated rather than hidden** (`01-threat-model.md` §3b): a modified client keeps
+      deleted text; a deleted message cannot be reported afterwards from an honest client
+      (owner question, `04-safety-architecture.md` §6); the instance keeps the ciphertext and
+      any blob; the CLI prints edits and deletes but does not apply them. **Not done:** edits
+      and deletes in T3 rooms, editing an attachment's caption, a report button in the client.
 - [ ] Crash/restart resilience under real use
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.

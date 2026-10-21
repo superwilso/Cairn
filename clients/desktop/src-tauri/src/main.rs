@@ -198,6 +198,27 @@ fn react(
     with(&state, |s| s.react(&sender, &id, emoji.as_deref()))
 }
 
+/// Replace the text of one of this user's own messages. Rust decides whether it may be
+/// edited; the UI only offers the button where Rust said `can_edit`.
+#[tauri::command]
+fn edit_message(
+    state: State<'_, AppState>,
+    id: String,
+    text: String,
+) -> CmdResult<cairn_client_core::session::Revised> {
+    with(&state, |s| s.edit(&id, &text))
+}
+
+/// Ask everyone to delete one of this user's own messages, and delete it here. Honoured by
+/// honest clients only, which the UI says before the user confirms.
+#[tauri::command]
+fn delete_message(
+    state: State<'_, AppState>,
+    id: String,
+) -> CmdResult<cairn_client_core::session::Revised> {
+    with(&state, |s| s.delete(&id))
+}
+
 #[tauri::command]
 fn poll(state: State<'_, AppState>) -> CmdResult<Vec<Event>> {
     with(&state, |s| s.poll())
@@ -843,6 +864,8 @@ fn main() {
             set_room_timer,
             reply,
             react,
+            edit_message,
+            delete_message,
             gif_providers,
             gif_search,
             gif_preview,
