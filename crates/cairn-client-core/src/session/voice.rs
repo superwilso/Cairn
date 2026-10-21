@@ -183,6 +183,16 @@ impl Session {
             }
             other => other?,
         };
+        // Seats live in the instance's memory, so a restart empties the channel. A seat the
+        // instance does not list is gone, whatever this device remembers: holding on to it
+        // kept a dead call open with nothing offering to rejoin.
+        if let Some(roster) = &roster {
+            let me = (self.client.user().to_string(), self.client.device().to_string());
+            let listed = roster.participants.iter().any(|p| (&p.user, &p.device) == (&me.0, &me.1));
+            if !listed && self.voice.as_ref().is_some_and(|s| s.room == room) {
+                self.voice = None;
+            }
+        }
         let seat = self.voice.as_ref().filter(|s| s.room == room).cloned();
         let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
         let has_group = open.convo.group_id().is_some();
