@@ -64,6 +64,7 @@ pub fn router_behind(instance: SharedInstance, proxies: TrustedProxies) -> Route
         .route("/v1/devices", post(link_device))
         .route("/v1/rooms", post(create_room))
         .route("/v1/rooms/{room}", get(describe_room))
+        .route("/v1/activity", get(activity))
         .route("/v1/rooms/{room}/messages", post(send_message).get(fetch_messages))
         .route("/v1/rooms/{room}/members", post(add_room_member).get(list_room_members))
         .route("/v1/rooms/{room}/members/{target}", delete(remove_room_member).put(set_room_role))
@@ -1154,6 +1155,16 @@ async fn fetch_messages(
             })
             .collect(),
     ))
+}
+
+/// Which of the caller's rooms have moved, so a client can follow all of them with one
+/// request. The rule — readable rooms only — is `Instance::activity`'s.
+async fn activity(
+    State(instance): State<SharedInstance>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::state::RoomActivity>>, ServerError> {
+    let actor = signed_actor(&instance, &headers, "activity", None)?;
+    Ok(Json(instance.activity(actor)))
 }
 
 #[derive(Serialize)]

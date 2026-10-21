@@ -205,9 +205,36 @@
       <p id="vc-note" class="note" role="status"></p>
       <div class="vc-controls">
         <button id="vc-join" class="primary">Join voice</button>
-        <button id="vc-mute" hidden aria-pressed="false">Mute</button>
-        <button id="vc-deafen" hidden aria-pressed="false">Deafen</button>
+        <button id="vc-mute" hidden aria-pressed="false"><span class="lbl">Mute</span></button>
+        <button id="vc-deafen" hidden aria-pressed="false"><span class="lbl">Deafen</span></button>
         <button id="vc-leave" class="danger" hidden>Leave</button>
+      </div>
+    </section>
+    <!-- The voice channel this device is connected to, from whichever room is open. It is
+         a different call from the panel above whenever another room is open, so it carries
+         that call's own badge — a transport-only call stays labelled from anywhere. -->
+    <section id="voice-bar" class="vbar" hidden aria-label="Connected to voice">
+      <div class="vbar-head">
+        <span class="vbar-live" aria-hidden="true"></span>
+        <span class="vbar-title">Voice connected</span>
+        <span id="vb-badge" class="badge"></span>
+      </div>
+      <div class="vbar-where">
+        <span class="vbar-in">in</span>
+        <button id="vb-room" type="button" class="ghost vbar-room"></button>
+        <span id="vb-count" class="vbar-count"></span>
+      </div>
+      <p id="vb-note" class="note" role="status"></p>
+      <div class="vbar-controls">
+        <button id="vb-mute" type="button" class="icon" aria-pressed="false" title="Mute your microphone in the voice channel">
+          <svg width="15" height="15" aria-hidden="true"><use href="#i-mic"/></svg> <span class="lbl">Mute</span>
+        </button>
+        <button id="vb-deafen" type="button" class="icon" aria-pressed="false" title="Hear nobody in the voice channel, and mute">
+          <svg width="15" height="15" aria-hidden="true"><use href="#i-headphones"/></svg> <span class="lbl">Deafen</span>
+        </button>
+        <button id="vb-leave" type="button" class="icon danger" title="Leave the voice channel">
+          <svg width="15" height="15" aria-hidden="true"><use href="#i-hangup"/></svg> <span class="lbl">Leave</span>
+        </button>
       </div>
     </section>
   </aside>

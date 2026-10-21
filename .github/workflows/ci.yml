@@ -196,6 +196,13 @@ jobs:
           CAIRN_REQUIRE_BROWSER_TEST: '1'
         run: node --test clients/desktop/tests/voicechannel.browser.test.js
 
+      - name: Rooms that are not open, in the whole UI
+        # Unread counts and mentions from rooms not on screen, a ring from one reaching the
+        # user and declining back to the caller, and a voice channel kept across a room switch.
+        env:
+          CAIRN_REQUIRE_BROWSER_TEST: '1'
+        run: node --test clients/desktop/tests/background.browser.test.js
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

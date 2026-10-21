@@ -181,6 +181,10 @@ if command -v node >/dev/null 2>&1; then
             env \
                 NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
                 node --test clients/desktop/tests/voicechannel.browser.test.js
+        run "desktop rooms that are not open" \
+            env \
+                NODE_PATH="${NODE_PATH:-/opt/node22/lib/node_modules}" \
+                node --test clients/desktop/tests/background.browser.test.js
     fi
 else
     printf '\n\033[33mSKIPPED desktop tests: node is not installed\033[0m\n'
