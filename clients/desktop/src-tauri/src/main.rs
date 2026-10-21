@@ -765,9 +765,50 @@ fn send_sticker(state: State<'_, AppState>, name: String) -> CmdResult<MessageVi
     with(&state, |s| s.send_sticker(&name))
 }
 
+/// WebKitGTK's default answer to `getUserMedia` is **deny**: its `permission-request` signal
+/// goes unanswered unless the app connects to it, and wry only handles the clipboard. So on
+/// Linux calls could not start at all. This grants microphone, camera and device-list
+/// requests — nothing else — and only while the webview shows the app's own bundled UI, so a
+/// page that somehow navigated elsewhere gets WebKitGTK's default instead. Windows needs
+/// none of this: WebView2 raises its own prompt.
+///
+/// Unlike WebView2 there is no system prompt here: the app's UI asks only when the user
+/// starts or joins a call, and that click is the consent.
+#[cfg(target_os = "linux")]
+fn grant_media_requests(app: &tauri::App) {
+    use tauri::Manager;
+    use webkit2gtk::glib::ObjectExt;
+    use webkit2gtk::{
+        DeviceInfoPermissionRequest, PermissionRequestExt, UserMediaPermissionRequest, WebViewExt,
+    };
+    for window in app.webview_windows().values() {
+        let _ = window.with_webview(|webview| {
+            webview.inner().connect_permission_request(|view, request| {
+                let ours = view.uri().is_some_and(|uri| {
+                    uri.starts_with("tauri://localhost")
+                        || uri.starts_with("http://tauri.localhost")
+                });
+                let media = request.is::<UserMediaPermissionRequest>()
+                    || request.is::<DeviceInfoPermissionRequest>();
+                if ours && media {
+                    request.allow();
+                    true
+                } else {
+                    false
+                }
+            });
+        });
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|_app| {
+            #[cfg(target_os = "linux")]
+            grant_media_requests(_app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             sign_in,
             publish_key_packages,
