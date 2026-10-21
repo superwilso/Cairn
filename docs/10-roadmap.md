@@ -467,12 +467,13 @@ Four calls made by the owner, so a session does not re-litigate them:
       (owner question, `04-safety-architecture.md` §6); the instance keeps the ciphertext and
       any blob; the CLI prints edits and deletes but does not apply them. **Not done:** edits
       and deletes in T3 rooms, editing an attachment's caption, a report button in the client.
-- [ ] Crash/restart resilience under real use
+- [x] **Crash/restart resilience under real use.**
 
-      **Probed so far** by `kill -9` on the real server and client binaries mid-traffic, and
-      by failing or delaying the store's commits. Survived: acknowledged messages,
-      uploads and space roles across a server kill, and a client killed mid-send resumes
-      and stays readable both ways.
+      **Probed** by `kill -9` on the real server and client binaries mid-traffic, by failing
+      or delaying the store's commits, by a proxy that loses one upload or its answer, and
+      by restarting an instance under a seated voice client. Survived from the start:
+      acknowledged messages, uploads and space roles across a server kill, and a client
+      killed mid-send resumes and stays readable both ways.
 
       **Fixed, server:** every room, account, device, invite, key-package and handle change
       now commits *before* memory moves, under the lock that guards it — as spaces already
@@ -487,14 +488,21 @@ Four calls made by the owner, so a session does not re-litigate them:
       welcomed nor listed as waiting. A commit is now held pending until the instance
       accepts it, and an upload that fails is settled by the next poll: kept and followed
       if it is in the log (its welcome goes then), forgotten if it is not. Sending waits
-      while one is unsettled. **Left open:** the held welcome lives in memory, so a client
-      restart in that window still strands the newcomer; and a commit could in principle
-      land after the poll that gave up on it, if the instance were still working on a
-      request whose connection had already died.
+      while one is unsettled. The held welcome is kept on disk beside the pending commit
+      (`cairn_client_core::welcomes`) — in memory, a restart in that window found the
+      commit in the log, followed it, and had nothing to send the newcomer. `cairn-cli`
+      had the same apply-first fault and now takes the same path; its test drives the real
+      binary through the lossy proxy. A voice client whose instance restarted went on
+      reporting itself seated in a channel that no longer held it; a seat the instance
+      does not list is now a seat this device does not hold, so the app offers to rejoin.
 
-      **Found, not yet fixed:** after a server restart a voice client still believes it is
-      seated while the instance has no seats. `cairn-cli` adds members with the old
-      apply-first call.
+      **Residual, stated rather than hidden:** "not in the log, so it never landed" assumes
+      the instance is not still working on a request whose connection already died. The
+      window is one synchronous `accept` on the instance, its wait for the room's lock
+      included, and if it is hit the sender is
+      forked out of the group until re-added — detected by nothing yet. Closing it needs
+      the instance to answer "did this envelope land?" for an id, which is a protocol
+      change, not a client fix.
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
 
