@@ -531,8 +531,16 @@ Four calls made by the owner, so a session does not re-litigate them:
       **Not ticked** until someone who has not read the source tries to implement against
       it — the item's own test, and the only one that can say the draft is good enough.
 - [ ] Public threat model review invited
-- [ ] Build and contribution instructions that work on a clean machine
-- [ ] Reproducible builds investigated
+- [x] Build and contribution instructions that work on a clean machine. Checked by
+      building a fresh clone as an ordinary user with an empty cargo home: Rust 1.88+ and
+      a C compiler are all the server, CLI and libraries need. The README and
+      CONTRIBUTING now say so, list the desktop app's webview packages, and cover the
+      JavaScript tests.
+- [x] Reproducible builds investigated — [`16-reproducible-builds.md`](16-reproducible-builds.md).
+      The server and CLI binaries come out byte-identical across checkout locations, and
+      across cargo homes once that path is remapped. The Docker image, the desktop
+      bundles and other platforms were not measured. Investigated is not done: no release
+      is reproducible until the steps listed there exist.
 
 **Exit:** the repository is public, and a stranger can build and run it from the README.
 
