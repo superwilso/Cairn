@@ -82,12 +82,52 @@ obsolete.
 | Reordering is rejected | `reordering_is_rejected` |
 | Cross-room splicing is rejected | `splicing_messages_from_another_room_is_rejected` |
 | Commitments hide content | `commitment_hides_the_message` |
+| An edit's report names what it replaced, and cannot be moved | `an_edit_and_its_original_are_both_reportable_and_the_report_names_the_original` |
+| An edit cannot be franked as something other than itself | `an_edit_cannot_be_franked_as_anything_but_itself` |
 
 ### What franking costs
 
 **Deniability.** Franking exists to make sending provable, which is the opposite of what a
 deniable protocol offers. Cairn accepts this trade on frankable surfaces and states it in
 `01-threat-model.md` §3.6 rather than hiding it.
+
+### 1a. Edits, deletes and reports
+
+**Can someone report the original of an edited message?** Yes. An edit is a new franked
+message; it does not touch the original's commitment, tag or opening, and every honest
+recipient keeps the original in its transcript as the edit history. A reporter can disclose
+the original, the edit, or both.
+
+**An edit's commitment binds what it replaces.** Its franked bytes are not the new text but
+a frame (`cairn_proto::franked::edit_bytes`): the target's sender, the target's commitment,
+and the new text, length-prefixed. So a moderator who verifies a report of an edit learns
+*from the cryptography* that it claims to replace that specific message by that account, and
+can match the target commitment to the original's own tag in the same report. The reporter
+cannot present the edit as a standalone message, or move it onto a different one: both fail
+verification (`an_edit_and_its_original_are_both_reportable_and_the_report_names_the_original`,
+and over HTTP `an_edit_and_its_original_each_verify_when_reported_to_the_instance`). Recipients
+recompute the frame from the edit they are about to apply, so a sender cannot have the
+commitment name one target while honest clients apply another
+(`an_edit_cannot_be_franked_as_anything_but_itself`).
+
+**No framing through edits.** An edit naming someone else's message is dropped by every honest
+client. If a modified client applied one anyway and reported it, the server's tag binds the
+edit to its real sender, and the frame names a target sender who is not that sender — a
+moderator must read that as "X claimed to edit Y's message", never as Y's words. An ordinary
+message whose text happens to parse as a frame is refused on send and dropped on receipt, so
+every message an honest client showed reads back to a moderator as what it was.
+
+**What a moderator sees**, for a report of an edited message: the original text, verified as
+the sender's; each edit, verified as the sender's and as replacing that original; and the
+server-attested order of all of them.
+
+**Deleted messages are not reportable afterwards from an honest client.** Honouring a delete
+means discarding the opening, and without it there is nothing to disclose. A report already
+filed is unaffected — the instance's verification does not depend on the reporter still
+holding anything — and a deletion cannot invalidate one. The consequence is real: a sender can
+say something abusive and delete it before the recipient reports it. Signal and WhatsApp make
+the same trade. Whether an honest client should instead keep a deleted message's report
+material, hidden, for a short window is an open question for the owner (§6).
 
 ### What franking does not do
 
@@ -220,6 +260,12 @@ unmoderated; the mechanism changes to match what is technically possible there.
 ---
 
 ## 6. Open questions
+
+0. **Evidence after delete-for-everyone.** Honest clients currently discard a deleted
+   message's opening, so it cannot be reported afterwards (§1a). Keeping report material for a
+   deleted message, hidden from view, for a bounded window would let a victim still report
+   abuse that was deleted quickly — at the cost of "deleted" meaning less on honest clients too.
+   An owner decision, not a session's.
 
 1. **Group franking.** Resolved for Cairn's threat model — see the AGMF note above. The
    ordering bug it depended on is fixed and tested. Reopen if metadata privacy becomes a

@@ -299,10 +299,9 @@ impl Session {
         let mut removed: Vec<String> = Vec::new();
         for (index, user) in departed {
             let group = open.convo.group_mut().ok_or(SessionError::NoGroupYet)?;
-            let output = group.remove_member(index)?;
+            let output = group.stage_remove(index)?;
             let commit = output.commit.to_bytes().map_err(|_| SessionError::NoGroupYet)?;
-            let wrapped = open.convo.wrap_handshake(&commit, now_ms())?;
-            self.client.send(room, &wrapped)?;
+            super::relay_commit(&self.client, open, &commit)?;
             let user = user.to_string();
             if !removed.contains(&user) {
                 removed.push(user);

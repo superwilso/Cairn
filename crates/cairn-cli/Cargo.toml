@@ -15,3 +15,10 @@ cairn-client-core = { workspace = true, features = ["http"] }
 
 hex.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The instance itself, in-process, so a test can drive the real binary against it.
+cairn-server = { path = "../cairn-server" }
+tokio.workspace = true
+axum.workspace = true
+uuid.workspace = true

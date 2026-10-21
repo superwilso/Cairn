@@ -1028,6 +1028,50 @@ label.timer select option, label.timer select optgroup { background: var(--surfa
 .quote.gone { cursor: default; border-left-color: var(--line); font-style: italic; color: var(--dim); }
 .quote.gone .quote-who { color: var(--dim); }
 
+/* ---- edits and deletes ------------------------------------------------- */
+
+.msg .actions .act-delete:hover { color: var(--danger); }
+.edited-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.edited {
+  padding: 0; border: 0; background: transparent;
+  font-size: 11.5px; color: var(--dim); letter-spacing: 0.01em;
+}
+.edited:hover, .edited[aria-expanded="true"] { background: transparent; color: var(--accent); }
+.revisions {
+  list-style: none; margin: 0; padding: 4px 10px;
+  border-left: 2px solid var(--line);
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 12.5px; color: var(--muted);
+}
+.revisions[hidden] { display: none; }
+.revisions li { display: flex; gap: 8px; align-items: baseline; }
+.revisions time { flex: none; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.revisions .revision-text { overflow-wrap: anywhere; text-decoration: line-through; text-decoration-color: var(--line); }
+.msg .body.tombstone { font-style: italic; color: var(--dim); }
+.msg.deleted .who { opacity: 0.7; }
+.quote.gone.deleted { border-left-style: dashed; }
+
+.edit-box, .delete-confirm {
+  display: flex; flex-direction: column; gap: 6px;
+  max-width: min(560px, 100%);
+  padding: 8px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.delete-confirm { border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-soft); }
+.delete-confirm p { margin: 0; font-size: 12.5px; line-height: 1.45; color: var(--text); }
+.edit-input {
+  width: 100%; min-height: 2.2em; resize: vertical;
+  font: inherit; line-height: 1.5; color: var(--text);
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 5px 8px;
+}
+.edit-input:focus { outline: var(--focus-w) solid var(--accent); outline-offset: 1px; }
+.edit-row { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.edit-row .edit-hint { flex: 1; font-size: 11.5px; color: var(--dim); }
+.edit-row button { padding: 3px 12px; font-size: 12.5px; }
+
 .reactions { display: flex; flex-wrap: wrap; gap: 4px; }
 .reactions:empty { display: none; }
 .reactions .chip {

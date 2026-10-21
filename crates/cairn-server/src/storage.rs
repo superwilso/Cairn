@@ -43,7 +43,7 @@ use redb::{Database, Error as RedbError, ReadableTable, ReadableTableMetadata, T
 use serde::{Deserialize, Serialize};
 
 use cairn_crypto::franking::ServerFrankingKey;
-use cairn_proto::{BlobId, DeviceId, RoomId, SpaceId, UserId, Username};
+use cairn_proto::{BlobId, DeviceId, MessageId, RoomId, SpaceId, UserId, Username};
 
 use crate::state::{
     AccountRecord, BlobRecord, DeviceRecord, InviteRecord, RegistrationPolicy, Room,
@@ -96,7 +96,11 @@ impl From<RedbError> for StorageError {
 }
 
 /// What this build writes and can read.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// 2 added `message_ids`. A version-1 database is indexed once when first opened, and an
+/// older build then refuses it, because a build that did not know the index would write
+/// messages without it and reopen the replay it closes.
+const SCHEMA_VERSION: u32 = 2;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// `meta` key holding the hash of the franking key this database belongs to.
@@ -122,6 +126,17 @@ const SPACE_INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("space_
 /// Keyed by `(room id, server_seq)` so a room's messages are contiguous and a fetch after
 /// a cursor is a range scan rather than a filter over everything.
 const MESSAGES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("messages");
+/// `"{room}/{message id}"` → the `server_seq` it was stored at.
+///
+/// Every envelope id a room has ever accepted, kept after a disappearing message is purged.
+/// Found by probing: the instance accepted the same signed envelope twice, so any member
+/// could resubmit someone else's message — shown again under their name, at a later point
+/// in the room, with a fresh franking tag chaining it after whatever came just before.
+/// That let a reporter assemble a *verifying* transcript in which the victim's old words
+/// answer a question they never saw. Kept after a purge because a purged message's
+/// envelope can still be in a member's hands; what survives is an id and a number the
+/// instance had already, not content.
+const MESSAGE_IDS: TableDefinition<&str, &[u8]> = TableDefinition::new("message_ids");
 /// Attachment metadata — which room a blob belongs to, and who uploaded it.
 ///
 /// Split from the bytes so an access check does not have to load the payload. Answering
@@ -137,7 +152,7 @@ const BLOB_BYTES: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_byte
 /// here produces a backup that restores *almost* everything, which is worse than one that
 /// fails, because the loss is only discovered after the restore.
 /// `every_table_is_included_in_a_backup` guards this.
-const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 12] = [
+const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 13] = [
     META,
     ROOMS,
     ACCOUNTS,
@@ -148,6 +163,7 @@ const STRING_KEYED_TABLES: [TableDefinition<'static, &str, &[u8]>; 12] = [
     ROOM_INVITES,
     SPACES,
     SPACE_INVITES,
+    MESSAGE_IDS,
     BLOB_META,
     BLOB_BYTES,
 ];
@@ -224,11 +240,31 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// Messages in a room with `server_seq` strictly greater than `after`, in order.
     fn messages_since(&self, room: RoomId, after: u64) -> Result<Vec<StoredMessage>, StorageError>;
 
+    /// Whether `room` has ever accepted an envelope with this id: the sequence number it
+    /// was given, and the message itself if it has not been purged since.
+    fn message_by_id(
+        &self,
+        room: RoomId,
+        id: MessageId,
+    ) -> Result<Option<SeenMessage>, StorageError>;
+
     /// A blob's metadata, without its bytes. Used for the access check.
     fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError>;
 
     /// A blob's ciphertext. Call only after the access check has passed.
     fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError>;
+}
+
+/// An envelope id a room has already accepted. See [`Storage::message_by_id`].
+#[derive(Debug, Clone)]
+pub struct SeenMessage {
+    pub server_seq: u64,
+    /// `None` once the disappearing-message purge has removed it.
+    pub stored: Option<StoredMessage>,
+}
+
+fn message_id_key(room: RoomId, id: MessageId) -> String {
+    format!("{}/{}", room.as_uuid(), id.as_uuid())
 }
 
 /// A `redb`-backed store.
@@ -253,7 +289,45 @@ impl DbStorage {
         let store = Self { dir, db };
         store.check_schema_version()?;
         store.import_legacy_snapshot()?;
+        store.index_message_ids()?;
         Ok(store)
+    }
+
+    /// Bring a version-1 database up to version 2 by indexing every message it holds.
+    ///
+    /// Once, in one transaction with the version bump, so a crash part way leaves a
+    /// version-1 database that is indexed again from the start on the next open.
+    fn index_message_ids(&self) -> Result<(), StorageError> {
+        let tx = self.db.begin_write().map_err(RedbError::from)?;
+        {
+            let mut meta = tx.open_table(META).map_err(RedbError::from)?;
+            let found = meta
+                .get("schema_version")
+                .map_err(RedbError::from)?
+                .map(|v| serde_json::from_slice::<u32>(v.value()))
+                .transpose()?
+                .unwrap_or(SCHEMA_VERSION);
+            if found >= 2 {
+                return Ok(());
+            }
+            let messages = tx.open_table(MESSAGES).map_err(RedbError::from)?;
+            let mut ids = tx.open_table(MESSAGE_IDS).map_err(RedbError::from)?;
+            for entry in messages.iter().map_err(RedbError::from)? {
+                let (k, v) = entry.map_err(RedbError::from)?;
+                let m: StoredMessage = serde_json::from_slice(v.value())?;
+                // The room the log files it under, as `Write::Message` keys it.
+                let room: RoomId = k.value().0.parse().map_err(|_| {
+                    StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, "bad room key"))
+                })?;
+                let key = message_id_key(room, m.envelope.id);
+                ids.insert(key.as_str(), serde_json::to_vec(&m.server_seq)?.as_slice())
+                    .map_err(RedbError::from)?;
+            }
+            meta.insert("schema_version", serde_json::to_vec(&SCHEMA_VERSION)?.as_slice())
+                .map_err(RedbError::from)?;
+        }
+        tx.commit().map_err(RedbError::from)?;
+        Ok(())
     }
 
     /// Refuse a database from a future build rather than misinterpreting its records.
@@ -499,6 +573,7 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                 t.insert("registration_policy", serde_json::to_vec(policy)?.as_slice())
                     .map_err(RedbError::from)?;
             }
+            // The id stays in `message_ids`: see there.
             Write::DeleteMessage(room, seq) => {
                 let mut t = tx.open_table(MESSAGES).map_err(RedbError::from)?;
                 t.remove((room.to_string().as_str(), *seq)).map_err(RedbError::from)?;
@@ -518,6 +593,10 @@ fn apply(tx: &redb::WriteTransaction, writes: &[Write]) -> Result<(), StorageErr
                     serde_json::to_vec(message)?.as_slice(),
                 )
                 .map_err(RedbError::from)?;
+                let mut ids = tx.open_table(MESSAGE_IDS).map_err(RedbError::from)?;
+                let key = message_id_key(*room, message.envelope.id);
+                ids.insert(key.as_str(), serde_json::to_vec(&message.server_seq)?.as_slice())
+                    .map_err(RedbError::from)?;
             }
         }
     }
@@ -662,6 +741,30 @@ impl Storage for DbStorage {
         }
         Ok(out)
     }
+
+    fn message_by_id(
+        &self,
+        room: RoomId,
+        id: MessageId,
+    ) -> Result<Option<SeenMessage>, StorageError> {
+        let tx = self.db.begin_read().map_err(RedbError::from)?;
+        let ids = match tx.open_table(MESSAGE_IDS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(RedbError::from(e).into()),
+        };
+        let Some(seq) = ids.get(message_id_key(room, id).as_str()).map_err(RedbError::from)? else {
+            return Ok(None);
+        };
+        let server_seq: u64 = serde_json::from_slice(seq.value())?;
+        let messages = tx.open_table(MESSAGES).map_err(RedbError::from)?;
+        let stored = messages
+            .get((room.to_string().as_str(), server_seq))
+            .map_err(RedbError::from)?
+            .map(|v| serde_json::from_slice(v.value()))
+            .transpose()?;
+        Ok(Some(SeenMessage { server_seq, stored }))
+    }
 }
 
 impl DbStorage {
@@ -694,6 +797,8 @@ pub struct MemoryStorage {
 struct MemoryInner {
     directory: Directory,
     messages: Vec<(RoomId, StoredMessage)>,
+    /// Kept after a purge, as `message_ids` is.
+    message_ids: std::collections::HashMap<(RoomId, MessageId), u64>,
     blobs: Vec<(BlobId, BlobRecord, Vec<u8>)>,
 }
 
@@ -738,7 +843,10 @@ impl Storage for MemoryStorage {
                     upsert(&mut inner.directory.space_invites, h.clone(), r.clone())
                 }
                 Write::Policy(p) => inner.directory.registration_policy = *p,
-                Write::Message(room, m) => inner.messages.push((*room, m.clone())),
+                Write::Message(room, m) => {
+                    inner.message_ids.insert((*room, m.envelope.id), m.server_seq);
+                    inner.messages.push((*room, m.clone()));
+                }
                 Write::DeleteMessage(room, seq) => {
                     inner.messages.retain(|(r, m)| !(r == room && m.server_seq == *seq))
                 }
@@ -766,6 +874,22 @@ impl Storage for MemoryStorage {
             .collect();
         out.sort_by_key(|m| m.server_seq);
         Ok(out)
+    }
+
+    fn message_by_id(
+        &self,
+        room: RoomId,
+        id: MessageId,
+    ) -> Result<Option<SeenMessage>, StorageError> {
+        let inner = self.inner.lock().expect("memory storage mutex poisoned");
+        Ok(inner.message_ids.get(&(room, id)).map(|&server_seq| SeenMessage {
+            server_seq,
+            stored: inner
+                .messages
+                .iter()
+                .find(|(r, m)| *r == room && m.server_seq == server_seq)
+                .map(|(_, m)| m.clone()),
+        }))
     }
 }
 
@@ -996,6 +1120,47 @@ mod tests {
                 Write::Message(room_id, message(1)),
             ])
             .unwrap();
+    }
+
+    #[test]
+    fn a_version_one_database_is_indexed_so_its_messages_cannot_be_replayed() {
+        let dir = temp_dir("index");
+        let room = RoomId::new();
+        let m = message(1);
+        {
+            let store = DbStorage::new(&dir).unwrap();
+            store.commit(&[Write::Message(room, m.clone())]).unwrap();
+            // Put it back the way a version-1 build left it: the message, no index.
+            let tx = store.db.begin_write().unwrap();
+            {
+                let mut ids = tx.open_table(MESSAGE_IDS).unwrap();
+                ids.remove(message_id_key(room, m.envelope.id).as_str()).unwrap();
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert("schema_version", serde_json::to_vec(&1u32).unwrap().as_slice())
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+            assert!(store.message_by_id(room, m.envelope.id).unwrap().is_none());
+        }
+        let reopened = DbStorage::new(&dir).unwrap();
+        let seen = reopened.message_by_id(room, m.envelope.id).unwrap().expect("indexed on open");
+        assert_eq!(seen.server_seq, 1);
+        assert!(seen.stored.is_some());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_purged_message_is_still_known_to_have_been_accepted() {
+        let dir = temp_dir("purged-id");
+        let store = DbStorage::new(&dir).unwrap();
+        let room = RoomId::new();
+        let m = message(4);
+        store.commit(&[Write::Message(room, m.clone())]).unwrap();
+        store.commit(&[Write::DeleteMessage(room, 4)]).unwrap();
+        let seen = store.message_by_id(room, m.envelope.id).unwrap().expect("the id outlives it");
+        assert_eq!(seen.server_seq, 4);
+        assert!(seen.stored.is_none(), "the content is gone, as a purge promises");
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

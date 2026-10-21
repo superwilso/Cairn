@@ -33,6 +33,14 @@ pub enum ConversationError {
     /// signature does not verify under that leaf's key. See [`Conversation::receive`].
     #[error("the message's claimed sender is not the device that signed it")]
     UnattributableSender,
+    /// An ordinary message whose text would read back to a moderator as an edit frame
+    /// (`cairn_proto::franked`). Refused so every franked message means one thing.
+    #[error("this text is reserved by the protocol and cannot be sent as a message")]
+    ReservedText,
+    /// An edit with no text, or one naming a malformed reference. A deletion is
+    /// [`Conversation::send_delete`], not an empty edit.
+    #[error("an edit needs new text and a well-formed target")]
+    BadEdit,
 }
 
 /// A message ready to hand to the transport, plus the opening the sender must retain.
@@ -190,6 +198,20 @@ impl Conversation {
 
     pub fn group_mut(&mut self) -> Option<&mut GroupHandle> {
         self.group.as_mut()
+    }
+
+    /// Whether a commit this device built is waiting to be settled. See
+    /// [`cairn_crypto::mls::GroupHandle::stage_add`].
+    pub fn has_pending_commit(&self) -> bool {
+        self.group.as_ref().is_some_and(GroupHandle::has_pending_commit)
+    }
+
+    /// Drop this device's pending commit: it never reached the instance.
+    pub fn discard_commit(&mut self) -> Result<(), ConversationError> {
+        if let Some(group) = self.group.as_mut() {
+            group.discard_commit()?;
+        }
+        Ok(())
     }
 
     /// Everyone in this conversation, as the MLS group's own state records them.
@@ -366,21 +388,76 @@ impl Conversation {
         )
     }
 
+    /// Replace the text of one of this account's own earlier messages.
+    ///
+    /// The edit is a new message with its own franking commitment — **over the new text and
+    /// the reference to the message it replaces** (`cairn_proto::franked::edit_bytes`), so a
+    /// report of the edit proves which message it claims to replace, and a reporter cannot
+    /// present it as a standalone message or move it onto another one. The original is not
+    /// touched: each recipient keeps it, its opening and its tag, so it stays reportable and
+    /// the edit history stays visible (`docs/04-safety-architecture.md` §1a).
+    ///
+    /// Nothing here checks that `target` exists — this type holds no transcript. Every
+    /// recipient checks it on receipt (`crate::thread`), and the session refuses to send an
+    /// edit that would fail there.
+    pub fn send_edit(
+        &mut self,
+        target: MessageRef,
+        new_text: &[u8],
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        if new_text.is_empty() || !target.is_valid() || target.sender != self.user {
+            return Err(ConversationError::BadEdit);
+        }
+        self.send_with(new_text, Extras { edit: Some(target), ..Extras::default() }, now_ms)
+    }
+
+    /// Ask every member to delete one of this account's own earlier messages.
+    ///
+    /// **A request, not a deletion.** Honest clients remove the text, its franking opening
+    /// and any attachment key from their transcripts; a modified client keeps all of it, and
+    /// nothing in any protocol can make it otherwise (`docs/01-threat-model.md` §7). The body
+    /// is empty, like a reaction's, so a delete itself is not reportable as content.
+    pub fn send_delete(
+        &mut self,
+        target: MessageRef,
+        now_ms: i64,
+    ) -> Result<OutboundMessage, ConversationError> {
+        if !target.is_valid() || target.sender != self.user {
+            return Err(ConversationError::BadEdit);
+        }
+        self.send_with(b"", Extras { delete: Some(target), ..Extras::default() }, now_ms)
+    }
+
     fn send_with(
         &mut self,
         plaintext: &[u8],
         extras: Extras,
         now_ms: i64,
     ) -> Result<OutboundMessage, ConversationError> {
-        let Extras { card, attachment, signal, reply_to, reaction, profile, custom_set, sticker } =
-            extras;
+        let Extras {
+            card,
+            attachment,
+            signal,
+            reply_to,
+            reaction,
+            profile,
+            custom_set,
+            sticker,
+            edit,
+            delete,
+        } = extras;
         let tier = self.seal.tier();
         if !tier.is_e2ee() {
             return Err(ConversationError::NotEncrypted);
         }
+        let franked = franked_bytes(plaintext, edit.as_ref()).ok_or(ConversationError::BadEdit)?;
+        if edit.is_none() && cairn_proto::franked::is_edit_frame(plaintext) {
+            return Err(ConversationError::ReservedText);
+        }
         let group = self.group.as_mut().ok_or(MlsError::NoGroup)?;
 
-        let (commitment, opening) = franking::commit(plaintext);
+        let (commitment, opening) = franking::commit(&franked);
 
         // The opening travels *inside* the encrypted body, never beside it. A recipient
         // cannot file a report without it, and the server must never see it — a server
@@ -397,6 +474,8 @@ impl Conversation {
             profile,
             custom_set,
             sticker,
+            edit,
+            delete,
         };
         let encoded = serde_json::to_vec(&inner).map_err(ConversationError::Encoding)?;
         let mls_message = group.encrypt(&encoded)?;
@@ -494,6 +573,8 @@ impl Conversation {
                 profile: None,
                 custom_set: None,
                 sticker: None,
+                edit: None,
+                delete: None,
             })),
             EnvelopePayload::MlsApplication { ciphertext }
             | EnvelopePayload::MlsHandshake { message: ciphertext, .. } => {
@@ -520,8 +601,27 @@ impl Conversation {
                     .and_then(decode_commitment)
                     .ok_or(ConversationError::MissingCommitment)?;
 
-                if !franking::verify_commitment(&inner.body, &inner.opening, &claimed) {
+                // What the commitment covers: the text, and for an edit the message it
+                // replaces. Recomputed from what this device will act on, so a sender cannot
+                // have the commitment name one target while recipients apply another.
+                let franked = franked_bytes(&inner.body, inner.edit.as_ref())
+                    .ok_or(ConversationError::CommitmentMismatch)?;
+                if !franking::verify_commitment(&franked, &inner.opening, &claimed) {
                     return Err(ConversationError::CommitmentMismatch);
+                }
+                // An ordinary message that reads as an edit frame would mean one thing on
+                // screen and another to a moderator. No honest client sends one.
+                if inner.edit.is_none() && cairn_proto::franked::is_edit_frame(&inner.body) {
+                    return Ok(TimelineEvent::Nothing);
+                }
+                // Edits and deletes carry nothing but themselves, and only ever name the
+                // sender's own messages. Whether the target exists, and is still editable, is
+                // the transcript's to say (`crate::thread`); what is checkable here is checked
+                // here, so a malformed one never reaches it.
+                if (inner.edit.is_some() || inner.delete.is_some())
+                    && !inner.is_bare_revision(envelope.sender)
+                {
+                    return Ok(TimelineEvent::Nothing);
                 }
 
                 // A reaction that is not one is dropped whole rather than shown as an empty
@@ -554,6 +654,7 @@ impl Conversation {
                     franking: Some(ReceivedFranking {
                         opening: inner.opening,
                         commitment: claimed,
+                        franked,
                     }),
                     // Clamped again on receipt. These bytes came from the sender, so the
                     // limits are a defence against a hostile one, not tidiness.
@@ -567,6 +668,8 @@ impl Conversation {
                     profile: inner.profile.map(Box::new),
                     custom_set: inner.custom_set.map(Box::new),
                     sticker,
+                    edit: inner.edit.map(Box::new),
+                    delete: inner.delete.map(Box::new),
                 }))
             }
         }
@@ -709,6 +812,50 @@ struct InnerBody {
     /// The name of the room sticker this message is. See [`Conversation::send_sticker`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sticker: Option<String>,
+    /// This message replaces the text of the sender's own earlier message. See
+    /// [`Conversation::send_edit`]. A client that predates edits shows it as a new message
+    /// with the new text — which is what it is, and still franked as the sender's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edit: Option<MessageRef>,
+    /// This message asks for the sender's own earlier message to be deleted. See
+    /// [`Conversation::send_delete`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delete: Option<MessageRef>,
+}
+
+impl InnerBody {
+    /// An edit or a delete carrying nothing else, naming a well-formed message of the
+    /// sender's own. Anything else is dropped whole: an "edit" with an attachment, a reply or
+    /// a reaction riding on it would be one feature smuggling another past its checks.
+    fn is_bare_revision(&self, sender: UserId) -> bool {
+        let nothing_else = self.card.is_none()
+            && self.attachment.is_none()
+            && self.signal.is_none()
+            && self.reply_to.is_none()
+            && self.reaction.is_none()
+            && self.profile.is_none()
+            && self.custom_set.is_none()
+            && self.sticker.is_none();
+        let own = |target: &MessageRef| target.is_valid() && target.sender == sender;
+        match (&self.edit, &self.delete) {
+            (Some(target), None) => nothing_else && own(target) && !self.body.is_empty(),
+            (None, Some(target)) => nothing_else && own(target) && self.body.is_empty(),
+            _ => false,
+        }
+    }
+}
+
+/// The bytes a message's franking commitment covers: its text, or for an edit the frame
+/// binding the text to the message it replaces. `None` for an edit naming a malformed
+/// reference, which has no frame.
+fn franked_bytes(body: &[u8], edit: Option<&MessageRef>) -> Option<Vec<u8>> {
+    match edit {
+        None => Some(body.to_vec()),
+        Some(target) => {
+            let commitment = decode_commitment(&target.id)?;
+            Some(cairn_proto::franked::edit_bytes(target.sender, &commitment.0, body))
+        }
+    }
 }
 
 /// The optional parts of an outgoing message. Bundled so `send_with` does not grow a
@@ -723,6 +870,8 @@ struct Extras {
     profile: Option<crate::profile::Profile>,
     custom_set: Option<crate::custom::CustomSet>,
     sticker: Option<String>,
+    edit: Option<MessageRef>,
+    delete: Option<MessageRef>,
 }
 
 /// Names one earlier message in a room: who sent it, and its franking commitment.
@@ -879,6 +1028,12 @@ pub struct ReceivedMessage {
     pub custom_set: Option<Box<crate::custom::CustomSet>>,
     /// The room sticker this message is, by name; the body is `:name:`.
     pub sticker: Option<String>,
+    /// This message replaces the text of `edit`, which the envelope's sender also sent —
+    /// checked here. Whether that message exists, and may still be edited, is not knowable
+    /// without the transcript; [`crate::thread::Thread::admits`] decides.
+    pub edit: Option<Box<MessageRef>>,
+    /// This message asks for `delete`, the sender's own, to be deleted. Same checks as `edit`.
+    pub delete: Option<Box<MessageRef>>,
 }
 
 /// Franking material a recipient retains so a message can be reported later.
@@ -886,6 +1041,10 @@ pub struct ReceivedMessage {
 pub struct ReceivedFranking {
     pub opening: Opening,
     pub commitment: Commitment,
+    /// The exact bytes the commitment opens to — what a report discloses as its plaintext.
+    /// The body for an ordinary message; for an edit, the frame naming what it replaces
+    /// (`cairn_proto::franked`). Reporting an edit with only its body would fail to verify.
+    pub franked: Vec<u8>,
 }
 
 fn decode_commitment(hex_str: &str) -> Option<Commitment> {
@@ -1323,6 +1482,219 @@ mod tests {
         assert_eq!(got.custom_set.unwrap().items[0].name, "ok");
     }
 
+    /// What a modified client can send: any inner body, committed over any bytes, encrypted
+    /// and signed by a real member. The honest send path cannot produce these.
+    fn hostile_send(from: &mut Conversation, inner: &InnerBody, franked: &[u8]) -> Envelope {
+        let commitment = franking::commit_with_opening(franked, &inner.opening);
+        let encoded = serde_json::to_vec(inner).unwrap();
+        let ciphertext = from.group_mut().unwrap().encrypt(&encoded).unwrap().to_bytes().unwrap();
+        let envelope = Envelope::new(
+            from.tier(),
+            from.room(),
+            from.user,
+            from.device,
+            5_000,
+            EnvelopePayload::MlsApplication { ciphertext },
+        )
+        .unwrap()
+        .with_franking_commitment(commitment.to_hex());
+        from.sign(envelope).unwrap()
+    }
+
+    fn bare(body: &[u8]) -> InnerBody {
+        InnerBody {
+            body: body.to_vec(),
+            opening: Opening::generate(),
+            card: None,
+            attachment: None,
+            signal: None,
+            reply_to: None,
+            reaction: None,
+            profile: None,
+            custom_set: None,
+            sticker: None,
+            edit: None,
+            delete: None,
+        }
+    }
+
+    fn reference(sent: &OutboundMessage) -> MessageRef {
+        MessageRef { sender: sent.envelope.sender, id: sent.commitment.to_hex() }
+    }
+
+    #[test]
+    fn nobody_can_edit_or_delete_someone_elses_message_on_the_wire() {
+        // Probe: mallory, a real member, names alice's real message in an edit and a delete.
+        // The honest API refuses to build either; a modified client's are dropped on receipt
+        // before any transcript sees them.
+        let (mut first, mut rest, _) = linked_group(3);
+        let alice = &mut first[0];
+        let (mut bob, mut mallory) = (rest.remove(0), rest.remove(0));
+        let original = alice.send(b"the meeting is at 3", 1).unwrap();
+        bob.receive(&original.envelope).unwrap();
+        mallory.receive(&original.envelope).unwrap();
+        let target = reference(&original);
+
+        assert!(matches!(
+            mallory.send_edit(target.clone(), b"cancelled", 2),
+            Err(ConversationError::BadEdit)
+        ));
+        assert!(matches!(mallory.send_delete(target.clone(), 2), Err(ConversationError::BadEdit)));
+
+        let edit = InnerBody { edit: Some(target.clone()), ..bare(b"cancelled") };
+        let frame = franked_bytes(b"cancelled", Some(&target)).unwrap();
+        let sent = hostile_send(&mut mallory, &edit, &frame);
+        assert!(matches!(bob.receive(&sent).unwrap(), TimelineEvent::Nothing));
+
+        let delete = InnerBody { delete: Some(target), ..bare(b"") };
+        let sent = hostile_send(&mut mallory, &delete, b"");
+        assert!(matches!(bob.receive(&sent).unwrap(), TimelineEvent::Nothing));
+    }
+
+    #[test]
+    fn an_edit_cannot_be_franked_as_anything_but_itself() {
+        // Probe: a hostile sender whose edit opens to bytes other than the frame recipients
+        // apply — the new text alone (so a report of it reads as a standalone message), or a
+        // frame naming a different message (so a report moves it onto that one). Either would
+        // leave the recipient holding an edit they could not truthfully report. Both refused.
+        let (mut alice, mut bob) = linked_pair();
+        let one = alice.send(b"one", 1).unwrap();
+        let two = alice.send(b"two", 2).unwrap();
+        bob.receive(&one.envelope).unwrap();
+        bob.receive(&two.envelope).unwrap();
+        let edit = InnerBody { edit: Some(reference(&one)), ..bare(b"one, fixed") };
+
+        let unframed = hostile_send(&mut alice, &edit, b"one, fixed");
+        assert!(matches!(bob.receive(&unframed), Err(ConversationError::CommitmentMismatch)));
+        let elsewhere = franked_bytes(b"one, fixed", Some(&reference(&two))).unwrap();
+        let moved = hostile_send(&mut alice, &edit, &elsewhere);
+        assert!(matches!(bob.receive(&moved), Err(ConversationError::CommitmentMismatch)));
+    }
+
+    #[test]
+    fn an_edit_and_its_original_are_both_reportable_and_the_report_names_the_original() {
+        // What a moderator sees for a reported edit: the original, verified under its own
+        // tag; the edit, verified under its own; and — from the commitment, not from the
+        // reporter — which message the edit replaced. A reporter cannot move it.
+        use cairn_crypto::franking::{Context, ReportedMessage, ServerFrankingKey};
+        use cairn_crypto::{ReportError, TranscriptReport};
+        use cairn_proto::franked::{self as frame, Franked};
+
+        let (mut alice, mut bob) = linked_pair();
+        let key = ServerFrankingKey::generate();
+        let original = alice.send(b"meet at the station", 1).unwrap();
+        let edit = alice.send_edit(reference(&original), b"meet at the library", 2).unwrap();
+
+        let mut prev = None;
+        let mut reported = Vec::new();
+        for (seq, sent) in [&original, &edit].into_iter().enumerate() {
+            let context = Context {
+                commitment: sent.commitment,
+                room: sent.envelope.room,
+                sender: sent.envelope.sender,
+                sender_device: sent.envelope.sender_device,
+                server_seq: seq as u64 + 1,
+                prev_commitment: prev,
+            };
+            let tag = key.tag(&context);
+            prev = Some(sent.commitment);
+            let got = bob.receive(&sent.envelope).unwrap().message().unwrap();
+            let franking = got.franking.unwrap();
+            reported.push(ReportedMessage {
+                plaintext: franking.franked,
+                opening: franking.opening,
+                context,
+                tag,
+            });
+        }
+        let report = TranscriptReport { messages: reported };
+        assert_eq!(report.verify(&key), Ok(()));
+        match frame::parse(&report.messages[1].plaintext) {
+            Franked::Edit { target_sender, target_commitment, body } => {
+                assert_eq!(target_sender, report.messages[0].context.sender);
+                assert_eq!(target_commitment, report.messages[0].context.commitment.0);
+                assert_eq!(body, b"meet at the library");
+            }
+            other => panic!("an edit must read back as one: {other:?}"),
+        }
+        assert_eq!(
+            frame::parse(&report.messages[0].plaintext),
+            Franked::Message(b"meet at the station")
+        );
+
+        // Reported as plain text, or moved onto another message, it no longer verifies.
+        let mut bare_text = report.clone();
+        bare_text.messages[1].plaintext = b"meet at the library".to_vec();
+        assert_eq!(bare_text.verify(&key), Err(ReportError::BadCommitment(1)));
+        let mut moved = report;
+        moved.messages[1].plaintext =
+            frame::edit_bytes(alice.user, &[9; 32], b"meet at the library");
+        assert_eq!(moved.verify(&key), Err(ReportError::BadCommitment(1)));
+    }
+
+    #[test]
+    fn text_that_reads_as_an_edit_frame_is_neither_sent_nor_shown() {
+        // Otherwise a message would be one thing on screen and another to a moderator.
+        let (mut alice, mut bob) = linked_pair();
+        let frame = cairn_proto::franked::edit_bytes(UserId::new(), &[1; 32], b"x");
+        assert!(matches!(alice.send(&frame, 1), Err(ConversationError::ReservedText)));
+        let sent = hostile_send(&mut alice, &bare(&frame), &frame);
+        assert!(matches!(bob.receive(&sent).unwrap(), TimelineEvent::Nothing));
+    }
+
+    #[test]
+    fn an_edit_or_delete_carrying_anything_else_is_dropped() {
+        let (mut alice, mut bob) = linked_pair();
+        let original = alice.send(b"hi", 1).unwrap();
+        bob.receive(&original.envelope).unwrap();
+        let target = reference(&original);
+
+        let with_text = InnerBody { delete: Some(target.clone()), ..bare(b"a parting shot") };
+        let sent = hostile_send(&mut alice, &with_text, b"a parting shot");
+        assert!(matches!(bob.receive(&sent).unwrap(), TimelineEvent::Nothing));
+
+        let riding = InnerBody {
+            edit: Some(target.clone()),
+            reply_to: Some(target.clone()),
+            ..bare(b"hello")
+        };
+        let frame = franked_bytes(b"hello", Some(&target)).unwrap();
+        let sent = hostile_send(&mut alice, &riding, &frame);
+        assert!(matches!(bob.receive(&sent).unwrap(), TimelineEvent::Nothing));
+    }
+
+    #[test]
+    fn a_reply_carries_a_reference_and_not_the_text_it_quotes() {
+        // Probe: if a reply carried its quote, the instance would learn something about the
+        // quoted message from the reply's size alone — and a sender could misquote. Replies
+        // to a two-letter message and to a long one must be the same size on the wire.
+        let (mut alice, mut bob) = linked_pair();
+        let short = alice.send(b"ok", 1).unwrap();
+        let long = alice.send("a much longer message ".repeat(100).as_bytes(), 2).unwrap();
+        bob.receive(&short.envelope).unwrap();
+        bob.receive(&long.envelope).unwrap();
+        let size = |e: &Envelope| match &e.payload {
+            EnvelopePayload::MlsApplication { ciphertext } => ciphertext.len(),
+            _ => unreachable!(),
+        };
+        let a = bob.send_reply(b"agreed", reference(&short), 3).unwrap();
+        let b = bob.send_reply(b"agreed", reference(&long), 4).unwrap();
+        assert_eq!(size(&a.envelope), size(&b.envelope));
+
+        // A modified client may add a quote of its own choosing to the body; there is no
+        // field for it to land in, so a recipient never holds one to show.
+        let mut inner = serde_json::to_value(InnerBody {
+            reply_to: Some(reference(&short)),
+            ..bare(b"agreed")
+        })
+        .unwrap();
+        inner["quote"] = serde_json::json!("alice said she would pay");
+        inner["snippet"] = serde_json::json!("alice said she would pay");
+        let forged: InnerBody = serde_json::from_value(inner).unwrap();
+        let encoded = serde_json::to_vec(&forged).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("would pay"));
+    }
+
     #[test]
     fn a_malformed_reply_reference_leaves_an_ordinary_message() {
         let (mut alice, mut bob) = linked_pair();
@@ -1493,6 +1865,8 @@ mod attachment_tests {
             profile: None,
             custom_set: None,
             sticker: None,
+            edit: None,
+            delete: None,
         };
 
         let encoded = serde_json::to_vec(&inner).unwrap();

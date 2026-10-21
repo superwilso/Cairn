@@ -34,8 +34,9 @@ pub enum EnvelopePayload {
     MlsHandshake {
         #[serde(with = "hex_bytes")]
         message: Vec<u8>,
-        /// Server-assigned sequence number establishing commit order within the room.
-        /// `None` until the server assigns it.
+        /// Reserved. Nothing sets it: commit order is the room's `server_seq`, which every
+        /// message gets, handshake or not. Senders leave it `None`, and it is signed as 0.
+        /// The comment here used to say the server assigned it, which no instance does.
         #[serde(skip_serializing_if = "Option::is_none")]
         epoch_seq: Option<u64>,
     },

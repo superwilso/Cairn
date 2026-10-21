@@ -16,15 +16,24 @@ Legend: ✅ has it · ⚠️ partial or qualified · ❌ lacks it · 🎯 Cairn 
 |---|---|---|---|---|---|---|
 | 1:1 DMs | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
 | Group chats | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
-| Threads / replies | ✅ | ⚠️ replies | ⚠️ replies | ⚠️ replies | ✅ | 🎯 v1 |
-| Reactions | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1 |
-| Edit / delete | ✅ | ✅ | ✅ | ⚠️ | ✅ | 🎯 v1 |
+| Threads / replies | ✅ | ⚠️ replies | ⚠️ replies | ⚠️ replies | ✅ | ⚠️ desktop replies — quote resolved on the recipient's device, click to jump; no threads |
+| Reactions | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ desktop |
+| Edit / delete | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ desktop — edits marked with visible history and still reportable; delete is a request honest clients honour |
 | Disappearing messages | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ per-room, from send |
 | Read receipts (optional) | ⚠️ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Typing indicators | ✅ | ✅ | ✅ | ✅ | ✅ | 🎯 v1, opt-out |
 | Message search | ✅ | ✅ local | ✅ local | ✅ | ✅ server | ⚠️ local history stored, search unbuilt |
 | Scheduled messages | ❌ | ❌ | ⚠️ | ❌ | ✅ | 🎯 v2 |
 | Voice messages | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ desktop — recorded Opus, sent as an encrypted attachment |
+
+**Note on edit and delete.** Both travel inside the encrypted stream, and only a message's
+sender can do either. Unlike Discord, an edit cannot hide what was first said: recipients see
+"(edited)" and the earlier versions, and the original stays reportable through franking
+(`04-safety-architecture.md` §1a). Delete-for-everyone is what it is in Signal and WhatsApp too
+— a request: honest clients remove the text and its report material, and a modified client,
+a screenshot or a report already filed keeps it (`01-threat-model.md` §3b). The CLI does not
+honour deletes yet. Discord can actually delete, because its server holds the plaintext; no
+end-to-end encrypted product can.
 
 **Note on search.** Telegram's server-side search over all history is a genuine advantage
 that E2EE products structurally cannot match. Cairn's tiering means public communities get

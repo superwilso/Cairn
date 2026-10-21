@@ -34,6 +34,10 @@ pub enum ServerError {
     Shape(#[from] ShapeError),
     #[error("malformed franking commitment")]
     BadCommitment,
+    /// This room already holds a different envelope with this id, or held this one and
+    /// purged it. An identical resend of one still held is answered as the original was.
+    #[error("this room has already accepted a message with that id")]
+    DuplicateMessage,
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("message is not signed")]
@@ -907,8 +911,10 @@ impl Instance {
 
     /// Set the registration policy. Operator action.
     pub fn set_registration_policy(&self, policy: RegistrationPolicy) -> Result<(), ServerError> {
-        *self.registration_policy.lock().expect("policy mutex poisoned") = policy;
-        self.write(&[Write::Policy(policy)])
+        let mut current = self.registration_policy.lock().expect("policy mutex poisoned");
+        self.write(&[Write::Policy(policy)])?;
+        *current = policy;
+        Ok(())
     }
 
     /// Mint a registration invite. Operator action.
@@ -921,11 +927,10 @@ impl Instance {
             return Err(ServerError::InviteTooShort);
         }
         let record = InviteRecord { used_by: None, expires_at_ms };
-        self.invites
-            .lock()
-            .expect("invites mutex poisoned")
-            .insert(token.to_owned(), record.clone());
-        self.write(&[Write::Invite(token.to_owned(), record)])
+        let mut invites = self.invites.lock().expect("invites mutex poisoned");
+        self.write(&[Write::Invite(token.to_owned(), record.clone())])?;
+        invites.insert(token.to_owned(), record);
+        Ok(())
     }
 
     /// Registration as it arrives from the network: [`Self::claim_account`], charged to the
@@ -979,35 +984,42 @@ impl Instance {
         let mut spent_invite = None;
         if self.registration_policy() == RegistrationPolicy::InviteOnly {
             let token = invite.ok_or(ServerError::InviteRequired)?;
-            let record = invites.get_mut(token).ok_or(ServerError::InviteInvalid)?;
+            let record = invites.get(token).ok_or(ServerError::InviteInvalid)?;
             if record.used_by.is_some() {
                 return Err(ServerError::InviteInvalid);
             }
             if record.expires_at_ms.is_some_and(|exp| now_ms >= exp) {
                 return Err(ServerError::InviteInvalid);
             }
-            record.used_by = Some(user);
-            spent_invite = Some((token.to_owned(), record.clone()));
+            spent_invite =
+                Some((token.to_owned(), InviteRecord { used_by: Some(user), ..record.clone() }));
         }
 
         let device_record = DeviceRecord { user, public_key: hex::encode(public_key) };
         let account_record = AccountRecord { devices: vec![device] };
-        devices.insert(device, device_record.clone());
-        accounts.insert(user, account_record.clone());
-
-        drop(devices);
-        drop(accounts);
-        drop(invites);
 
         // One batch, so a crash cannot leave the invite spent with no account to show for
         // it — which would lock the rightful holder out of an instance they were invited
         // to, with no way to tell that from a stolen token.
-        let mut writes =
-            vec![Write::Device(device, device_record), Write::Account(user, account_record)];
-        if let Some((token, record)) = spent_invite {
-            writes.push(Write::Invite(token, record));
+        //
+        // Written before memory changes, with every lock still held. A registration that
+        // failed to persist used to stay in memory: the caller was told it failed, a retry
+        // was refused as `AccountAlreadyClaimed`, and the account then worked until the next
+        // restart quietly deleted it.
+        let mut writes = vec![
+            Write::Device(device, device_record.clone()),
+            Write::Account(user, account_record.clone()),
+        ];
+        if let Some((token, record)) = &spent_invite {
+            writes.push(Write::Invite(token.clone(), record.clone()));
         }
-        self.write(&writes)
+        self.write(&writes)?;
+        devices.insert(device, device_record);
+        accounts.insert(user, account_record);
+        if let Some((token, record)) = spent_invite {
+            invites.insert(token, record);
+        }
+        Ok(())
     }
 
     /// Add a device to an account that already exists.
@@ -1047,16 +1059,15 @@ impl Instance {
         }
 
         let device_record = DeviceRecord { user, public_key: hex::encode(new_public_key) };
-        devices.insert(new_device, device_record.clone());
-        account.devices.push(new_device);
-        let account_record = account.clone();
-
-        drop(devices);
-        drop(accounts);
+        let mut account_record = account.clone();
+        account_record.devices.push(new_device);
         self.write(&[
-            Write::Device(new_device, device_record),
-            Write::Account(user, account_record),
-        ])
+            Write::Device(new_device, device_record.clone()),
+            Write::Account(user, account_record.clone()),
+        ])?;
+        devices.insert(new_device, device_record);
+        *account = account_record;
+        Ok(())
     }
 
     /// Authenticate an envelope against its claimed sending device.
@@ -1102,9 +1113,8 @@ impl Instance {
             space: None,
         };
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        rooms.insert(id, room.clone());
-        drop(rooms);
-        self.write(&[Write::Room(id, room)])?;
+        self.write(&[Write::Room(id, room.clone())])?;
+        rooms.insert(id, room);
         Ok((id, seal))
     }
 
@@ -1121,7 +1131,8 @@ impl Instance {
         new_member: UserId,
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let current = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let mut r = current.clone();
         if r.space.is_some() {
             return Err(ServerError::ManagedBySpace);
         }
@@ -1142,9 +1153,9 @@ impl Instance {
             return Err(ServerError::RoomFull);
         }
         r.members.push(RoomMember { user: new_member, role: RoomRole::Member });
-        let updated = r.clone();
-        drop(rooms);
-        self.write(&[Write::Room(room, updated)])
+        self.write(&[Write::Room(room, r.clone())])?;
+        *current = r;
+        Ok(())
     }
 
     /// Remove an account from a room.
@@ -1162,7 +1173,8 @@ impl Instance {
         target: UserId,
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let current = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let mut r = current.clone();
         if r.space.is_some() {
             return Err(ServerError::ManagedBySpace);
         }
@@ -1186,7 +1198,8 @@ impl Instance {
         }
 
         r.members.retain(|m| m.user != target);
-        let updated = r.clone();
+        self.write(&[Write::Room(room, r.clone())])?;
+        *current = r;
         // Out of the voice channel in the same breath, under the rooms lock, so there is no
         // moment at which the account is not a member and still holds a seat. The SFU asks
         // the registry before every forward, so the media stops with the seat.
@@ -1196,8 +1209,7 @@ impl Instance {
         // seated and still listed — the SFU would have gone on carrying a private room's
         // audio to someone the room had ejected.
         self.voice.lock().expect("voice mutex poisoned").evict(room, target);
-        drop(rooms);
-        self.write(&[Write::Room(room, updated)])
+        Ok(())
     }
 
     /// Change an account's role. Owners only.
@@ -1209,7 +1221,8 @@ impl Instance {
         role: RoomRole,
     ) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let current = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let mut r = current.clone();
         if r.space.is_some() {
             return Err(ServerError::ManagedBySpace);
         }
@@ -1223,9 +1236,9 @@ impl Instance {
         if let Some(m) = r.members.iter_mut().find(|m| m.user == target) {
             m.role = role;
         }
-        let updated = r.clone();
-        drop(rooms);
-        self.write(&[Write::Room(room, updated)])
+        self.write(&[Write::Room(room, r.clone())])?;
+        *current = r;
+        Ok(())
     }
 
     /// Set or clear the room's disappearing-message timer. Any member may.
@@ -1245,17 +1258,18 @@ impl Instance {
             return Err(ServerError::BadTtl);
         }
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
-        let access = self.room_access(r, room, actor).ok_or(ServerError::NotAMember)?;
+        let current = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let mut r = current.clone();
+        let access = self.room_access(&r, room, actor).ok_or(ServerError::NotAMember)?;
         // In a space the timer is the channel's, set by whoever manages channels — otherwise
         // any member could make a moderator's announcements disappear.
         if r.space.is_some() && !access.contains(Permissions::MANAGE_CHANNELS) {
             return Err(ServerError::MissingPermission("manage_channels"));
         }
         r.disappear_after_ms = ttl_ms;
-        let updated = r.clone();
-        drop(rooms);
-        self.write(&[Write::Room(room, updated)])
+        self.write(&[Write::Room(room, r.clone())])?;
+        *current = r;
+        Ok(())
     }
 
     /// The room's disappearing-message timer, if set.
@@ -1345,7 +1359,8 @@ impl Instance {
     /// badge would be claiming a confidentiality the membership rules do not enforce.
     pub fn join_room(&self, room: RoomId, user: UserId) -> Result<(), ServerError> {
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let r = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let current = rooms.get_mut(&room).ok_or(ServerError::NoSuchRoom)?;
+        let mut r = current.clone();
         // Before the public-room check: a public *channel* passes that one, and joining it
         // here would put an account on the room without putting it in the space.
         if r.space.is_some() {
@@ -1360,9 +1375,9 @@ impl Instance {
         if !r.has_member(user) {
             r.members.push(RoomMember { user, role: RoomRole::Member });
         }
-        let updated = r.clone();
-        drop(rooms);
-        self.write(&[Write::Room(room, updated)])
+        self.write(&[Write::Room(room, r.clone())])?;
+        *current = r;
+        Ok(())
     }
 
     /// Verify a signed non-message request and return the acting account.
@@ -1442,16 +1457,16 @@ impl Instance {
         }
 
         let mut store = self.key_packages.lock().expect("key packages mutex poisoned");
-        let queue = store.entry(device).or_default();
-        if queue.len() + packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
+        let mut updated = store.get(&device).cloned().unwrap_or_default();
+        if updated.len() + packages.len() > MAX_KEY_PACKAGES_PER_DEVICE {
             return Err(ServerError::TooManyKeyPackages);
         }
-        queue.extend(packages);
-        let remaining = queue.len();
-        let updated = queue.clone();
-        drop(store);
-
-        self.write(&[Write::KeyPackages(device, updated)])?;
+        updated.extend(packages);
+        let remaining = updated.len();
+        // Under the lock: two publishes for one device would otherwise each write their own
+        // view of the queue, and whichever committed second would erase the other's.
+        self.write(&[Write::KeyPackages(device, updated.clone())])?;
+        store.insert(device, updated);
         Ok(remaining)
     }
 
@@ -1506,27 +1521,26 @@ impl Instance {
             return Err(ServerError::NoKeyPackages);
         }
 
-        let claimed: Vec<(DeviceId, String)> = devices
-            .iter()
-            .map(|device| {
-                let package = store
-                    .get_mut(device)
-                    .and_then(|q| q.pop_front())
-                    .expect("checked non-empty above");
-                (*device, package)
-            })
-            .collect();
+        let mut drained = Vec::with_capacity(devices.len());
+        let mut claimed = Vec::with_capacity(devices.len());
+        for device in &devices {
+            let mut queue = store.get(device).cloned().unwrap_or_default();
+            let package = queue.pop_front().expect("checked non-empty above");
+            claimed.push((*device, package));
+            drained.push((*device, queue));
+        }
 
         // Every drained queue in one batch. A partial write would hand out packages the
         // instance still believes it holds, and `mls-rs` destroys a package's secrets on
         // use — the second welcome built from a reissued package is permanently unopenable.
-        let writes: Vec<Write> = devices
-            .iter()
-            .map(|d| Write::KeyPackages(*d, store.get(d).cloned().unwrap_or_default()))
-            .collect();
-        drop(store);
-
+        //
+        // Committed under the lock and before memory changes, for the same reason: two
+        // claims racing to disk out of order would leave the store holding a package one of
+        // them had already handed out.
+        let writes: Vec<Write> =
+            drained.iter().map(|(d, q)| Write::KeyPackages(*d, q.clone())).collect();
         self.write(&writes)?;
+        store.extend(drained);
         Ok(claimed)
     }
 
@@ -1637,11 +1651,9 @@ impl Instance {
             revoked: false,
         };
         let hash = hash_token(&token);
-        self.room_invites
-            .lock()
-            .expect("room invites mutex poisoned")
-            .insert(hash.clone(), record.clone());
-        self.write(&[Write::RoomInvite(hash, record)])?;
+        let mut invites = self.room_invites.lock().expect("room invites mutex poisoned");
+        self.write(&[Write::RoomInvite(hash.clone(), record.clone())])?;
+        invites.insert(hash, record);
         Ok(token)
     }
 
@@ -1669,7 +1681,8 @@ impl Instance {
 
         let room_id = record.room;
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let room = rooms.get_mut(&room_id).ok_or(ServerError::RoomInviteInvalid)?;
+        let current = rooms.get_mut(&room_id).ok_or(ServerError::RoomInviteInvalid)?;
+        let mut room = current.clone();
         // Unreachable while minting refuses channels; kept so a record restored from an
         // older build cannot put someone on a channel's empty member list.
         if room.space.is_some() {
@@ -1688,17 +1701,15 @@ impl Instance {
         }
 
         room.members.push(RoomMember { user: actor, role: RoomRole::Member });
-        record.uses_remaining -= 1;
-
-        let updated_room = room.clone();
-        let updated_invite = record.clone();
-        drop(rooms);
-        drop(invites);
+        let mut spent = record.clone();
+        spent.uses_remaining -= 1;
 
         // One batch: a crash between them either admits someone without spending the use, or
         // spends it without admitting them. Both are wrong, and the second locks out a
         // person holding a legitimate invite.
-        self.write(&[Write::Room(room_id, updated_room), Write::RoomInvite(hash, updated_invite)])?;
+        self.write(&[Write::Room(room_id, room.clone()), Write::RoomInvite(hash, spent.clone())])?;
+        *current = room;
+        *record = spent;
         Ok(room_id)
     }
 
@@ -1717,10 +1728,10 @@ impl Instance {
             }
         }
 
-        record.revoked = true;
-        let updated = record.clone();
-        drop(invites);
-        self.write(&[Write::RoomInvite(hash, updated)])
+        let updated = RoomInviteRecord { revoked: true, ..record.clone() };
+        self.write(&[Write::RoomInvite(hash, updated.clone())])?;
+        *record = updated;
+        Ok(())
     }
 
     /// Claim a handle for the acting account.
@@ -1744,9 +1755,9 @@ impl Instance {
             return Err(ServerError::NoSuchAccount);
         }
 
-        usernames.insert(name.clone(), actor);
-        drop(usernames);
-        self.write(&[Write::Username(name, actor)])
+        self.write(&[Write::Username(name.clone(), actor)])?;
+        usernames.insert(name, actor);
+        Ok(())
     }
 
     /// Resolve a handle to an account. Exact match only — there is deliberately no search.
@@ -1809,19 +1820,37 @@ impl Instance {
         self.authenticate(&envelope)?;
 
         let mut rooms = self.rooms.lock().expect("rooms mutex poisoned");
-        let room = rooms.get_mut(&envelope.room).ok_or(ServerError::NoSuchRoom)?;
+        let current = rooms.get_mut(&envelope.room).ok_or(ServerError::NoSuchRoom)?;
+        let mut room = current.clone();
 
         // A non-member's message would advance next_seq and the franking chain of a room
         // they are not in, corrupting evidence for the members who are. In a channel,
         // "member" means whoever the space currently lets send there.
         let access = self
-            .room_access(room, envelope.room, envelope.sender)
+            .room_access(&room, envelope.room, envelope.sender)
             .ok_or(ServerError::NotAMember)?;
         if !access.contains(Permissions::SEND) {
             return Err(ServerError::MissingPermission("send"));
         }
 
         envelope.validate_for_tier(room.seal.tier())?;
+
+        // An envelope is accepted once. Its signature covers who, where and what, but not
+        // *when in the room*: that is the sequence number the instance assigns. Accepting a
+        // resubmission let any member who had read someone's message post it again under
+        // their name, at a point of the member's choosing, with a fresh franking tag that
+        // chains it after whatever the member had just said — a report built that way
+        // verifies. Under the rooms lock, so two copies racing each other cannot both pass.
+        //
+        // The sender's own retry of a send whose answer was lost is the honest case, and it
+        // gets the original receipt back rather than an error, so it is safe to retry.
+        // Before the budget, so a replay does not spend the victim's.
+        if let Some(seen) = self.storage.message_by_id(envelope.room, envelope.id)? {
+            return match seen.stored {
+                Some(original) if original.envelope == envelope => Ok(original),
+                _ => Err(ServerError::DuplicateMessage),
+            };
+        }
 
         // After authentication and membership, so neither an impostor nor an outsider can
         // spend a member's budget, and before the sequence number moves, so a refused
@@ -1856,14 +1885,22 @@ impl Instance {
 
         let stored = StoredMessage { envelope, server_seq, franking_tag };
         let room_id = stored.envelope.room;
-        let updated = room.clone();
-        drop(rooms);
 
         // The room and the message in one transaction. Split, a crash between them either
         // loses the message while keeping the sequence number it consumed, or — far worse
         // in the other order — replays that number onto a different message later and
         // rewrites franked history at a sequence a moderator has already been shown.
-        self.write(&[Write::Room(room_id, updated), Write::Message(room_id, stored.clone())])?;
+        //
+        // **Still under the rooms lock**, and memory moves only once it lands. Both found by
+        // probing. Released before the commit, two sends could reach the disk out of order:
+        // the room record from message N overwrote the one from N+1, a restart then handed
+        // N+1's sequence number to the next message, and that message *replaced* an
+        // acknowledged, franked one in the log. A poller could also see N+1 before N existed
+        // and step its cursor past N for good. And a send that failed to commit — a full
+        // disk — used to leave `next_seq` and the franking chain advanced in memory, so the
+        // next message was chained to a commitment that is in no stored message.
+        self.write(&[Write::Room(room_id, room.clone()), Write::Message(room_id, stored.clone())])?;
+        *current = room;
         Ok(stored)
     }
 
@@ -3374,7 +3411,7 @@ pub(crate) mod tests {
     use super::*;
     use cairn_proto::{DeviceId, EnvelopePayload, Tier, UserId};
 
-    fn dm_shape() -> RoomShape {
+    pub(crate) fn dm_shape() -> RoomShape {
         RoomShape { is_direct: true, is_publicly_discoverable: false, member_ceiling: 2 }
     }
 
@@ -3420,7 +3457,7 @@ pub(crate) mod tests {
             self.sign(self.unsigned(room, payload))
         }
 
-        fn unsigned(&self, room: RoomId, payload: EnvelopePayload) -> Envelope {
+        pub(crate) fn unsigned(&self, room: RoomId, payload: EnvelopePayload) -> Envelope {
             Envelope {
                 version: cairn_proto::PROTOCOL_VERSION,
                 id: cairn_proto::MessageId::new(),
@@ -3434,7 +3471,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn sign(&self, e: Envelope) -> Envelope {
+        pub(crate) fn sign(&self, e: Envelope) -> Envelope {
             let sig = self.session.sign(&e.signing_bytes()).unwrap();
             e.with_signature(hex::encode(sig))
         }
@@ -3571,6 +3608,13 @@ pub(crate) mod tests {
             after: u64,
         ) -> Result<Vec<StoredMessage>, StorageError> {
             self.inner.messages_since(room, after)
+        }
+        fn message_by_id(
+            &self,
+            room: RoomId,
+            id: cairn_proto::MessageId,
+        ) -> Result<Option<crate::storage::SeenMessage>, StorageError> {
+            self.inner.message_by_id(room, id)
         }
         fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
             self.inner.blob_meta(id)
@@ -6245,9 +6289,9 @@ mod spaces {
 
     /// A store whose commits can be made to fail.
     #[derive(Debug, Default)]
-    struct FailingStorage {
-        inner: crate::storage::MemoryStorage,
-        fail: std::sync::atomic::AtomicBool,
+    pub(super) struct FailingStorage {
+        pub(super) inner: crate::storage::MemoryStorage,
+        pub(super) fail: std::sync::atomic::AtomicBool,
     }
 
     impl crate::storage::Storage for FailingStorage {
@@ -6271,6 +6315,13 @@ mod spaces {
             after: u64,
         ) -> Result<Vec<StoredMessage>, StorageError> {
             self.inner.messages_since(room, after)
+        }
+        fn message_by_id(
+            &self,
+            room: RoomId,
+            id: cairn_proto::MessageId,
+        ) -> Result<Option<crate::storage::SeenMessage>, StorageError> {
+            self.inner.message_by_id(room, id)
         }
         fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
             self.inner.blob_meta(id)
@@ -6309,5 +6360,201 @@ mod spaces {
         let held = inst.spaces.lock().unwrap()[&space].base_permissions(m.user).unwrap();
         assert!(!held.contains(Permissions::KICK), "the failed grant is not in memory");
         inst.messages_since(channel, m.user, 0, 0).expect("nor is the failed kick");
+    }
+}
+
+/// Crash and restart resilience: what reaches the disk, in what order, and what memory does
+/// when it does not.
+///
+/// Every test here began as a probe that printed the wrong answer. Spaces already committed
+/// under their lock and changed memory only afterwards (`with_space`); rooms, accounts,
+/// devices, invites, key packages and handles did neither, and nothing had tried them.
+#[cfg(test)]
+mod resilience {
+    use super::spaces::FailingStorage;
+    use super::tests::*;
+    use super::*;
+    use crate::storage::DbStorage;
+    use cairn_proto::{DeviceId, EnvelopePayload, UserId, Username};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// A real store that holds the commit carrying message 1 until message 2 has committed,
+    /// or a short while has passed — standing in for a thread preempted between releasing
+    /// the rooms lock and opening its transaction.
+    #[derive(Debug)]
+    struct HoldFirstMessage {
+        inner: DbStorage,
+        second_landed: (Mutex<bool>, std::sync::Condvar),
+        /// Set if, after any commit, the log held a message without every one before it.
+        gap_seen: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::storage::Storage for HoldFirstMessage {
+        fn load_or_create_franking_key(
+            &self,
+        ) -> Result<cairn_crypto::franking::ServerFrankingKey, StorageError> {
+            self.inner.load_or_create_franking_key()
+        }
+        fn load_directory(&self) -> Result<crate::storage::Directory, StorageError> {
+            self.inner.load_directory()
+        }
+        fn commit(&self, writes: &[Write]) -> Result<(), StorageError> {
+            let seq = writes.iter().find_map(|w| match w {
+                Write::Message(_, m) => Some(m.server_seq),
+                _ => None,
+            });
+            if seq == Some(1) {
+                let (landed, cv) = &self.second_landed;
+                let guard = landed.lock().unwrap();
+                // Bounded: once the rule holds, message 2 cannot reach the disk until this
+                // one has, so waiting for it forever would be a deadlock of the test's own.
+                let _ = cv.wait_timeout_while(guard, Duration::from_millis(300), |l| !*l).unwrap();
+            }
+            let result = self.inner.commit(writes);
+            if let Some(Write::Message(room, _)) =
+                writes.iter().find(|w| matches!(w, Write::Message(..)))
+            {
+                let seqs: Vec<u64> =
+                    self.inner.messages_since(*room, 0)?.iter().map(|m| m.server_seq).collect();
+                if seqs.iter().enumerate().any(|(i, s)| *s != i as u64 + 1) {
+                    self.gap_seen.store(true, Ordering::SeqCst);
+                }
+            }
+            if seq == Some(2) {
+                *self.second_landed.0.lock().unwrap() = true;
+                self.second_landed.1.notify_all();
+            }
+            result
+        }
+        fn messages_since(
+            &self,
+            room: RoomId,
+            after: u64,
+        ) -> Result<Vec<StoredMessage>, StorageError> {
+            self.inner.messages_since(room, after)
+        }
+        fn message_by_id(
+            &self,
+            room: RoomId,
+            id: cairn_proto::MessageId,
+        ) -> Result<Option<crate::storage::SeenMessage>, StorageError> {
+            self.inner.message_by_id(room, id)
+        }
+        fn blob_meta(&self, id: BlobId) -> Result<Option<BlobRecord>, StorageError> {
+            self.inner.blob_meta(id)
+        }
+        fn blob_bytes(&self, id: BlobId) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.blob_bytes(id)
+        }
+    }
+
+    fn plain(body: &str) -> EnvelopePayload {
+        EnvelopePayload::Plaintext { body: body.into() }
+    }
+
+    #[test]
+    fn an_acknowledged_message_is_never_overwritten_after_a_restart() {
+        // The probe: message 1 held on its way to disk, message 2 sent meanwhile, restart,
+        // send a third. Before the fix the disk's room record was message 1's (next_seq 1),
+        // so the third message was given seq 2 and *replaced* the acknowledged, franked
+        // message 2 in the log.
+        //
+        // The same race was visible live: for as long as message 1 was still on its way, the
+        // log held message 2 alone, a poller following its cursor stepped to 2, and it never
+        // saw message 1 at all. A separate jittered probe lost up to 7 messages in 80 that way.
+        let dir = temp_dir("reorder");
+        let store = Arc::new(HoldFirstMessage {
+            inner: DbStorage::new(&dir).unwrap(),
+            second_landed: Default::default(),
+            gap_seen: Default::default(),
+        });
+        let inst = Arc::new(Instance::open(store.clone()).unwrap());
+        let a = TestSender::registered(&inst);
+        let b = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(public_shape(), a.user).unwrap();
+        inst.join_room(room, b.user).unwrap();
+        std::thread::scope(|sc| {
+            let first = a.envelope(room, plain("first"));
+            let i = inst.clone();
+            sc.spawn(move || i.accept(first, 0).unwrap());
+            std::thread::sleep(Duration::from_millis(50));
+            let second = b.envelope(room, plain("second"));
+            let i = inst.clone();
+            sc.spawn(move || i.accept(second, 0).unwrap());
+        });
+        drop(inst);
+        assert!(
+            !store.gap_seen.load(Ordering::SeqCst),
+            "the log showed a message before the one ahead of it, so a poller could skip it"
+        );
+        drop(store);
+
+        let inst = Instance::open(Arc::new(DbStorage::new(&dir).unwrap())).unwrap();
+        let third = inst.accept(a.envelope(room, plain("third")), 0).unwrap();
+        let log: Vec<(u64, String)> = inst
+            .storage
+            .messages_since(room, 0)
+            .unwrap()
+            .into_iter()
+            .map(|m| match m.envelope.payload {
+                EnvelopePayload::Plaintext { body } => (m.server_seq, body),
+                other => panic!("unexpected payload {other:?}"),
+            })
+            .collect();
+        assert_eq!(third.server_seq, 3);
+        assert_eq!(log.len(), 3, "every acknowledged message is still in the log: {log:?}");
+        assert!(log.iter().any(|(_, b)| b == "first") && log.iter().any(|(_, b)| b == "second"));
+    }
+
+    #[test]
+    fn a_write_that_fails_to_persist_leaves_memory_as_it_was() {
+        // A full disk, or any failed commit. The probe found every one of these applied in
+        // memory regardless: the caller was told the request failed while the change worked
+        // until the next restart silently undid it.
+        let storage = Arc::new(FailingStorage::default());
+        let inst = Instance::open(storage.clone()).unwrap();
+        let fail = |on: bool| storage.fail.store(on, Ordering::SeqCst);
+        let o = TestSender::registered(&inst);
+        let (room, _) = inst.create_room(dm_shape(), o.user).unwrap();
+        let (open, _) = inst.create_room(public_shape(), o.user).unwrap();
+
+        // A send: no sequence number consumed, no link in the franking chain to a commitment
+        // that is in no stored message.
+        let (lost, _) = cairn_crypto::commit(b"lost");
+        let e = o
+            .unsigned(room, EnvelopePayload::MlsApplication { ciphertext: vec![1] })
+            .with_franking_commitment(lost.to_hex());
+        fail(true);
+        assert!(matches!(inst.accept(o.sign(e), 0), Err(ServerError::Storage(_))));
+        fail(false);
+        let r = inst.rooms.lock().unwrap()[&room].clone();
+        assert_eq!((r.next_seq, r.last_franked), (0, None));
+
+        // Registration: a retry must succeed, not be refused as already claimed.
+        let (user, device) = (UserId::new(), DeviceId::new());
+        let id = cairn_proto::DeviceIdentity::new(user, device).to_credential();
+        let session = cairn_crypto::mls::Session::new(&id).unwrap();
+        fail(true);
+        assert!(inst.claim_account(user, device, session.public_key(), None, 0).is_err());
+        fail(false);
+        inst.claim_account(user, device, session.public_key(), None, 0)
+            .expect("a registration that failed to persist can be retried");
+
+        fail(true);
+        assert!(inst.create_invite("an-invite-token-long-enough", None).is_err());
+        assert!(inst.set_registration_policy(RegistrationPolicy::InviteOnly).is_err());
+        let rooms_before = inst.rooms.lock().unwrap().len();
+        assert!(inst.create_room(dm_shape(), o.user).is_err());
+        assert!(inst.publish_key_packages(o.user, o.device, o.key_packages(2)).is_err());
+        assert!(inst.add_room_member(open, o.user, user).is_err());
+        assert!(inst.claim_username(o.user, Username::parse("probe").unwrap()).is_err());
+        fail(false);
+        assert!(!inst.invites.lock().unwrap().contains_key("an-invite-token-long-enough"));
+        assert_eq!(inst.registration_policy(), RegistrationPolicy::Open);
+        assert_eq!(inst.rooms.lock().unwrap().len(), rooms_before);
+        assert_eq!(inst.key_packages_remaining(o.device), 0);
+        assert!(!inst.rooms.lock().unwrap()[&open].has_member(user));
+        assert_eq!(inst.username_of(o.user), None);
     }
 }

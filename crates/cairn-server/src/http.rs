@@ -155,7 +155,7 @@ impl IntoResponse for ServerError {
             | ServerError::InsufficientRole
             | ServerError::LastOwner => StatusCode::FORBIDDEN,
             ServerError::TargetNotAMember => StatusCode::NOT_FOUND,
-            ServerError::RoomFull => StatusCode::CONFLICT,
+            ServerError::RoomFull | ServerError::DuplicateMessage => StatusCode::CONFLICT,
             // Publishing for a device you do not own is an authorization failure, not a
             // bad request: the caller is authenticated, just not entitled.
             ServerError::NotYourDevice => StatusCode::FORBIDDEN,

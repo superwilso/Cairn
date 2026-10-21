@@ -453,7 +453,63 @@ Four calls made by the owner, so a session does not re-litigate them:
       **Not done:** the per-call MLS group (so the channel's roster is the instance's word),
       SFrame proper, video and screen share through the SFU, TURN in front of it, staying in a
       voice channel while viewing another room, boosting a voice past 100% in voice channels.
-- [ ] Crash/restart resilience under real use
+- [x] **Replies, edits and delete-for-everyone**, inside the encrypted stream and below the
+      FFI line: a reply carries a reference and each recipient resolves the quote from its own
+      transcript; an edit is a franked message whose commitment binds the message it replaces,
+      shown with "(edited)" and its history; a delete is a request every honest client honours
+      by rewriting its transcript. The desktop client draws what `Session` decides
+      (`can_edit`, `can_delete`, the resolved quote) and decides nothing.
+
+      **Probed:** editing or deleting someone else's message, an edit backdating itself, a
+      reply stuffing its own quote into the body, an edit franked over the bare text or over a
+      different target, a delete sent before its message, and an edit outliving a disappearing
+      original. All refused in-process; the ones that need a dishonest member (someone else's
+      message, a stuffed quote, a delete sent first) also against one over HTTP
+      (`crates/cairn-server/tests/edits_session.rs`), checked to fail with the
+      sender rule removed. Nothing was found open: replies were already reference-only, and the
+      edit and delete rules were written with their probes.
+
+      **Stated rather than hidden** (`01-threat-model.md` §3b): a modified client keeps
+      deleted text; a deleted message cannot be reported afterwards from an honest client
+      (owner question, `04-safety-architecture.md` §6); the instance keeps the ciphertext and
+      any blob; the CLI prints edits and deletes but does not apply them. **Not done:** edits
+      and deletes in T3 rooms, editing an attachment's caption, a report button in the client.
+- [x] **Crash/restart resilience under real use.**
+
+      **Probed** by `kill -9` on the real server and client binaries mid-traffic, by failing
+      or delaying the store's commits, by a proxy that loses one upload or its answer, and
+      by restarting an instance under a seated voice client. Survived from the start:
+      acknowledged messages, uploads and space roles across a server kill, and a client
+      killed mid-send resumes and stays readable both ways.
+
+      **Fixed, server:** every room, account, device, invite, key-package and handle change
+      now commits *before* memory moves, under the lock that guards it — as spaces already
+      did. Two sends released their lock before committing, could reach the disk out of
+      order, and after a restart the next message was given a sequence number already in
+      the log and **replaced an acknowledged, franked message**; a poller could also step
+      past one for good. A failed commit (a full disk) left the change live in memory until
+      the next restart undid it, and refused the retry of a registration as already claimed.
+
+      **Fixed, client:** an MLS commit whose upload was lost left its sender alone in the
+      next epoch — nobody could read them again, and the person being admitted was never
+      welcomed nor listed as waiting. A commit is now held pending until the instance
+      accepts it, and an upload that fails is settled by the next poll: kept and followed
+      if it is in the log (its welcome goes then), forgotten if it is not. Sending waits
+      while one is unsettled. The held welcome is kept on disk beside the pending commit
+      (`cairn_client_core::welcomes`) — in memory, a restart in that window found the
+      commit in the log, followed it, and had nothing to send the newcomer. `cairn-cli`
+      had the same apply-first fault and now takes the same path; its test drives the real
+      binary through the lossy proxy. A voice client whose instance restarted went on
+      reporting itself seated in a channel that no longer held it; a seat the instance
+      does not list is now a seat this device does not hold, so the app offers to rejoin.
+
+      **Residual, stated rather than hidden:** "not in the log, so it never landed" assumes
+      the instance is not still working on a request whose connection already died. The
+      window is one synchronous `accept` on the instance, its wait for the room's lock
+      included, and if it is hit the sender is
+      forked out of the group until re-added — detected by nothing yet. Closing it needs
+      the instance to answer "did this envelope land?" for an id, which is a protocol
+      change, not a client fix.
 
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
 
@@ -465,7 +521,15 @@ Four calls made by the owner, so a session does not re-litigate them:
       from their publishers at the owner's request; map in `README.md`. The trademark
       policy and the AGPL boundary note in ADR-004 are still open.
 - [ ] **Name clearance** — USPTO/EUIPO, domains *(owner; may rename, see `NAMING.md`)*
-- [ ] Protocol specification good enough for an outsider to implement against
+- [ ] Protocol specification good enough for an outsider to implement against.
+      **Drafted:** [`15-protocol.md`](15-protocol.md) covers identity, request and envelope
+      signing, rooms and membership, MLS usage, the encrypted body, franking, attachments
+      and the HTTP surface, each from the code. Writing it found a live hole: a member could
+      replay someone else's signed envelope, and get it franked again at a new position —
+      now refused (§5.3). The MLS wire choices it depends on (§7.1) are `mls-rs` defaults,
+      now written down and pinned by a test that fails if a dependency bump changes one.
+      **Not ticked** until someone who has not read the source tries to implement against
+      it — the item's own test, and the only one that can say the draft is good enough.
 - [ ] Public threat model review invited
 - [ ] Build and contribution instructions that work on a clean machine
 - [ ] Reproducible builds investigated

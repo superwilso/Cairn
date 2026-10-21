@@ -82,6 +82,12 @@ pub enum MlsError {
     NoWelcome,
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A membership change this client sent has not been confirmed yet. It settles on the
+    /// next poll of the room.
+    #[error(
+        "a membership change from this device is not confirmed yet; try again after the next poll"
+    )]
+    CommitUnsettled,
 }
 
 /// Verify a signature made by [`Session::sign`].
@@ -423,9 +429,25 @@ impl GroupHandle {
     /// to the newcomer. A member added without existing members seeing the commit is a
     /// wiretap, which is why clients must surface membership changes
     /// (`docs/02-encryption-tiers.md` §4.6).
+    ///
+    /// Applies the commit at once, before anyone has it. Fine where the commit cannot be
+    /// lost on its way; a client relaying through an instance wants [`Self::stage_add`].
     pub fn add_member(&mut self, key_package: MlsMessage) -> Result<CommitOutput, MlsError> {
+        let output = self.stage_add(key_package)?;
+        self.confirm_commit()?;
+        Ok(output)
+    }
+
+    /// Build the commit that adds a member, without moving to the epoch it creates.
+    ///
+    /// The commit is held as pending — and saved, so a restart keeps it — until
+    /// [`Self::confirm_commit`] or [`Self::discard_commit`] settles it, or until it comes
+    /// back through the room and [`Self::process`] applies it. Applying first was a fork
+    /// waiting for a dropped connection: the committer moved to an epoch nobody else
+    /// reached, and from then on nobody could read them and they could read nobody.
+    pub fn stage_add(&mut self, key_package: MlsMessage) -> Result<CommitOutput, MlsError> {
+        self.refuse_while_unsettled()?;
         let output = self.group.commit_builder().add_member(key_package)?.build()?;
-        self.group.apply_pending_commit()?;
         self.persist()?;
         let welcome = output.welcome_messages.into_iter().next();
         Ok(CommitOutput { commit: output.commit_message, welcome })
@@ -436,10 +458,44 @@ impl GroupHandle {
     /// After the removal commit, MLS's post-compromise security means the removed member
     /// cannot read subsequent messages even if they kept old key material.
     pub fn remove_member(&mut self, index: u32) -> Result<CommitOutput, MlsError> {
+        let output = self.stage_remove(index)?;
+        self.confirm_commit()?;
+        Ok(output)
+    }
+
+    /// Build the commit that removes a member, held as pending. See [`Self::stage_add`].
+    pub fn stage_remove(&mut self, index: u32) -> Result<CommitOutput, MlsError> {
+        self.refuse_while_unsettled()?;
         let output = self.group.commit_builder().remove_member(index)?.build()?;
-        self.group.apply_pending_commit()?;
         self.persist()?;
         Ok(CommitOutput { commit: output.commit_message, welcome: None })
+    }
+
+    /// Move to the epoch the pending commit creates: the instance has accepted it.
+    pub fn confirm_commit(&mut self) -> Result<(), MlsError> {
+        self.group.apply_pending_commit()?;
+        self.persist()
+    }
+
+    /// Forget the pending commit: it never reached the instance, so nobody else will move
+    /// to its epoch either.
+    pub fn discard_commit(&mut self) -> Result<(), MlsError> {
+        self.group.clear_pending_commit();
+        self.persist()
+    }
+
+    /// Whether a commit this client built is still waiting to be settled.
+    pub fn has_pending_commit(&self) -> bool {
+        self.group.has_pending_commit()
+    }
+
+    /// A second commit would silently replace the first in `mls-rs`, and if the first had in
+    /// fact landed, this client would have dropped the only state that can follow it.
+    fn refuse_while_unsettled(&self) -> Result<(), MlsError> {
+        if self.group.has_pending_commit() {
+            return Err(MlsError::CommitUnsettled);
+        }
+        Ok(())
     }
 
     /// Encrypt an application message for the group.
@@ -449,7 +505,12 @@ impl GroupHandle {
     /// *before* the encrypt would send its next message at a generation the receiver has
     /// already consumed — the receiver rejects it and the sender never learns. See
     /// [`crate::store`] for what that does and does not amount to.
+    ///
+    /// Refused while a commit of this client's is unsettled. If the commit did land, the
+    /// instance sequenced it first and every recipient has moved on to its epoch; a message
+    /// encrypted in the old one would reach them under keys they no longer hold.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<MlsMessage, MlsError> {
+        self.refuse_while_unsettled()?;
         let message = self.group.encrypt_application_message(plaintext, Vec::new())?;
         self.persist()?;
         Ok(message)
@@ -603,6 +664,41 @@ mod tests {
             .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The wire choices `docs/15-protocol.md` §7.1 writes down, which `mls-rs` makes by
+    /// default rather than because Cairn asked. A dependency bump that changed a default
+    /// would change the protocol silently; this is what notices.
+    #[test]
+    fn the_mls_wire_choices_the_protocol_spec_names_still_hold() {
+        let alice = Session::new(b"alice").unwrap();
+        let bob = Session::new(b"bob").unwrap();
+        let carol = Session::new(b"carol").unwrap();
+
+        // Key packages live for 365 days.
+        let kp = bob.key_package().unwrap();
+        let package = kp.clone().into_key_package().unwrap();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let days = (package.expiration().unwrap().seconds_since_epoch() - now) / 86_400;
+        assert!((364..=366).contains(&days), "key package lifetime is {days} days");
+
+        // Commits go out as PublicMessage, and one welcome covers the commit.
+        let mut group = alice.create_group().unwrap();
+        let out = group.add_member(kp).unwrap();
+        assert_eq!(out.commit.wire_format(), mls_rs::WireFormat::PublicMessage);
+        let welcome = out.welcome.expect("an add produces a welcome");
+
+        // The welcome carries the ratchet tree: joining supplies none from elsewhere.
+        bob.join(&welcome).unwrap();
+
+        // A second add, so the commit has a path and the group a second epoch: still public.
+        let out = group.add_member(carol.key_package().unwrap()).unwrap();
+        assert_eq!(out.commit.wire_format(), mls_rs::WireFormat::PublicMessage);
+
+        // Application messages are PrivateMessage, as RFC 9420 requires.
+        let message = group.encrypt(b"hi").unwrap();
+        assert_eq!(message.wire_format(), mls_rs::WireFormat::PrivateMessage);
     }
 
     /// M1's exit condition, minus the network: both ends close and both resume.

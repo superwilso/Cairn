@@ -35,11 +35,12 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cairn_client_core::client::{Client, CreatedRoom};
+use cairn_client_core::client::{ClaimedKeyPackage, Client, CreatedRoom};
 use cairn_client_core::embed::{self, Card};
 use cairn_client_core::history::{Entry as HistoryEntry, History};
 use cairn_client_core::transport::HttpTransport;
 use cairn_client_core::verify;
+use cairn_client_core::welcomes::Welcomes;
 use cairn_client_core::{
     accept_welcome, ContactStore, Conversation, ConversationIndex, TimelineEvent,
 };
@@ -135,6 +136,10 @@ struct Open {
     /// *these* — never whatever the leaf holds at the moment the command is typed, which a
     /// commit arriving in between could have changed.
     shown: Vec<(Vec<u8>, String)>,
+    /// Welcomes for people this device is adding, held until their commits are known to
+    /// have landed. Sent early, a welcome invites someone into an epoch nobody else may
+    /// ever reach. On disk, because the pending commit is too.
+    welcomes: Welcomes,
 }
 
 /// Run the client until the user quits.
@@ -416,6 +421,8 @@ impl App {
                 reaction: None,
                 card: None,
                 sticker: None,
+                edit: None,
+                deleted: false,
             },
         );
     }
@@ -609,7 +616,13 @@ impl App {
 
         self.index.record(created.room, &created.seal, convo.group_id())?;
         println!("  room {} created, tier {}", created.room, created.tier_label());
-        self.open = Some(Open { convo, seal: created.seal, cursor: 0, shown: Vec::new() });
+        self.open = Some(Open {
+            convo,
+            seal: created.seal,
+            cursor: 0,
+            shown: Vec::new(),
+            welcomes: Welcomes::open(&self.dir, created.room),
+        });
         Ok(())
     }
 
@@ -672,6 +685,7 @@ impl App {
                     seal,
                     cursor,
                     shown: Vec::new(),
+                    welcomes: Welcomes::open(&self.dir, room),
                 });
                 return Ok(());
             }
@@ -680,7 +694,13 @@ impl App {
         println!("  opened {room} at tier {}", seal.tier().label());
         self.replay_history(room);
         let cursor = self.index.cursor(&room);
-        self.open = Some(Open { convo, seal, cursor, shown: Vec::new() });
+        self.open = Some(Open {
+            convo,
+            seal,
+            cursor,
+            shown: Vec::new(),
+            welcomes: Welcomes::open(&self.dir, room),
+        });
         // Said on open rather than left to be discovered: someone who redeemed an invite is
         // sitting in a room they cannot read, and the only person who can fix that is
         // whoever opens it next.
@@ -702,24 +722,11 @@ impl App {
         let claimed = self.client.claim_key_packages(user)?;
         println!("  claimed {} key package(s) for {user}", claimed.len());
 
-        for package in &claimed {
-            let key_package =
-                cairn_crypto::mls::parse_message(&hex::decode(&package.key_package)?)?;
-            let group = open.convo.group_mut().ok_or("this room has no MLS group")?;
-            let output = group.add_member(key_package)?;
-
-            // The commit goes to existing members, the welcome to the newcomer. Both are
-            // ordinary room traffic so the server sequences them with everything else.
-            let commit = output.commit.to_bytes()?;
-            self.client.send(open.convo.room(), &open.convo.wrap_handshake(&commit, now_ms())?)?;
-            if let Some(welcome) = output.welcome {
-                let bytes = welcome.to_bytes()?;
-                self.client
-                    .send(open.convo.room(), &open.convo.wrap_handshake(&bytes, now_ms())?)?;
-            }
-        }
-
+        // The commit goes to existing members, the welcome to the newcomer. Both are
+        // ordinary room traffic so the server sequences them with everything else.
+        let added = add_packages(&self.client, open, &claimed);
         self.index.record(open.convo.room(), &open.seal, open.convo.group_id())?;
+        added?;
         println!("  added; they should see the room after their next poll");
         Ok(())
     }
@@ -815,22 +822,9 @@ impl App {
         let open = self.open.as_mut().ok_or("open a room first")?;
         let claimed = self.client.claim_key_packages(user)?;
 
-        for package in &claimed {
-            let key_package =
-                cairn_crypto::mls::parse_message(&hex::decode(&package.key_package)?)?;
-            let group = open.convo.group_mut().ok_or("this room has no MLS group")?;
-            let output = group.add_member(key_package)?;
-
-            let commit = output.commit.to_bytes()?;
-            self.client.send(open.convo.room(), &open.convo.wrap_handshake(&commit, now_ms())?)?;
-            if let Some(welcome) = output.welcome {
-                let bytes = welcome.to_bytes()?;
-                self.client
-                    .send(open.convo.room(), &open.convo.wrap_handshake(&bytes, now_ms())?)?;
-            }
-        }
+        let added = add_packages(&self.client, open, &claimed);
         self.index.record(open.convo.room(), &open.seal, open.convo.group_id())?;
-        Ok(())
+        added
     }
 
     fn list_members(&mut self) {
@@ -1021,12 +1015,33 @@ impl App {
             }
 
             // A device does not receive its own messages back as readable traffic; MLS
-            // cannot decrypt what this leaf encrypted.
-            if message.envelope.sender_device == self.client.device() {
+            // cannot decrypt what this leaf encrypted. The exception is a commit of ours
+            // whose upload failed: finding it in the log is how it settles.
+            let own = message.envelope.sender_device == self.client.device();
+            let unsettled = open.convo.has_pending_commit();
+            if own && !unsettled {
+                continue;
+            }
+            let outcome = open.convo.receive(&message.envelope);
+            if unsettled && !open.convo.has_pending_commit() {
+                if own {
+                    // It landed even though the upload failed. Its welcome can go now.
+                    let _ = open.welcomes.landed();
+                } else {
+                    // Someone else's commit was sequenced first and replaced ours, so
+                    // whoever this device was adding was not added.
+                    let _ = open.welcomes.drop_held();
+                    println!("\n  ! another member's change came first; yours was not applied");
+                }
+            }
+            if own {
+                if let Ok(TimelineEvent::Membership { added, removed, committer }) = &outcome {
+                    announce(&mut self.contacts, added, removed, *committer);
+                }
                 continue;
             }
 
-            match open.convo.receive(&message.envelope) {
+            match outcome {
                 // A reaction has an empty body; printed as a message it would be a blank
                 // line from nobody in particular.
                 Ok(TimelineEvent::Message(received)) if received.reaction.is_some() => {
@@ -1050,6 +1065,24 @@ impl App {
                 Ok(TimelineEvent::Message(received)) if received.custom_set.is_some() => {
                     println!(
                         "\n  {} sent the room's custom emoji (not shown here)",
+                        short(&message.envelope.sender.as_uuid().to_string())
+                    );
+                }
+                // The CLI keeps no message ids, so it cannot apply an edit or a delete to its
+                // transcript. It says what arrived rather than pretending to honour either:
+                // a delete it cannot carry out is shown as a request, not as done.
+                Ok(TimelineEvent::Message(received)) if received.edit.is_some() => {
+                    println!(
+                        "\n  [{}] {} edited a message: {}",
+                        open.seal.tier().label(),
+                        short(&message.envelope.sender.as_uuid().to_string()),
+                        String::from_utf8_lossy(&received.body)
+                    );
+                }
+                Ok(TimelineEvent::Message(received)) if received.delete.is_some() => {
+                    println!(
+                        "\n  {} asked for one of their messages to be deleted (the CLI cannot \
+                         remove it from its transcript)",
                         short(&message.envelope.sender.as_uuid().to_string())
                     );
                 }
@@ -1078,6 +1111,8 @@ impl App {
                             reaction: None,
                             card: received.card.as_deref().cloned(),
                             sticker: received.sticker.clone(),
+                            edit: None,
+                            deleted: false,
                         },
                     );
                     if let Some(attachment) = &received.attachment {
@@ -1106,7 +1141,70 @@ impl App {
                 Err(e) => println!("\n  ! could not read a message: {e}"),
             }
         }
+
+        // A commit of ours still pending after the whole log has been read never reached
+        // the instance, which commits a message within the request that carries it.
+        // Dropped, so this device stays in the epoch everyone else is in.
+        if open.convo.has_pending_commit() {
+            let _ = open.convo.discard_commit();
+            let _ = open.welcomes.drop_held();
+            println!(
+                "\n  ! your last membership change never reached the instance; nothing changed"
+            );
+        }
+        if let Err(e) = flush_welcomes(&self.client, open) {
+            println!("\n  ! a welcome could not be sent yet, will retry: {e}");
+        }
     }
+}
+
+/// Add each claimed key package to the open room's group, one commit at a time.
+///
+/// Each commit is staged rather than applied, and applied only once the instance has
+/// accepted it. Applying first, as this used to, left this device alone in an epoch nobody
+/// else reached whenever the upload was lost: nobody could read it again, and the person
+/// being added was never welcomed. On a failed upload the commit stays pending, because a
+/// failed request does not say whether the instance stored it, and the next poll settles
+/// it from the log.
+fn add_packages(
+    client: &Client<HttpTransport>,
+    open: &mut Open,
+    claimed: &[ClaimedKeyPackage],
+) -> Fallible<()> {
+    for package in claimed {
+        let key_package = cairn_crypto::mls::parse_message(&hex::decode(&package.key_package)?)?;
+        let group = open.convo.group_mut().ok_or("this room has no MLS group")?;
+        let output = group.stage_add(key_package)?;
+        let commit = output.commit.to_bytes()?;
+        // Held before the commit goes, so a commit whose fate is unknown still has its
+        // welcome when a poll finds it in the log.
+        open.welcomes.hold(output.welcome.map(|w| w.to_bytes()).transpose()?)?;
+        let wrapped = open.convo.wrap_handshake(&commit, now_ms())?;
+        if let Err(e) = client.send(open.convo.room(), &wrapped) {
+            println!("  ! the change may not have reached the instance; the next poll settles it");
+            return Err(e.into());
+        }
+        open.convo.group_mut().ok_or("this room has no MLS group")?.confirm_commit()?;
+        open.welcomes.landed()?;
+        flush_welcomes(client, open)?;
+    }
+    Ok(())
+}
+
+/// Send the welcomes held for people this device added, once no commit is pending.
+///
+/// Retried on every poll until they go: a newcomer whose commit landed is in the group and
+/// no longer listed as waiting, so nothing else would ever send them one.
+fn flush_welcomes(client: &Client<HttpTransport>, open: &mut Open) -> Fallible<()> {
+    if open.convo.has_pending_commit() {
+        return Ok(());
+    }
+    while let Some(welcome) = open.welcomes.next_unsent() {
+        let wrapped = open.convo.wrap_handshake(&welcome, now_ms())?;
+        client.send(open.convo.room(), &wrapped)?;
+        open.welcomes.sent()?;
+    }
+    Ok(())
 }
 
 /// Print a roster change, loudly enough that it is not mistaken for chat.
