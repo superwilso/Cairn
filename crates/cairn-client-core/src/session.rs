@@ -119,6 +119,8 @@ pub enum SessionError {
     RoomChangedDuringUpload,
     #[error("could not save the attachment: {0}")]
     Save(std::io::Error),
+    #[error("could not record a welcome owed to someone being added: {0}")]
+    Welcomes(std::io::Error),
     #[error("a disappearing-message timer must be longer than zero")]
     BadTimer,
     #[error("that message is not on this device")]
@@ -350,12 +352,10 @@ struct OpenRoom {
     /// When `roles` was last read. On the timer's clock — never because a set arrived.
     roles_checked_ms: i64,
     /// The welcome that goes with this device's pending commit, held until the commit is
-    /// known to have landed. Sent early, it would invite someone into an epoch nobody else
-    /// may ever reach.
-    held_welcome: Option<Vec<u8>>,
-    /// Welcomes whose commits landed, not yet sent. In memory only, like `held_welcome`: a
-    /// restart before they go leaves the newcomer in the group but never welcomed.
-    unsent_welcomes: Vec<Vec<u8>>,
+    /// known to have landed, and welcomes whose commits landed but have not gone out. Sent
+    /// early, a welcome invites someone into an epoch nobody else may ever reach. On disk,
+    /// because the pending commit is too: see [`crate::welcomes`].
+    welcomes: crate::welcomes::Welcomes,
 }
 
 /// How often an open room re-reads its timer and sweeps its transcript.
@@ -586,8 +586,7 @@ impl Session {
             labels: HashMap::new(),
             roles: None,
             roles_checked_ms: now_ms(),
-            held_welcome: None,
-            unsent_welcomes: Vec::new(),
+            welcomes: crate::welcomes::Welcomes::open(&self.dir, room),
         };
         self.relabel(&mut open);
         self.refresh_roles(&mut open);
@@ -692,8 +691,7 @@ impl Session {
             labels,
             roles: None,
             roles_checked_ms: now_ms(),
-            held_welcome: None,
-            unsent_welcomes: Vec::new(),
+            welcomes: crate::welcomes::Welcomes::open(&self.dir, room),
         });
         // Who may change the room's custom set, read now rather than when a set arrives.
         if let Some(mut open) = self.open.take() {
@@ -962,11 +960,11 @@ impl Session {
             if unsettled && !open.convo.has_pending_commit() {
                 if message.envelope.sender_device == self.client.device() {
                     // Ours, back from the log: it landed even though the upload failed.
-                    open.unsent_welcomes.extend(open.held_welcome.take());
+                    let _ = open.welcomes.landed();
                 } else {
                     // Someone else's commit was sequenced first, and `mls-rs` dropped ours
                     // for it. Whoever this device was adding was not added: still waiting.
-                    open.held_welcome = None;
+                    let _ = open.welcomes.drop_held();
                 }
             }
             match outcome {
@@ -1143,7 +1141,7 @@ impl Session {
         // epoch everyone else is in.
         if open.convo.has_pending_commit() {
             let _ = open.convo.discard_commit();
-            open.held_welcome = None;
+            let _ = open.welcomes.drop_held();
         }
         let _ = self.flush_welcomes(&mut open);
 
@@ -1572,10 +1570,11 @@ impl Session {
             let commit = output.commit.to_bytes().map_err(|_| SessionError::NoGroupYet)?;
             // Held before the commit goes, so a commit whose fate is unknown still has its
             // welcome when a poll finds it in the log.
-            open.held_welcome = match output.welcome {
+            let welcome = match output.welcome {
                 Some(w) => Some(w.to_bytes().map_err(|_| SessionError::NoGroupYet)?),
                 None => None,
             };
+            open.welcomes.hold(welcome).map_err(SessionError::Welcomes)?;
             relay_commit(&self.client, open, &commit)?;
             self.flush_welcomes(open)?;
         }
@@ -1587,14 +1586,14 @@ impl Session {
     /// Retried on every poll until it goes: a newcomer whose commit landed is in the group
     /// and no longer listed as waiting, so nothing else would ever send it again.
     fn flush_welcomes(&mut self, open: &mut OpenRoom) -> Result<(), SessionError> {
-        if open.convo.has_pending_commit() || open.unsent_welcomes.is_empty() {
+        if open.convo.has_pending_commit() || open.welcomes.next_unsent().is_none() {
             return Ok(());
         }
         let room = open.convo.room();
-        while let Some(welcome) = open.unsent_welcomes.first() {
-            let wrapped = open.convo.wrap_handshake(welcome, now_ms())?;
+        while let Some(welcome) = open.welcomes.next_unsent() {
+            let wrapped = open.convo.wrap_handshake(&welcome, now_ms())?;
             self.client.send(room, &wrapped)?;
-            open.unsent_welcomes.remove(0);
+            open.welcomes.sent().map_err(SessionError::Welcomes)?;
         }
         // This device committed the add, so its own poll reports nothing to prompt these —
         // and the new member still needs this account's profile, sent after the welcome.
@@ -1640,7 +1639,7 @@ fn relay_commit(
     let wrapped = open.convo.wrap_handshake(commit, now_ms())?;
     client.send(open.convo.room(), &wrapped)?;
     open.convo.group_mut().ok_or(SessionError::NoGroupYet)?.confirm_commit()?;
-    open.unsent_welcomes.extend(open.held_welcome.take());
+    open.welcomes.landed().map_err(SessionError::Welcomes)?;
     Ok(())
 }
 

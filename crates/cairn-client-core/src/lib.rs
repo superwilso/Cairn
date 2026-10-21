@@ -34,6 +34,7 @@ pub mod store;
 pub mod thread;
 pub mod transport;
 pub mod verify;
+pub mod welcomes;
 
 pub use client::{Client, ClientError};
 pub use contacts::{ContactError, ContactRecord, ContactStore};

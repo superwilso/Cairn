@@ -109,9 +109,20 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn person(url: &str, name: &str) -> Session {
-    let s = Session::open(name, url, Some(&scratch(name))).unwrap();
+    person_in(url, name, &scratch(name))
+}
+
+fn person_in(url: &str, name: &str, dir: &std::path::Path) -> Session {
+    let s = Session::open(name, url, Some(dir)).unwrap();
     s.publish_key_packages(3).unwrap();
     s
+}
+
+/// Where Alice keeps her state, and the address she reaches the instance by, so a test can
+/// restart her.
+struct AliceHome {
+    dir: PathBuf,
+    url: String,
 }
 
 /// Whether `s` reads a message saying `text` within a few polls.
@@ -126,13 +137,14 @@ fn hears(s: &mut Session, text: &str) -> bool {
 
 /// Alice owns a group, through the proxy; Bob is in it; Carol has redeemed an invite and is
 /// waiting to be admitted.
-fn waiting_room(mode: &Arc<AtomicU8>) -> (Session, Session, Session, String) {
+fn waiting_room(mode: &Arc<AtomicU8>) -> (Session, Session, Session, String, AliceHome) {
     let server = start();
     let direct = format!("http://{}", server.addr);
     let proxied = format!("http://{}", proxy(server.addr, mode.clone()));
     // The runtime must outlive the sessions; the test process ends first.
     std::mem::forget(server);
-    let mut alice = person(&proxied, "alice");
+    let home = AliceHome { dir: scratch("alice"), url: proxied.clone() };
+    let mut alice = person_in(&proxied, "alice", &home.dir);
     let mut bob = person(&direct, "bob");
     let mut carol = person(&direct, "carol");
     let room = alice.create_group(10).unwrap();
@@ -143,13 +155,13 @@ fn waiting_room(mode: &Arc<AtomicU8>) -> (Session, Session, Session, String) {
     assert!(hears(&mut bob, "before"));
     carol.redeem_invite(&alice.create_invite(1, 24).unwrap()).unwrap();
     carol.open_room(&room).unwrap();
-    (alice, bob, carol, room)
+    (alice, bob, carol, room, home)
 }
 
 #[test]
 fn a_commit_that_never_reached_the_instance_does_not_cut_its_sender_off() {
     let mode = Arc::new(AtomicU8::new(PASS));
-    let (mut alice, mut bob, mut carol, _room) = waiting_room(&mode);
+    let (mut alice, mut bob, mut carol, _room, _home) = waiting_room(&mode);
 
     mode.store(LOSE_REQUEST, Ordering::SeqCst);
     assert!(alice.admit_waiting().unwrap().is_empty(), "the upload failed, so nobody was admitted");
@@ -173,7 +185,7 @@ fn a_commit_that_never_reached_the_instance_does_not_cut_its_sender_off() {
 #[test]
 fn a_commit_whose_answer_was_lost_still_admits_the_newcomer() {
     let mode = Arc::new(AtomicU8::new(PASS));
-    let (mut alice, mut bob, mut carol, _room) = waiting_room(&mode);
+    let (mut alice, mut bob, mut carol, _room, _home) = waiting_room(&mode);
 
     mode.store(LOSE_RESPONSE, Ordering::SeqCst);
     assert!(alice.admit_waiting().unwrap().is_empty(), "the answer was lost, so alice cannot know");
@@ -187,4 +199,30 @@ fn a_commit_whose_answer_was_lost_still_admits_the_newcomer() {
     assert!(hears(&mut carol, "after the lost answer"), "carol must get the held welcome");
     carol.send("hello both").unwrap();
     assert!(hears(&mut alice, "hello both"));
+}
+
+#[test]
+fn a_client_restarted_before_its_commit_settles_still_welcomes_the_newcomer() {
+    let mode = Arc::new(AtomicU8::new(PASS));
+    let (alice, mut bob, mut carol, room, home) = waiting_room(&mode);
+    let mut alice = alice;
+
+    mode.store(LOSE_RESPONSE, Ordering::SeqCst);
+    assert!(alice.admit_waiting().unwrap().is_empty(), "the answer was lost, so alice cannot know");
+
+    // Alice's process ends before any poll settles the commit, and comes back from disk.
+    // The commit is in the log, so the restarted client follows it into the new epoch, and
+    // Carol is no longer listed as waiting: the welcome is the only way in, and it must
+    // have survived the restart.
+    drop(alice);
+    let mut alice = person_in(&home.url, "alice", &home.dir);
+    alice.open_room(&room).unwrap();
+    alice.poll().unwrap();
+    assert!(alice.waiting().unwrap().is_empty(), "carol is in the group now");
+    alice.send("after a restart").unwrap();
+    assert!(hears(&mut bob, "after a restart"), "bob must follow the commit alice made");
+    assert!(
+        hears(&mut carol, "after a restart"),
+        "carol must get the welcome held across the restart"
+    );
 }
