@@ -177,7 +177,7 @@ Deliberate omissions, listed so nobody mistakes the scaffold for a product:
 | No sessions; rate limits bound one actor | Accounts are claimed, invite-gated, and device linking is authorized. Registration is limited per address, and sending, uploads, key package claims and lookups per account — all in memory, so a restart clears them, and many addresses or accounts still add up. There is no session concept and no account recovery. Concretely: several accounts together can still drain another account's key packages and make it unaddable until it republishes |
 | Franking unreviewed | Groups are handled, but no external cryptographic review yet |
 | JSON + hex wire format | A development convenience; a binary format replaces it |
-| Replay window, not nonces | Signed requests carry a timestamp checked against a 60s window; replay inside that window is possible |
+| Replay window, not nonces | Signed requests carry a timestamp checked against a 60s window; replay inside that window is possible. Message envelopes are not in this class: each room accepts an envelope id once, and an identical resend gets the original receipt |
 | No bans or instance-wide moderation | Rooms have owner/moderator/member roles and removal, but a removed account can be re-added, and there is no instance-level ban or the subscribable policy lists `04-safety-architecture.md` §2 calls the highest-leverage item |
 | No TLS termination | Must sit behind a reverse proxy. `HttpTransport` verifies certificates via rustls, but pointing it at a bare `http://` origin is a plaintext connection and defeats A1/A2 in `01-threat-model.md` §2 |
 | Vertical slice is one process | Two clients over a real socket, but not yet two machines — the last part of M1's exit condition |

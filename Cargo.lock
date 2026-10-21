@@ -335,11 +335,15 @@ dependencies = [
 name = "cairn-cli"
 version = "0.0.1"
 dependencies = [
+ "axum",
  "cairn-client-core",
  "cairn-crypto",
  "cairn-proto",
+ "cairn-server",
  "hex",
  "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

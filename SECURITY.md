@@ -30,6 +30,10 @@ Specifically, and non-exhaustively:
   signed and carry a timestamp; the server rejects anything outside a 60-second window. A
   captured request can still be replayed inside it. Acceptable for reads, and it should
   become a nonce before anything state-changing is exposed to a hostile network.
+  Messages are outside that window: a room accepts each envelope id once, so a member
+  cannot post someone else's signed message again at a later point in the room. Until
+  probing found it, they could — and the replay got a fresh franking tag, so a report
+  built around it verified.
 - **No transport security of its own.** Must sit behind a TLS-terminating proxy.
 
 A full list is in `docs/03-protocol-evaluation.md`.

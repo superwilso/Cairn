@@ -666,6 +666,41 @@ mod tests {
         dir
     }
 
+    /// The wire choices `docs/15-protocol.md` §7.1 writes down, which `mls-rs` makes by
+    /// default rather than because Cairn asked. A dependency bump that changed a default
+    /// would change the protocol silently; this is what notices.
+    #[test]
+    fn the_mls_wire_choices_the_protocol_spec_names_still_hold() {
+        let alice = Session::new(b"alice").unwrap();
+        let bob = Session::new(b"bob").unwrap();
+        let carol = Session::new(b"carol").unwrap();
+
+        // Key packages live for 365 days.
+        let kp = bob.key_package().unwrap();
+        let package = kp.clone().into_key_package().unwrap();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let days = (package.expiration().unwrap().seconds_since_epoch() - now) / 86_400;
+        assert!((364..=366).contains(&days), "key package lifetime is {days} days");
+
+        // Commits go out as PublicMessage, and one welcome covers the commit.
+        let mut group = alice.create_group().unwrap();
+        let out = group.add_member(kp).unwrap();
+        assert_eq!(out.commit.wire_format(), mls_rs::WireFormat::PublicMessage);
+        let welcome = out.welcome.expect("an add produces a welcome");
+
+        // The welcome carries the ratchet tree: joining supplies none from elsewhere.
+        bob.join(&welcome).unwrap();
+
+        // A second add, so the commit has a path and the group a second epoch: still public.
+        let out = group.add_member(carol.key_package().unwrap()).unwrap();
+        assert_eq!(out.commit.wire_format(), mls_rs::WireFormat::PublicMessage);
+
+        // Application messages are PrivateMessage, as RFC 9420 requires.
+        let message = group.encrypt(b"hi").unwrap();
+        assert_eq!(message.wire_format(), mls_rs::WireFormat::PrivateMessage);
+    }
+
     /// M1's exit condition, minus the network: both ends close and both resume.
     ///
     /// Every handle and session is dropped before the second half, so the only thing
