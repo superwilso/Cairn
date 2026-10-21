@@ -448,6 +448,24 @@ Four calls made by the owner, so a session does not re-litigate them:
       voice channel while viewing another room, boosting a voice past 100% in voice channels.
 - [ ] Crash/restart resilience under real use
 
+      **Probed so far** by `kill -9` on the real server and client binaries mid-traffic, and
+      by failing or delaying the store's commits. Survived: acknowledged messages,
+      uploads and space roles across a server kill, and a client killed mid-send resumes
+      and stays readable both ways.
+
+      **Fixed, server:** every room, account, device, invite, key-package and handle change
+      now commits *before* memory moves, under the lock that guards it — as spaces already
+      did. Two sends released their lock before committing, could reach the disk out of
+      order, and after a restart the next message was given a sequence number already in
+      the log and **replaced an acknowledged, franked message**; a poller could also step
+      past one for good. A failed commit (a full disk) left the change live in memory until
+      the next restart undid it, and refused the retry of a registration as already claimed.
+
+      **Found, not yet fixed:** an MLS commit whose upload is lost leaves its sender alone
+      in the next epoch — nobody can read them again and the newcomer is never welcomed.
+      After a server restart a voice client still believes it is seated while the instance
+      has no seats.
+
 **Exit:** five people use it for two weeks. Bugs come from use, not from tests.
 
 ## M4 — Open source launch
