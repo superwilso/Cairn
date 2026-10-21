@@ -43,7 +43,7 @@ use crate::history::{Entry as HistoryEntry, History, HistoryError};
 use crate::statedir::{self, StateDirError};
 use crate::store::{ConversationIndex, IndexError};
 use crate::thread::Thread;
-pub use crate::thread::{QuoteView, ReactionView};
+pub use crate::thread::{QuoteView, ReactionView, Revision};
 use crate::transport::HttpTransport;
 use crate::verify::{self, SafetyView, VerifyError};
 
@@ -125,6 +125,11 @@ pub enum SessionError {
     UnknownMessage,
     #[error("a reaction is a single emoji")]
     BadReaction,
+    /// Not this account's message, not on this device, already deleted, or not text.
+    #[error("only your own text messages can be edited")]
+    NotEditable,
+    #[error("an edit needs some text; to remove a message, delete it")]
+    EmptyEdit,
     #[error(transparent)]
     Profile(#[from] ProfileError),
     #[error(transparent)]
@@ -224,6 +229,33 @@ pub struct MessageView {
     /// this device ([`Session::custom_asset`]) and shows `body` (`:name:`) if it has none.
     #[serde(default)]
     pub sticker: Option<String>,
+    /// When the text shown was last edited, by the sender's clock. `None` if never. A
+    /// frontend must mark an edited message as edited: the words are not the ones first sent.
+    #[serde(default)]
+    pub edited_at_ms: Option<i64>,
+    /// Every earlier version, oldest first, starting with what was first sent — as this
+    /// device received them. Empty unless edited.
+    #[serde(default)]
+    pub revisions: Vec<Revision>,
+    /// Its sender asked for it to be deleted, and this device has removed its text. `body`
+    /// is empty; a frontend shows that a message was deleted.
+    #[serde(default)]
+    pub deleted: bool,
+    /// Whether this device's user may edit it: their own text message, not deleted. Decided
+    /// here so a frontend never offers an edit every recipient would drop.
+    #[serde(default)]
+    pub can_edit: bool,
+    /// Whether this device's user may ask for it to be deleted.
+    #[serde(default)]
+    pub can_delete: bool,
+}
+
+/// A message that changed after it was drawn — edited or deleted — and the quote to show
+/// wherever a reply names it. Both resolved here; a frontend redraws them and builds neither.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Revised {
+    pub message: MessageView,
+    pub quote: QuoteView,
 }
 
 /// Something that happened while polling, for a frontend to render in the timeline.
@@ -258,6 +290,9 @@ pub enum Event {
     Expired {
         before_ms: i64,
     },
+    /// A message already shown was edited or deleted by its sender. Replace it, and every
+    /// quote of it, with what this carries.
+    Updated(Revised),
     /// The reactions under one message changed. The whole set, not the change: a frontend
     /// redraws it rather than keeping its own tally, which is a second copy of a rule.
     Reactions {
@@ -631,10 +666,11 @@ impl Session {
         attachments::remember(&mut self.attachments, &entries);
         let thread = Thread::build(&entries);
         let labels = profiles::labels_for(&self.profiles, self.client.user(), &convo, &[]);
+        let me = self.client.user();
         let views = entries
             .iter()
-            .filter(|e| e.reaction.is_none())
-            .map(|e| view(e, &thread, &labels, true))
+            .filter(|e| e.is_original())
+            .map(|e| view(e, &thread, &labels, true, me))
             .collect();
         self.open = Some(OpenRoom {
             convo,
@@ -716,10 +752,92 @@ impl Session {
             reaction: None,
             card,
             sticker: None,
+            edit: None,
+            deleted: false,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
-        Ok(view(&entry, &open.thread, &open.labels, false))
+        Ok(view(&entry, &open.thread, &open.labels, false, self.client.user()))
+    }
+
+    /// Replace the text of one of this user's own messages in the open room.
+    ///
+    /// Refused unless every recipient would honour it — this account's, on this device, text,
+    /// not deleted — so the user is told now rather than seeing an edit nobody else applies.
+    /// The original stays in every honest transcript, as the edit history and as report
+    /// material; see [`Conversation::send_edit`].
+    pub fn edit(&mut self, id: &str, text: &str) -> Result<Revised, SessionError> {
+        let me = self.client.user();
+        let target = MessageRef { sender: me, id: id.to_owned() };
+        if text.is_empty() {
+            return Err(SessionError::EmptyEdit);
+        }
+        let open = self.open.as_mut().ok_or(SessionError::NoRoomOpen)?;
+        if open.convo.group_id().is_none() {
+            return Err(SessionError::NoGroupYet);
+        }
+        if !open.thread.editable_by(me, &target) {
+            return Err(SessionError::NotEditable);
+        }
+        let at = now_ms();
+        let outbound = open.convo.send_edit(target.clone(), text.as_bytes(), at)?;
+        let room = open.convo.room();
+        self.client.send(room, &outbound.envelope)?;
+        let entry = HistoryEntry {
+            sender: me,
+            sent_at_ms: at,
+            body: text.as_bytes().to_vec(),
+            attachment_name: None,
+            attachment: None,
+            id: Some(outbound.commitment.to_hex()),
+            reply_to: None,
+            reaction: None,
+            card: None,
+            sticker: None,
+            edit: Some(target.clone()),
+            deleted: false,
+        };
+        self.history.append(room, &entry)?;
+        open.thread.record(&entry);
+        let open = self.open.as_ref().ok_or(SessionError::NoRoomOpen)?;
+        revised(&self.history, open, me, &target).ok_or(SessionError::UnknownMessage)
+    }
+
+    /// Ask everyone in the open room to delete one of this user's own messages, and delete
+    /// it here.
+    ///
+    /// **Honoured by honest clients only.** Every honest member's client removes the text,
+    /// its report material and any attachment key from its transcript; a modified client
+    /// keeps them, and so does anyone who already copied or reported it. A frontend must not
+    /// call this "deleted for everyone" without saying so (`docs/01-threat-model.md` §3b).
+    pub fn delete(&mut self, id: &str) -> Result<Revised, SessionError> {
+        let me = self.client.user();
+        let target = MessageRef { sender: me, id: id.to_owned() };
+        let mut open = self.open.take().ok_or(SessionError::NoRoomOpen)?;
+        let result = (|| {
+            if open.convo.group_id().is_none() {
+                return Err(SessionError::NoGroupYet);
+            }
+            if !open.thread.admits_delete(me, &target) {
+                return Err(SessionError::UnknownMessage);
+            }
+            let outbound = open.convo.send_delete(target.clone(), now_ms())?;
+            self.client.send(open.convo.room(), &outbound.envelope)?;
+            self.apply_delete(&mut open, &target).ok_or(SessionError::UnknownMessage)
+        })();
+        self.open = Some(open);
+        result
+    }
+
+    /// Honour a delete in the open room: rewrite the transcript without the message's text,
+    /// edits and attachment key, refold the thread, and forget the key in memory too.
+    fn apply_delete(&mut self, open: &mut OpenRoom, target: &MessageRef) -> Option<Revised> {
+        let room = open.convo.room();
+        self.history.redact(room, target).ok()?;
+        let entries = self.history.replay(room, open.ttl, now_ms()).ok()?;
+        open.thread = Thread::build(&entries);
+        attachments::remember(&mut self.attachments, &entries);
+        revised(&self.history, open, self.client.user(), target)
     }
 
     /// React to a message on this device's screen, or withdraw this user's reaction to it
@@ -755,6 +873,8 @@ impl Session {
             reaction: Some(reaction),
             card: None,
             sticker: None,
+            edit: None,
+            deleted: false,
         };
         self.history.append(open.convo.room(), &entry)?;
         open.thread.record(&entry);
@@ -892,6 +1012,18 @@ impl Session {
                         }
                         continue;
                     }
+                    // A delete is an instruction about the transcript, not an entry in it.
+                    // Honoured only for the sender's own message, held here and not yet
+                    // deleted; anything else is dropped and not remembered, so a delete sent
+                    // ahead of its message arms nothing (`crate::thread`).
+                    if let Some(target) = received.delete {
+                        if open.thread.admits_delete(message.envelope.sender, &target) {
+                            if let Some(revised) = self.apply_delete(&mut open, &target) {
+                                events.push(Event::Updated(revised));
+                            }
+                        }
+                        continue;
+                    }
                     // Attributed to the envelope's sender, for a reaction as for a message:
                     // the payload has no field naming who reacted, so none can be forged.
                     let attachment = received.attachment.map(|a| *a);
@@ -906,9 +1038,23 @@ impl Session {
                         reaction: received.reaction.map(|r| *r),
                         card: received.card.map(|c| *c),
                         sticker: received.sticker,
+                        edit: received.edit.map(|r| *r),
+                        deleted: false,
                     };
+                    // An edit this transcript cannot honour — somebody else's message, one
+                    // not held here, a deleted one — is never written down.
+                    if !open.thread.admits(&entry) {
+                        continue;
+                    }
                     let _ = self.history.append(room, &entry);
                     open.thread.record(&entry);
+                    if let Some(target) = &entry.edit {
+                        let me = self.client.user();
+                        if let Some(revised) = revised(&self.history, &open, me, target) {
+                            events.push(Event::Updated(revised));
+                        }
+                        continue;
+                    }
                     if let Some(a) = &entry.attachment {
                         self.attachments.insert(a.blob, a.clone());
                     }
@@ -925,6 +1071,7 @@ impl Session {
                             &open.thread,
                             &open.labels,
                             false,
+                            self.client.user(),
                         )));
                     }
                 }
@@ -1662,16 +1809,34 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// A transcript entry as a frontend shows it, with its quote and reactions resolved.
+/// The message `target` names as it now stands, and its quote, read back from the
+/// transcript. The transcript, not the thread, holds a message's attachment, card and
+/// reply, so this replays it; edits and deletes are rare enough for that to be the
+/// simple choice rather than a second copy of every message in memory.
+fn revised(history: &History, open: &OpenRoom, me: UserId, target: &MessageRef) -> Option<Revised> {
+    let entries = history.replay(open.convo.room(), open.ttl, now_ms()).ok()?;
+    let original =
+        entries.iter().find(|e| e.is_original() && e.message_ref().as_ref() == Some(target))?;
+    Some(Revised {
+        message: view(original, &open.thread, &open.labels, true, me),
+        quote: open.thread.quote(target),
+    })
+}
+
+/// A transcript entry as a frontend shows it, with its quote, reactions and edits resolved.
 fn view(
     entry: &HistoryEntry,
     thread: &Thread,
     labels: &HashMap<UserId, Label>,
     historic: bool,
+    me: UserId,
 ) -> MessageView {
-    let own = entry.id.as_ref().map(|id| MessageRef { sender: entry.sender, id: id.clone() });
+    let own = entry.message_ref();
     let label = labels.get(&entry.sender);
-    let body = String::from_utf8_lossy(&entry.body).to_string();
+    let versions = thread.versions(entry);
+    let body = versions
+        .as_ref()
+        .map_or_else(|| String::from_utf8_lossy(&entry.body).to_string(), |v| v.current.clone());
     MessageView {
         sender: entry.sender.to_string(),
         sender_label: label
@@ -1682,7 +1847,16 @@ fn view(
         attachment: entry.attachment.as_ref().map(AttachmentView::of),
         id: entry.id.clone(),
         reply_to: entry.reply_to.as_ref().map(|r| thread.quote(r)),
-        reactions: own.map(|r| thread.reactions(&r)).unwrap_or_default(),
+        reactions: own
+            .as_ref()
+            .filter(|_| !entry.deleted)
+            .map(|r| thread.reactions(r))
+            .unwrap_or_default(),
+        edited_at_ms: versions.as_ref().map(|v| v.edited_at_ms),
+        revisions: versions.map(|v| v.earlier).unwrap_or_default(),
+        deleted: entry.deleted,
+        can_edit: own.as_ref().is_some_and(|r| thread.editable_by(me, r)),
+        can_delete: own.as_ref().is_some_and(|r| thread.admits_delete(me, r)),
         // Rendered from what arrived inside the envelope. Nothing is fetched to draw it —
         // the recipient-fetches-nothing rule (`docs/05-embeds.md`).
         card: entry.card.as_ref().and_then(|c| c.view_for(&body)).map(Box::new),

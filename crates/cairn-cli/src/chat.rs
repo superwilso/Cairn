@@ -416,6 +416,8 @@ impl App {
                 reaction: None,
                 card: None,
                 sticker: None,
+                edit: None,
+                deleted: false,
             },
         );
     }
@@ -1053,6 +1055,24 @@ impl App {
                         short(&message.envelope.sender.as_uuid().to_string())
                     );
                 }
+                // The CLI keeps no message ids, so it cannot apply an edit or a delete to its
+                // transcript. It says what arrived rather than pretending to honour either:
+                // a delete it cannot carry out is shown as a request, not as done.
+                Ok(TimelineEvent::Message(received)) if received.edit.is_some() => {
+                    println!(
+                        "\n  [{}] {} edited a message: {}",
+                        open.seal.tier().label(),
+                        short(&message.envelope.sender.as_uuid().to_string()),
+                        String::from_utf8_lossy(&received.body)
+                    );
+                }
+                Ok(TimelineEvent::Message(received)) if received.delete.is_some() => {
+                    println!(
+                        "\n  {} asked for one of their messages to be deleted (the CLI cannot \
+                         remove it from its transcript)",
+                        short(&message.envelope.sender.as_uuid().to_string())
+                    );
+                }
                 Ok(TimelineEvent::Message(received)) => {
                     println!(
                         "\n  [{}] {}: {}",
@@ -1078,6 +1098,8 @@ impl App {
                             reaction: None,
                             card: received.card.as_deref().cloned(),
                             sticker: received.sticker.clone(),
+                            edit: None,
+                            deleted: false,
                         },
                     );
                     if let Some(attachment) = &received.attachment {

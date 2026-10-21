@@ -93,6 +93,33 @@ pub struct Entry {
     /// this device; the transcript keeps only the name, which is also the message's body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker: Option<String>,
+    /// Set when this entry is an edit: `body` is the new text of the message named here.
+    ///
+    /// An entry of its own, like a reaction, so the original stays in the transcript beside
+    /// it — that is the edit history recipients see, and the original's report material.
+    /// Only ever written after [`crate::thread::Thread::admits`] accepted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<crate::conversation::MessageRef>,
+    /// The sender asked for this message to be deleted, and [`History::redact`] has removed
+    /// its text, attachment and card. What is left is a marker that a message was here, so a
+    /// reply to it can say "deleted" rather than "unavailable".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+}
+
+impl Entry {
+    /// The message this entry is, as a reply, reaction or edit would name it.
+    pub fn message_ref(&self) -> Option<crate::conversation::MessageRef> {
+        self.id
+            .as_ref()
+            .map(|id| crate::conversation::MessageRef { sender: self.sender, id: id.clone() })
+    }
+
+    /// Whether this is a message in its own right rather than something said *about* one —
+    /// a reaction or an edit.
+    pub fn is_original(&self) -> bool {
+        self.reaction.is_none() && self.edit.is_none()
+    }
 }
 
 /// Per-room transcripts under a client's state directory.
@@ -157,7 +184,13 @@ impl History {
         };
 
         let cutoff = now_ms.saturating_sub(ttl);
-        let live: Vec<Entry> = all.iter().filter(|e| e.sent_at_ms > cutoff).cloned().collect();
+        let mut live: Vec<Entry> = all.iter().filter(|e| e.sent_at_ms > cutoff).cloned().collect();
+        // An edit expires with the message it edits, not on its own clock. Otherwise editing a
+        // disappearing message would restart its timer: the new text, and the history kept
+        // beside it, would outlive the original by however long after it the edit was sent.
+        let originals: std::collections::HashSet<crate::conversation::MessageRef> =
+            live.iter().filter(|e| e.is_original()).filter_map(Entry::message_ref).collect();
+        live.retain(|e| e.edit.as_ref().is_none_or(|target| originals.contains(target)));
 
         if live.len() != all.len() {
             let mut rewritten = Vec::new();
@@ -169,6 +202,56 @@ impl History {
             restrict(&path)?;
         }
         Ok(live)
+    }
+
+    /// Honour a delete: remove the text, attachment, card and every edit of one message.
+    ///
+    /// The file is **rewritten without them**, the same way an expired message is removed —
+    /// not marked hidden. What stays is the original entry with nothing in it but who sent
+    /// it, when, and its id, so a reply to it can say it was deleted. The attachment's key
+    /// goes, which is the only thing on this device that opened its blob; the blob itself is
+    /// still on the instance, which does not yet delete blobs at all.
+    ///
+    /// This is ordinary file replacement, not secure erasure: a filesystem or SSD may keep
+    /// the old blocks. Returns whether anything was removed.
+    pub fn redact(
+        &self,
+        room: RoomId,
+        target: &crate::conversation::MessageRef,
+    ) -> Result<bool, HistoryError> {
+        let path = self.path(room);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let mut changed = false;
+        let mut rewritten = Vec::new();
+        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            let mut entry: Entry = serde_json::from_str(line)?;
+            if entry.edit.as_ref() == Some(target) {
+                changed = true;
+                continue;
+            }
+            if entry.is_original() && entry.message_ref().as_ref() == Some(target) && !entry.deleted
+            {
+                entry.body.clear();
+                entry.attachment = None;
+                entry.attachment_name = None;
+                entry.card = None;
+                entry.sticker = None;
+                entry.reply_to = None;
+                entry.deleted = true;
+                changed = true;
+            }
+            rewritten.extend_from_slice(&serde_json::to_vec(&entry)?);
+            rewritten.push(b'\n');
+        }
+        if changed {
+            fs::write(&path, &rewritten)?;
+            restrict(&path)?;
+        }
+        Ok(changed)
     }
 
     /// Forget a room entirely — on leaving it, or being removed from it.
@@ -217,7 +300,65 @@ mod tests {
             reaction: None,
             card: None,
             sticker: None,
+            edit: None,
+            deleted: false,
         }
+    }
+
+    fn edit_of(target: &Entry, at: i64, body: &str) -> Entry {
+        Entry {
+            sender: target.sender,
+            id: Some(format!("{:064x}", at)),
+            edit: target.message_ref(),
+            ..entry(at, body)
+        }
+    }
+
+    #[test]
+    fn an_edit_disappears_with_the_message_it_edits() {
+        // Probe: an edit sent late in a message's life must not keep that message's words —
+        // the new text, and the history beside it — past the original's timer.
+        let dir = scratch("edit-expiry");
+        let room = RoomId::new();
+        let history = History::open(&dir).unwrap();
+        let original = Entry { id: Some("aa".repeat(32)), ..entry(1_000, "first draft") };
+        history.append(room, &original).unwrap();
+        history.append(room, &edit_of(&original, 4_000, "second draft")).unwrap();
+
+        // Past the original's timer, well inside the edit's.
+        let live = history.replay(room, Some(2_000), 4_500).unwrap();
+        assert!(live.is_empty(), "the edit must have gone with its original: {live:?}");
+        assert!(history.replay(room, None, 4_500).unwrap().is_empty(), "from the file, too");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_delete_removes_the_text_from_the_file_and_every_edit_of_it() {
+        let dir = scratch("redact");
+        let room = RoomId::new();
+        let history = History::open(&dir).unwrap();
+        let original = Entry { id: Some("bb".repeat(32)), ..entry(1, "regrettable") };
+        let other = Entry { id: Some("cc".repeat(32)), ..entry(2, "unrelated") };
+        history.append(room, &original).unwrap();
+        history.append(room, &other).unwrap();
+        history.append(room, &edit_of(&original, 3, "still regrettable")).unwrap();
+
+        assert!(history.redact(room, &original.message_ref().unwrap()).unwrap());
+        let raw = fs::read_to_string(history.path(room)).unwrap();
+        assert!(!raw.contains(&json_bytes("regrettable")), "the text must be gone from disk");
+        let left = history.replay(room, None, 0).unwrap();
+        assert_eq!(left.len(), 2, "the original's marker and the unrelated message: {left:?}");
+        assert!(left[0].deleted && left[0].body.is_empty());
+        assert_eq!(left[1].body, b"unrelated");
+        // Twice is harmless: a delete can be delivered to two of one account's devices.
+        assert!(!history.redact(room, &original.message_ref().unwrap()).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// How serde writes a body: a JSON array of byte values. Searching the file for this is
+    /// searching for the text.
+    fn json_bytes(text: &str) -> String {
+        serde_json::to_string(text.as_bytes()).unwrap()
     }
 
     #[test]

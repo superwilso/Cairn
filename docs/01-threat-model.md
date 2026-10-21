@@ -170,6 +170,51 @@ who is listening. A member removed from the room is dropped by the SFU at once, 
 removal commit is processed the keys they hold still open frames sealed under them. Calls
 somebody rings are still the peer-to-peer mesh, which the instance never carries.
 
+## 3b. Replies, edits and delete-for-everyone
+
+All three travel **inside the room's encrypted MLS stream** as ordinary franked application
+messages that *name* an earlier message by its sender and franking commitment. The instance
+relays them as ciphertext and cannot tell one from a message. What each does and does not
+promise, stated here so no UI or document claims more:
+
+- **A reply carries a reference, never the quoted text.** Each recipient resolves the quote
+  from its own transcript, so the instance learns nothing about the quoted message — not even
+  its length, which a carried copy would leak through the reply's size (probed:
+  `a_reply_carries_a_reference_and_not_the_text_it_quotes`). A sender cannot misquote anyone:
+  a quote of a message the recipient does not hold, or attributed to the wrong person, reads
+  "unavailable" (`a_reply_cannot_put_words_in_the_quote`).
+- **Only a message's sender may edit or delete it**, and only a message the recipient holds.
+  "Sender" is the envelope's, verified against the group roster (§4). A member naming someone
+  else's message is dropped by every honest client, and the edit is never written down
+  (`a_member_cannot_edit_or_delete_someone_elses_message`). An edit changes the text only: the
+  author, the original time and the message's place in the conversation are the original's.
+- **Edits are visible.** An edited message is marked, and every earlier version stays in each
+  recipient's transcript and is shown on request. An edit cannot erase what was first said
+  from an honest recipient's device — and the original stays **reportable** (`04-safety-architecture.md` §1a).
+- **Delete-for-everyone is a request honoured by honest clients.** An honest Cairn client
+  rewrites its transcript without the message's text, its earlier versions, its link card,
+  its franking opening and its attachment key. **A modified client keeps all of it**, as does
+  anyone who took a screenshot, copied it, or already filed a report. Deletion is never
+  guaranteed and the client never says it is. Further limits:
+  - The **instance keeps the ciphertext** of the message (and of the delete) until the room's
+    disappearing timer, if any, removes it; it cannot read either. An attachment's blob stays
+    on the instance, unreadable without the key the honest clients just discarded — the
+    instance does not delete blobs at all yet.
+  - The CLI keeps no message ids and **does not honour deletes**; it prints that one was asked
+    for. Treat it as a client that keeps the text.
+  - The rewrite is ordinary file replacement, not secure erasure.
+- **A delete or edit arrives only after its message.** One that names a message the recipient
+  does not hold is discarded, not remembered, so a sender cannot pre-arm a message that sits
+  on the instance but is never shown to an honest member
+  (`a_delete_sent_ahead_of_its_message_arms_nothing`).
+- **Disappearing messages win.** An edit expires with the message it edits, on the original's
+  clock, so editing cannot restart a timer (`an_edit_does_not_keep_a_disappearing_message_alive`).
+  The instance purges by each ciphertext's own time, so an edit's ciphertext can sit there up
+  to one timer-length after the edit; honest clients discard it, because its original is gone.
+- **Metadata.** The instance sees that a message was sent, by whom, when, and its size. A
+  delete has an empty body, so its ciphertext is small — like a reaction's — and a close
+  observer could guess "reaction or delete". That is §3.1's concession, not a new one.
+
 ## 4. The malicious server operator (A4)
 
 The most nuanced case, and the one most often overstated by messaging products.

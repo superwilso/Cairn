@@ -351,12 +351,14 @@ impl Session {
             reaction: None,
             card: None,
             sticker: None,
+            edit: None,
+            deleted: false,
         };
         self.history.append(open.convo.room(), &entry)?;
         // Into the thread too, so the sender can be replied to or reacted to about it.
         open.thread.record(&entry);
         self.attachments.insert(attachment.blob, attachment);
-        Ok(view(&entry, &open.thread, &open.labels, false))
+        Ok(view(&entry, &open.thread, &open.labels, false, self.client.user()))
     }
 
     /// Seal, upload and send in one call, holding `&mut self` throughout. For callers that
