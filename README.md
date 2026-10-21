@@ -47,8 +47,10 @@ A working protocol core, with the security-critical paths under test:
   messages**, so a moderator can verify ordering and causality — and a reporter cannot
   quietly drop the message that supplies the context.
 - **Safety numbers** — 60-digit out-of-band key verification, so a malicious server
-  substituting keys becomes visible to the user. Verified against real MLS identity keys.
-  Not yet surfaced in any UI, so the protection is not yet effective in practice.
+  substituting keys becomes visible to the user. Computed from the MLS group's own roster,
+  shown by both clients (`/safety` and `/verify` in the CLI, the member list on desktop),
+  with a sticky warning when a verified contact's key changes. It protects only the
+  conversations where someone actually compares numbers.
 - **Authenticated envelopes** — every message is signed by its sending device over
   length-prefixed canonical bytes, and a device's account binding is fixed at registration.
   This is what makes franking's attribution real rather than a claim the server takes on
@@ -157,22 +159,26 @@ it, and its **non-goals** matter more than its goals.
 | [06 — Federation seam](docs/06-federation-seam.md) | Islands now, federation later |
 | [07 — Regulatory posture](docs/07-regulatory-posture.md) | DSA, OSA, age assurance, export control |
 | [08 — Feature parity](docs/08-feature-parity.md) | Scorecard vs Discord, Signal, WhatsApp, Instagram, Telegram |
-| [09 — Platform strategy](docs/09-platform-strategy.md) | Native on five platforms; servers on three |
+| [09 — Platform strategy](docs/09-platform-strategy.md) | One web client, Tauri on desktop; servers on three |
 | [Naming](docs/NAMING.md) | Why "Cairn", and the clearance still required |
 | [ADRs](docs/adr/) | The decisions, with their consequences |
 
 ## Platforms
 
-Native everywhere — one shared Rust core, a thin native UI per platform, and **no protocol
-logic above the FFI line** ([ADR-006](docs/adr/006-platform-architecture.md)).
+One web client, wrapped in Tauri on desktop, over one shared Rust core, with **no protocol
+logic above the FFI line** ([ADR-008](docs/adr/008-client-architecture.md), which
+superseded the five-native-UI plan of ADR-006).
 
-**Clients:** Windows (first), Linux, Android, macOS, iOS.
+**Clients:** Windows, macOS and Linux, through Tauri. A browser build is planned but not
+built; when it exists, its end-to-end encryption will not protect against the instance that
+serves its code ([threat model §3a](docs/01-threat-model.md)). Mobile is deferred.
 **Servers:** Linux (primary), Windows, macOS.
 
 ## What Cairn is not
 
-- **Not yet safe against a *malicious* server.** Safety numbers exist but no client shows
-  them, and key transparency is unimplemented. ([SECURITY.md](SECURITY.md))
+- **Not yet safe against a *malicious* server.** Both clients show safety numbers, but
+  comparing them is manual and per person, and key transparency is unimplemented. A user
+  who never compares is still exposed to key substitution. ([SECURITY.md](SECURITY.md))
 - **Not metadata-private.** The server sees who talks to whom and when. Signal beats us
   here, and will until it is designed for. ([Threat model §3.1](docs/01-threat-model.md))
 - **Not federated at launch.** Self-hosted islands, with a designed seam.
