@@ -785,7 +785,8 @@ fn grant_media_requests(app: &tauri::App) {
         let _ = window.with_webview(|webview| {
             webview.inner().connect_permission_request(|view, request| {
                 let ours = view.uri().is_some_and(|uri| {
-                    uri.starts_with("tauri://localhost") || uri.starts_with("http://tauri.localhost")
+                    uri.starts_with("tauri://localhost")
+                        || uri.starts_with("http://tauri.localhost")
                 });
                 let media = request.is::<UserMediaPermissionRequest>()
                     || request.is::<DeviceInfoPermissionRequest>();
