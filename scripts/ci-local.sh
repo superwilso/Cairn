@@ -80,6 +80,11 @@ run "clippy --all-targets" cargo clippy --workspace --all-targets
 run "test --all-targets"   cargo test --workspace --all-targets
 run "vertical slice"       cargo run -p cairn-cli
 
+# ---- interop job ----------------------------------------------------------
+run "MLS interop (OpenMLS)" bash -c 'cargo fmt --manifest-path interop/Cargo.toml --check &&
+    cargo clippy --manifest-path interop/Cargo.toml --all-targets --locked &&
+    cargo test --manifest-path interop/Cargo.toml --locked'
+
 # ---- desktop job ----------------------------------------------------------
 # The call mesh is JavaScript, and `cargo test` cannot see a line of it. Who offers, whether
 # an early ICE candidate survives, whether turning a camera on renegotiates -- all decided in

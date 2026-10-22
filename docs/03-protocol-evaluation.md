@@ -194,5 +194,5 @@ Before any of this protects a real user:
    transcript fails.
 4. **Independent MLS interop** against another RFC 9420 implementation.
 
-Item 3 is currently satisfied in-process by `cargo run -p cairn-cli`; items 1, 2, and 4 are
-outstanding.
+Item 3 is currently satisfied in-process by `cargo run -p cairn-cli`, and item 4 by
+`interop/`, against OpenMLS; items 1 and 2 are outstanding.

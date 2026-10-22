@@ -1527,19 +1527,36 @@ impl Instance {
 
         let mut store = self.key_packages.lock().expect("key packages mutex poisoned");
 
+        // Expired packages are dropped rather than handed out. They are queued oldest
+        // first, and a claimer adding one is refused by its own MLS library — the claim
+        // would spend it for nothing, and the next attempt would get the next expired one.
+        // Packages last 84 days (`cairn_crypto::mls::KEY_PACKAGE_LIFETIME`), so a device
+        // that publishes and then goes quiet reaches this.
+        let now_secs = u64::try_from(now_ms / 1000).unwrap_or(0);
+        let live = |hex: &String| {
+            let expiry = hex::decode(hex)
+                .ok()
+                .and_then(|b| cairn_crypto::mls::parse_message(&b).ok())
+                .and_then(|m| cairn_crypto::mls::key_package_expiry(&m));
+            expiry.is_none_or(|e| e > now_secs)
+        };
+        let mut drained = Vec::with_capacity(devices.len());
+        for device in &devices {
+            let mut queue = store.get(device).cloned().unwrap_or_default();
+            queue.retain(live);
+            drained.push((*device, queue));
+        }
+
         // Check every device before consuming any, so a failure does not burn the
         // packages of the devices that did have one.
-        if devices.iter().any(|d| store.get(d).is_none_or(|q| q.is_empty())) {
+        if drained.iter().any(|(_, q)| q.is_empty()) {
             return Err(ServerError::NoKeyPackages);
         }
 
-        let mut drained = Vec::with_capacity(devices.len());
         let mut claimed = Vec::with_capacity(devices.len());
-        for device in &devices {
-            let mut queue = store.get(device).cloned().unwrap_or_default();
+        for (device, queue) in &mut drained {
             let package = queue.pop_front().expect("checked non-empty above");
             claimed.push((*device, package));
-            drained.push((*device, queue));
         }
 
         // Every drained queue in one batch. A partial write would hand out packages the
@@ -4848,6 +4865,36 @@ mod claim_limits {
             inst.publish_key_packages(bob.user, bob.device, vec![package]),
             Err(ServerError::KeyPackageIdentityMismatch)
         ));
+    }
+
+    #[test]
+    fn an_expired_key_package_is_never_handed_out() {
+        // Packages are claimed oldest first, so an expired one sits at the front of the
+        // queue. Handed out, the claimer's MLS library refuses it and the add fails — and
+        // the claim has spent it, so the next attempt meets the next expired one.
+        let inst = Instance::in_memory();
+        let alice = TestSender::registered(&inst);
+        let bob = TestSender::registered(&inst);
+        let long_ago = 1_000_000_000; // 2001: expired by any lifetime.
+        let stale = bob.session.key_package_valid_from(long_ago).unwrap();
+        let stale = hex::encode(stale.to_bytes().unwrap());
+        let mut packages = vec![stale.clone()];
+        packages.extend(bob.key_packages(1));
+        inst.publish_key_packages(bob.user, bob.device, packages).unwrap();
+
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+        )
+        .unwrap();
+        let claimed = inst.claim_key_packages(alice.user, bob.user, now_ms).unwrap();
+        assert_ne!(claimed[0].1, stale, "the expired package must not be handed out");
+        assert!(
+            matches!(
+                inst.claim_key_packages(alice.user, bob.user, now_ms),
+                Err(ServerError::NoKeyPackages)
+            ),
+            "with only an expired package left, there is nothing to hand out"
+        );
     }
 
     /// Publish `n` packages for a freshly registered account.

@@ -10,7 +10,11 @@ members = [
 ]
 # Patched copies of published crates, substituted by `[patch.crates-io]` below. Not members:
 # they are upstream's code. vendor/*/VENDORED.md says why each exists.
-exclude = ["vendor"]
+#
+# `interop` is its own workspace so OpenMLS, a test-only dependency, never enters this
+# lock file: `cargo audit` reads the lock file, not what is compiled, and OpenMLS's tree
+# lists crates with open advisories that no Cairn build links. See interop/Cargo.toml.
+exclude = ["vendor", "interop"]
 
 [workspace.package]
 version = "0.0.1"

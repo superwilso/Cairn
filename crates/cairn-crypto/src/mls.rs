@@ -47,6 +47,28 @@ use crate::store::{ClientStore, GroupStore, KeyPackageStore, StoreError};
 /// freezes; see `docs/adr/002-mls-for-groups.md`.
 pub const CIPHERSUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 
+/// How long a key package, and the leaf it becomes, stays valid: 84 days.
+///
+/// Set by interop rather than taste. `mls-rs` defaults to a year, and OpenMLS refuses any
+/// key package whose lifetime spans more than 84 days and an hour, so an OpenMLS client
+/// could not add a Cairn device at all, nor join a group a Cairn device had made. Found by
+/// `cairn-interop`, the first test with a different implementation on the other side.
+pub const KEY_PACKAGE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(84 * 86_400);
+
+/// How far a new leaf's `not_before` is set into the past.
+///
+/// `mls-rs` stamps `not_before` with the current second, and a receiver whose clock is
+/// even a second behind the sender's sees a leaf that is not yet valid. OpenMLS, which
+/// compares strictly, refused every welcome built within the second its leaves were made.
+/// An hour matches the margin both implementations allow elsewhere.
+const NOT_BEFORE_MARGIN_SECS: u64 = 3600;
+
+/// The timestamp a new leaf's lifetime is measured from.
+fn leaf_not_before() -> mls_rs::time::MlsTime {
+    let now = mls_rs::time::MlsTime::now().seconds_since_epoch();
+    mls_rs::time::MlsTime::from(now.saturating_sub(NOT_BEFORE_MARGIN_SECS))
+}
+
 /// The builder configuration Cairn uses, before `build()` resolves it.
 ///
 /// The wrapper order mirrors the order of the builder calls in [`Session::build`]; they
@@ -120,6 +142,15 @@ pub fn parse_message(bytes: &[u8]) -> Result<MlsMessage, MlsError> {
 pub fn key_package_credential(message: &MlsMessage) -> Option<Vec<u8>> {
     let kp = message.as_key_package()?;
     kp.signing_identity().credential.as_basic().map(|b| b.identifier().to_vec())
+}
+
+/// When a key package stops being valid, in seconds since the Unix epoch.
+///
+/// For an instance, which hands packages out oldest first: one past this point would be
+/// refused by whoever claimed it, and the claim would have spent it for nothing. `None` when
+/// the message is not a key package.
+pub fn key_package_expiry(message: &MlsMessage) -> Option<u64> {
+    Some(message.as_key_package()?.expiration().ok()?.seconds_since_epoch())
 }
 
 /// The leaf behind a commit, when it was an ordinary member.
@@ -242,6 +273,7 @@ impl Session {
             .group_state_storage(group_store)
             .key_package_repo(key_packages)
             .signing_identity(signing_identity, secret, CIPHERSUITE)
+            .key_package_lifetime(KEY_PACKAGE_LIFETIME)
             .build();
 
         Self { client, identity: identity.to_vec(), public_key, secret_key }
@@ -280,8 +312,11 @@ impl Session {
 
     /// Start a new group. The creator is its only member until it commits an add.
     pub fn create_group(&self) -> Result<GroupHandle, MlsError> {
-        let group =
-            self.client.create_group(ExtensionList::default(), ExtensionList::default(), None)?;
+        let group = self.client.create_group(
+            ExtensionList::default(),
+            ExtensionList::default(),
+            Some(leaf_not_before()),
+        )?;
         let mut handle = GroupHandle { group };
         handle.persist()?;
         Ok(handle)
@@ -301,7 +336,18 @@ impl Session {
         Ok(self.client.generate_key_package_message(
             ExtensionList::default(),
             ExtensionList::default(),
-            None,
+            Some(leaf_not_before()),
+        )?)
+    }
+
+    /// A key package whose lifetime starts at `not_before` (seconds since the Unix epoch)
+    /// rather than now. For tests that need one that has already expired.
+    #[doc(hidden)]
+    pub fn key_package_valid_from(&self, not_before: u64) -> Result<MlsMessage, MlsError> {
+        Ok(self.client.generate_key_package_message(
+            ExtensionList::default(),
+            ExtensionList::default(),
+            Some(mls_rs::time::MlsTime::from(not_before)),
         )?)
     }
 
@@ -675,13 +721,15 @@ mod tests {
         let bob = Session::new(b"bob").unwrap();
         let carol = Session::new(b"carol").unwrap();
 
-        // Key packages live for 365 days.
+        // Key packages are valid from an hour ago for 84 days in all, so they expire 84
+        // days less an hour from now.
         let kp = bob.key_package().unwrap();
         let package = kp.clone().into_key_package().unwrap();
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let days = (package.expiration().unwrap().seconds_since_epoch() - now) / 86_400;
-        assert!((364..=366).contains(&days), "key package lifetime is {days} days");
+        let left = package.expiration().unwrap().seconds_since_epoch() - now;
+        let expected = 84 * 86_400 - NOT_BEFORE_MARGIN_SECS;
+        assert!(left.abs_diff(expected) <= 5, "key package expires in {left}s, not {expected}s");
 
         // Commits go out as PublicMessage, and one welcome covers the commit.
         let mut group = alice.create_group().unwrap();
