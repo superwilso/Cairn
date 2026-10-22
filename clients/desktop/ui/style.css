@@ -621,6 +621,11 @@ main:has(#room-id:empty) #timeline:empty::after { content: "Pick a room from the
   transition: transform 0.12s ease-out, background 0.12s;
 }
 .msg > .avatar { grid-area: av; width: var(--av-size); height: var(--av-size); font-size: calc(var(--av-size) * 0.34); margin-top: 2px; }
+/* The profile's avatar in the same slot keeps the chosen shape, not its own circle. */
+.msg > .avatar.pf-avatar {
+  border-radius: var(--av-radius); border: 0;
+  background: hsl(var(--h, 36) var(--av-sat) var(--av-l)); color: var(--av-ink);
+}
 .msg > .head { grid-area: head; display: flex; align-items: baseline; gap: 9px; min-width: 0; }
 .msg > .who { grid-area: head; }
 .msg > .content { grid-area: content; }
