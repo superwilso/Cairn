@@ -90,7 +90,12 @@ cargo fmt --all
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
 RUSTFLAGS="-D warnings" cargo test --workspace --all-targets
 cargo run -p cairn-cli       # the vertical slice
+cargo test --manifest-path interop/Cargo.toml --locked   # Cairn's MLS against OpenMLS
 ```
+
+The interop tests are a separate workspace, so `--workspace` does not reach them. Run them
+after any change to `cairn-crypto`'s MLS layer: they are the only tests with a different MLS
+implementation on the other side.
 
 **Run it as an ordinary user, not root.** CI does, and root hides permission bugs: one
 chmod that only root could make passed locally and failed thirteen tests on the runner.

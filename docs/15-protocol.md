@@ -320,7 +320,7 @@ from storage on read. Their ids are retained (§5.3).
 
 `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (RFC 9420 ciphersuite 0x0001), with basic
 credentials (§3.4). The reference client uses `mls-rs` 0.55, and makes these choices.
-They are `mls-rs` defaults, not explicit configuration.
+All but the lifetime are `mls-rs` defaults, not explicit configuration.
 `the_mls_wire_choices_the_protocol_spec_names_still_hold` in `cairn-crypto` fails if a
 dependency bump changes them.
 
@@ -332,10 +332,22 @@ dependency bump changes them.
 | Welcomes per commit | one | One welcome covers every device added by the commit. |
 | Update path in a commit | not required | An add-only commit may omit the path. Receivers MUST accept that, as RFC 9420 allows. |
 | External commits | not allowed | Nobody joins a group without a member's commit. |
-| Key package lifetime | 365 days from generation | |
+| Key package lifetime | 84 days, starting an hour before generation | Chosen for OpenMLS, which refuses a lifetime spanning more than 84 days and an hour, and refuses a leaf whose `not_before` is not strictly in the past. The `mls-rs` default (a year, starting now) met neither. |
 | Group and key-package extensions | none | |
 | Proposals | by value, inside the commit (Add, Remove) | Cairn never sends standalone proposals. |
 | Padding of application messages | `mls-rs`'s step function | A sender's choice. Receivers accept any valid padding. |
+
+**Checked against an independent implementation.** `interop/` puts OpenMLS 0.8 in the same
+group as the reference client: each joins the other's group, messages and commits cross in
+both directions, a removed OpenMLS member is cut off, and both derive the same voice media
+key (ADR-012, not specified here). An OpenMLS client needs two settings that are not its
+defaults:
+
+- an incoming wire-format policy that accepts plaintext handshakes (`Mixed`). Its default
+  accepts only encrypted ones and refuses every Cairn commit with
+  `IncompatibleWireFormat`;
+- `use_ratchet_tree_extension(true)` when it joins, not only when it creates a group.
+  Otherwise its own welcomes leave the tree out, and a Cairn device it adds cannot join.
 
 ### 7.2 Key packages
 
@@ -345,8 +357,8 @@ dependency bump changes them.
   or the publish is refused with 403. A device may hold at most 100 unclaimed packages.
 - `POST /v1/users/{user}/key-packages` (action `claim_key_packages`, resource the user)
   consumes and returns one package for **every** device of the account, as
-  `[{device, key_package}]`. If any device has none left, it returns 409 and nothing is
-  consumed. Claims are limited per actor, to 3 per target and 30 in total per hour.
+  `[{device, key_package}]`. Expired packages are skipped, never handed out. If any device
+  has none left, it returns 409 and nothing is consumed. Claims are limited per actor, to 3 per target and 30 in total per hour.
 
 A claimer **MUST**:
 

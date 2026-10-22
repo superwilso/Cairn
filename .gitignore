@@ -1,4 +1,6 @@
 /target
+# The interop tests are a workspace of their own, with a target directory of their own.
+/interop/target
 **/*.rs.bk
 *.pdb
 

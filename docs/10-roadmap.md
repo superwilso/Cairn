@@ -552,7 +552,16 @@ Four calls made by the owner, so a session does not re-litigate them:
 
 - [ ] **External cryptographic review** of franking and the protocol. `SECURITY.md` calls
       this non-optional and it is the cheapest security spend available
-- [ ] Independent MLS interop against another RFC 9420 implementation
+- [x] Independent MLS interop against another RFC 9420 implementation — `interop/`, against
+      OpenMLS 0.8: joins both ways, messages, commits with and without an update path,
+      PublicMessage and encrypted handshakes, a removal, and the voice media exporter.
+      **It found that OpenMLS could not talk to Cairn at all.** It refused every Cairn key
+      package (a year's lifetime, above its 84-day limit) and every welcome (leaves stamped
+      valid from the current second, which it does not count as current). Lifetimes are now
+      84 days, starting an hour back, so the instance also drops expired packages instead of
+      handing them out. §7.1 of the spec lists the two OpenMLS settings a client needs.
+      **Not covered:** one other implementation only, in-process rather than through an
+      instance, and only the ciphersuite Cairn pins.
 - [ ] Key transparency, so a malicious server is bounded without manual comparison
 - [ ] **Subscribable policy lists** — `04-safety-architecture.md` §2 calls this the
       highest-leverage safety item, and it is still unbuilt
